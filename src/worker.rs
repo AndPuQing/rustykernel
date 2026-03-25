@@ -33,17 +33,53 @@ pub struct ExecutionOutcome {
     pub traceback: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CompletionOutcome {
+    pub matches: Vec<String>,
+    pub cursor_start: usize,
+    pub cursor_end: usize,
+    #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InspectionOutcome {
+    pub found: bool,
+    #[serde(default)]
+    pub data: Value,
+    #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
+    pub status: String,
+}
+
 #[derive(Serialize)]
-struct ExecutionRequest<'a> {
-    id: u64,
-    code: &'a str,
+#[serde(tag = "kind")]
+enum WorkerRequest<'a> {
+    #[serde(rename = "execute")]
+    Execute { id: u64, code: &'a str },
+    #[serde(rename = "complete")]
+    Complete {
+        id: u64,
+        code: &'a str,
+        cursor_pos: usize,
+    },
+    #[serde(rename = "inspect")]
+    Inspect {
+        id: u64,
+        code: &'a str,
+        cursor_pos: usize,
+        detail_level: u8,
+    },
 }
 
 #[derive(Deserialize)]
-struct ExecutionResponse {
+struct WorkerEnvelope<T> {
     id: u64,
     #[serde(flatten)]
-    outcome: ExecutionOutcome,
+    payload: T,
 }
 
 pub struct PythonWorker {
@@ -81,37 +117,50 @@ impl PythonWorker {
     }
 
     pub fn execute(&mut self, code: &str) -> Result<ExecutionOutcome, KernelError> {
-        let request = ExecutionRequest {
-            id: self.next_id,
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::Execute {
+            id: request_id,
             code,
         };
+        let response: WorkerEnvelope<ExecutionOutcome> = self.send_request(&request, request_id)?;
+        Ok(response.payload)
+    }
+
+    pub fn complete(
+        &mut self,
+        code: &str,
+        cursor_pos: usize,
+    ) -> Result<CompletionOutcome, KernelError> {
+        let request_id = self.next_id;
         self.next_id += 1;
+        let request = WorkerRequest::Complete {
+            id: request_id,
+            code,
+            cursor_pos,
+        };
+        let response: WorkerEnvelope<CompletionOutcome> =
+            self.send_request(&request, request_id)?;
+        Ok(response.payload)
+    }
 
-        let payload = serde_json::to_vec(&request).map_err(|error| {
-            KernelError::Worker(format!("failed to encode worker request: {error}"))
-        })?;
-        self.stdin.write_all(&payload).map_err(KernelError::Io)?;
-        self.stdin.write_all(b"\n").map_err(KernelError::Io)?;
-        self.stdin.flush().map_err(KernelError::Io)?;
-
-        let mut line = String::new();
-        let bytes_read = self.stdout.read_line(&mut line).map_err(KernelError::Io)?;
-        if bytes_read == 0 {
-            return Err(KernelError::Worker(self.stderr_summary()));
-        }
-
-        let response: ExecutionResponse = serde_json::from_str(&line).map_err(|error| {
-            KernelError::Worker(format!("failed to decode worker response: {error}"))
-        })?;
-
-        if response.id != request.id {
-            return Err(KernelError::Worker(format!(
-                "worker response id mismatch: expected {}, got {}",
-                request.id, response.id
-            )));
-        }
-
-        Ok(response.outcome)
+    pub fn inspect(
+        &mut self,
+        code: &str,
+        cursor_pos: usize,
+        detail_level: u8,
+    ) -> Result<InspectionOutcome, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::Inspect {
+            id: request_id,
+            code,
+            cursor_pos,
+            detail_level,
+        };
+        let response: WorkerEnvelope<InspectionOutcome> =
+            self.send_request(&request, request_id)?;
+        Ok(response.payload)
     }
 
     pub fn restart(&mut self) -> Result<(), KernelError> {
@@ -139,6 +188,41 @@ impl PythonWorker {
             }
             Err(_) => {}
         }
+    }
+
+    fn send_request<T>(
+        &mut self,
+        request: &WorkerRequest<'_>,
+        request_id: u64,
+    ) -> Result<WorkerEnvelope<T>, KernelError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let payload = serde_json::to_vec(request).map_err(|error| {
+            KernelError::Worker(format!("failed to encode worker request: {error}"))
+        })?;
+        self.stdin.write_all(&payload).map_err(KernelError::Io)?;
+        self.stdin.write_all(b"\n").map_err(KernelError::Io)?;
+        self.stdin.flush().map_err(KernelError::Io)?;
+
+        let mut line = String::new();
+        let bytes_read = self.stdout.read_line(&mut line).map_err(KernelError::Io)?;
+        if bytes_read == 0 {
+            return Err(KernelError::Worker(self.stderr_summary()));
+        }
+
+        let response: WorkerEnvelope<T> = serde_json::from_str(&line).map_err(|error| {
+            KernelError::Worker(format!("failed to decode worker response: {error}"))
+        })?;
+
+        if response.id != request_id {
+            return Err(KernelError::Worker(format!(
+                "worker response id mismatch: expected {}, got {}",
+                request_id, response.id
+            )));
+        }
+
+        Ok(response)
     }
 }
 

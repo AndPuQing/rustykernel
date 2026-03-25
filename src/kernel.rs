@@ -613,37 +613,62 @@ fn handle_shell_request(
             Ok(false)
         }
         "complete_request" => {
+            let code = request
+                .content
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let cursor_pos = request
                 .content
                 .get("cursor_pos")
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
+            let completion = state.worker.complete(code, cursor_pos.max(0) as usize)?;
             send_reply(
                 reply_socket,
                 state,
                 request,
                 "complete_reply",
                 json!({
-                    "status": "ok",
-                    "matches": [],
-                    "cursor_start": cursor_pos,
-                    "cursor_end": cursor_pos,
-                    "metadata": {},
+                    "status": completion.status,
+                    "matches": completion.matches,
+                    "cursor_start": completion.cursor_start,
+                    "cursor_end": completion.cursor_end,
+                    "metadata": completion.metadata,
                 }),
             )?;
             Ok(false)
         }
         "inspect_request" => {
+            let code = request
+                .content
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let cursor_pos = request
+                .content
+                .get("cursor_pos")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let detail_level = request
+                .content
+                .get("detail_level")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let inspection =
+                state
+                    .worker
+                    .inspect(code, cursor_pos.max(0) as usize, detail_level as u8)?;
             send_reply(
                 reply_socket,
                 state,
                 request,
                 "inspect_reply",
                 json!({
-                    "status": "ok",
-                    "found": false,
-                    "data": {},
-                    "metadata": {},
+                    "status": inspection.status,
+                    "found": inspection.found,
+                    "data": inspection.data,
+                    "metadata": inspection.metadata,
                 }),
             )?;
             Ok(false)
@@ -956,7 +981,10 @@ mod tests {
 
     fn test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     #[test]
@@ -1256,6 +1284,126 @@ mod tests {
                 .and_then(|data| data.get("text/plain")),
             Some(&json!("42"))
         );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn complete_request_returns_matches_from_worker_state() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let define = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 40",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &define);
+        let _ = recv_message(&shell, &signer);
+        let _ = recv_iopub_messages_for_parent(&iopub, &signer, &define.header.msg_id, 3);
+
+        let complete = client_request(
+            "client-session",
+            "complete_request",
+            json!({
+                "code": "val",
+                "cursor_pos": 3,
+            }),
+        );
+        send_client_message(&shell, &signer, &complete);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "complete_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+        assert!(
+            reply.content["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "value")
+        );
+        assert_eq!(reply.content.get("cursor_start"), Some(&json!(0)));
+        assert_eq!(reply.content.get("cursor_end"), Some(&json!(3)));
+
+        let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &complete.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn inspect_request_returns_details_from_worker_state() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let define = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 40",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &define);
+        let _ = recv_message(&shell, &signer);
+        let _ = recv_iopub_messages_for_parent(&iopub, &signer, &define.header.msg_id, 3);
+
+        let inspect = client_request(
+            "client-session",
+            "inspect_request",
+            json!({
+                "code": "value",
+                "cursor_pos": 5,
+                "detail_level": 1,
+            }),
+        );
+        send_client_message(&shell, &signer, &inspect);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "inspect_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(reply.content.get("found"), Some(&json!(true)));
+        let text = reply.content["data"]
+            .get("text/plain")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.starts_with("40\ntype: int"));
+        assert_eq!(
+            reply.content["metadata"].get("type_name"),
+            Some(&json!("int"))
+        );
+
+        let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &inspect.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
 
         runtime.stop().unwrap();
     }

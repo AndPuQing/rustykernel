@@ -266,6 +266,137 @@ def test_execute_request_persists_state_and_publishes_result(
         kernel.stop()
 
 
+def test_complete_request_returns_python_matches(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(kernel.endpoints.iopub)
+    shell.setsockopt(zmq.RCVTIMEO, 2000)
+    iopub.setsockopt(zmq.RCVTIMEO, 2000)
+    time.sleep(0.1)
+
+    try:
+        define_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value = 40",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        define_reply = recv_message(shell, str(payload["key"]))
+        assert define_reply["content"]["status"] == "ok"
+        recv_iopub_messages_for_parent(iopub, str(payload["key"]), define_header["msg_id"], 3)
+
+        complete_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "complete_request",
+            {
+                "code": "val",
+                "cursor_pos": 3,
+            },
+        )
+        complete_reply = recv_message(shell, str(payload["key"]))
+        assert complete_reply["header"]["msg_type"] == "complete_reply"
+        assert complete_reply["content"]["status"] == "ok"
+        assert "value" in complete_reply["content"]["matches"]
+        assert complete_reply["content"]["cursor_start"] == 0
+        assert complete_reply["content"]["cursor_end"] == 3
+
+        published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), complete_header["msg_id"], 2
+        )
+        assert [message["content"]["execution_state"] for message in published] == [
+            "busy",
+            "idle",
+        ]
+    finally:
+        shell.close(0)
+        iopub.close(0)
+        kernel.stop()
+
+
+def test_inspect_request_returns_python_details(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(kernel.endpoints.iopub)
+    shell.setsockopt(zmq.RCVTIMEO, 2000)
+    iopub.setsockopt(zmq.RCVTIMEO, 2000)
+    time.sleep(0.1)
+
+    try:
+        define_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value = 40",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        define_reply = recv_message(shell, str(payload["key"]))
+        assert define_reply["content"]["status"] == "ok"
+        recv_iopub_messages_for_parent(iopub, str(payload["key"]), define_header["msg_id"], 3)
+
+        inspect_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "inspect_request",
+            {
+                "code": "value",
+                "cursor_pos": 5,
+                "detail_level": 1,
+            },
+        )
+        inspect_reply = recv_message(shell, str(payload["key"]))
+        assert inspect_reply["header"]["msg_type"] == "inspect_reply"
+        assert inspect_reply["content"]["status"] == "ok"
+        assert inspect_reply["content"]["found"] is True
+        assert inspect_reply["content"]["data"]["text/plain"].startswith("40\ntype: int")
+        assert inspect_reply["content"]["metadata"]["type_name"] == "int"
+
+        published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), inspect_header["msg_id"], 2
+        )
+        assert [message["content"]["execution_state"] for message in published] == [
+            "busy",
+            "idle",
+        ]
+    finally:
+        shell.close(0)
+        iopub.close(0)
+        kernel.stop()
+
+
 def test_control_restart_clears_worker_state(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:
