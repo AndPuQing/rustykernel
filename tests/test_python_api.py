@@ -332,3 +332,71 @@ def test_control_restart_clears_worker_state(
         shell.close(0)
         control.close(0)
         kernel.stop()
+
+
+def test_control_interrupt_restarts_worker_state(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    control = zmq_context.socket(zmq.DEALER)
+    control.connect(kernel.endpoints.control)
+    shell.setsockopt(zmq.RCVTIMEO, 2000)
+    control.setsockopt(zmq.RCVTIMEO, 2000)
+    time.sleep(0.1)
+
+    try:
+        send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value = 123",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        define_reply = recv_message(shell, str(payload["key"]))
+        assert define_reply["content"]["status"] == "ok"
+
+        send_client_message(
+            control,
+            str(payload["key"]),
+            "python-test-session",
+            "interrupt_request",
+            {},
+        )
+        interrupt_reply = recv_message(control, str(payload["key"]))
+        assert interrupt_reply["header"]["msg_type"] == "interrupt_reply"
+        assert interrupt_reply["content"]["status"] == "ok"
+        assert kernel.is_running is True
+
+        send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        probe_reply = recv_message(shell, str(payload["key"]))
+        assert probe_reply["content"]["status"] == "error"
+        assert probe_reply["content"]["ename"] == "NameError"
+    finally:
+        shell.close(0)
+        control.close(0)
+        kernel.stop()
