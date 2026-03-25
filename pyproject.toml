@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.12,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustykernel"
+description = "Rust-first Python kernel runtime scaffold for VS Code and Jupyter clients"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Interpreters",
+]
+dynamic = ["version"]
+
+[project.scripts]
+rustykernel = "rustykernel.__main__:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "rustykernel._core"
+features = ["python"]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "src/**/*.rs" },
+    { file = "python/**/*.py" },
+]
