@@ -17,6 +17,18 @@ considered stale. For a `maturin` project that means the Rust and Python source
 files must be covered by `tool.uv.cache-keys`, and the project must be installed
 through the project environment (`uv sync`).
 
+To bind a real Jupyter connection file and keep the process alive, run:
+
+```bash
+uv run python -m rustykernel --connection-file /path/to/kernel-connection.json
+```
+
+That startup path now binds the `shell`, `iopub`, `stdin`, `control`, and
+`hb` sockets from the connection file. The runtime now runs a signed Jupyter
+message loop across `shell`, `control`, and `stdin`, publishes `status` and
+`execute_input` messages on `iopub`, and continues to echo heartbeat frames on
+`hb`.
+
 If you want an explicit rebuild without waiting for `uv` to resync the project,
 run:
 
@@ -38,6 +50,6 @@ LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_confi
 
 ## Next steps
 
-- Add kernel lifecycle management around the parsed connection file
-- Implement Jupyter message types and channel state machines in Rust
+- Add real execution, display data, and stdin request plumbing behind the new message loop
+- Expand shell/control coverage beyond the current baseline request handlers
 - Keep Python as a thin execution shim until protocol compatibility is stable

@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from ._core import ConnectionInfo, healthcheck, parse_connection_file, runtime_info
+from ._core import (
+    ConnectionInfo,
+    healthcheck,
+    parse_connection_file,
+    runtime_info,
+    start_kernel,
+)
 
 
 @dataclass(slots=True)
@@ -26,6 +33,39 @@ class KernelApp:
             "connection": connection,
             "healthcheck": healthcheck(),
         }
+
+    def run(self) -> int:
+        if self.connection_file is None:
+            payload = self.describe()
+            print(
+                "rustykernel scaffold ready "
+                f"(protocol {payload['protocol_version']}, "
+                f"connection_file={payload['connection_file']!r}, "
+                "no connection file loaded)"
+            )
+            return 0
+
+        connection = connection_to_dict(parse_connection_file(self.connection_file))
+        kernel = start_kernel(self.connection_file)
+        print(
+            "rustykernel channels bound "
+            f"(shell={kernel.endpoints.shell}, "
+            f"iopub={kernel.endpoints.iopub}, "
+            f"stdin={kernel.endpoints.stdin}, "
+            f"control={kernel.endpoints.control}, "
+            f"hb={kernel.endpoints.hb}, "
+            f"signature_scheme={connection['signature_scheme']})"
+        )
+
+        try:
+            while kernel.is_running:
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            kernel.stop()
+
+        return 0
 
     def load_connection(self) -> dict[str, Any] | None:
         if self.connection_file is None:
@@ -54,28 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     app = KernelApp(connection_file=args.connection_file)
-    payload = app.describe()
 
     if args.json:
+        payload = app.describe()
         print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        connection = payload["connection"]
-        connection_summary = "no connection file loaded"
-        if connection is not None:
-            connection_summary = (
-                f"{connection['transport']}://{connection['ip']} "
-                f"(shell={connection['shell_port']}, iopub={connection['iopub_port']}, "
-                f"stdin={connection['stdin_port']}, control={connection['control_port']}, "
-                f"hb={connection['hb_port']})"
-            )
-        print(
-            "rustykernel scaffold ready "
-            f"(protocol {payload['protocol_version']}, "
-            f"connection_file={payload['connection_file']!r}, "
-            f"{connection_summary})"
-        )
+        return 0
 
-    return 0
+    return app.run()
 
 
 def connection_to_dict(connection: ConnectionInfo) -> dict[str, Any]:
