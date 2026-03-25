@@ -19,6 +19,7 @@ dynamic = ["version"]
 [dependency-groups]
 dev = [
     "pytest>=8,<9",
+    "pyzmq>=26,<27",
 ]
 
 [project.scripts]
