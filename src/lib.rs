@@ -1,5 +1,6 @@
 mod kernel;
 mod protocol;
+mod worker;
 
 pub use crate::kernel::{
     ChannelEndpoints, ConnectionInfo, KernelError, KernelRuntime, KernelRuntimeInfo, healthcheck,
@@ -88,6 +89,7 @@ fn map_kernel_error(error: KernelError) -> PyErr {
         KernelError::InvalidConnectionFile(error) => {
             PyValueError::new_err(format!("invalid connection file JSON: {error}"))
         }
+        KernelError::Worker(message) => PyOSError::new_err(message),
         KernelError::Protocol(error) => PyValueError::new_err(error.to_string()),
         KernelError::Zmq(error) => PyOSError::new_err(error.to_string()),
         KernelError::HeartbeatThreadPanicked => PyOSError::new_err("heartbeat thread panicked"),

@@ -14,6 +14,7 @@ use crate::protocol::{
     IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, JupyterMessage, LANGUAGE, MessageHeader,
     MessageSigner, ProtocolError,
 };
+use crate::worker::PythonWorker;
 
 const CHANNEL_POLL_INTERVAL_MS: i64 = 100;
 const HEARTBEAT_POLL_INTERVAL_MS: i32 = 100;
@@ -72,6 +73,7 @@ pub enum KernelError {
     Io(io::Error),
     InvalidConnectionConfig(&'static str),
     InvalidConnectionFile(serde_json::Error),
+    Worker(String),
     Protocol(ProtocolError),
     Zmq(zmq::Error),
     HeartbeatThreadPanicked,
@@ -86,6 +88,7 @@ impl std::fmt::Display for KernelError {
             Self::InvalidConnectionFile(error) => {
                 write!(f, "invalid connection file JSON: {error}")
             }
+            Self::Worker(message) => f.write_str(message),
             Self::Protocol(error) => write!(f, "{error}"),
             Self::Zmq(error) => write!(f, "{error}"),
             Self::HeartbeatThreadPanicked => f.write_str("heartbeat thread panicked"),
@@ -197,6 +200,7 @@ struct MessageLoopState {
     signer: MessageSigner,
     kernel_session: String,
     execution_count: u32,
+    worker: PythonWorker,
 }
 
 impl MessageLoopState {
@@ -208,6 +212,7 @@ impl MessageLoopState {
                 .clone()
                 .unwrap_or_else(|| IMPLEMENTATION.to_owned()),
             execution_count: 0,
+            worker: PythonWorker::start()?,
         })
     }
 
@@ -509,18 +514,89 @@ fn handle_shell_request(
                 )?;
             }
 
-            send_reply(
-                reply_socket,
-                state,
-                request,
-                "execute_reply",
-                json!({
-                    "status": "ok",
-                    "execution_count": execution_count,
-                    "user_expressions": {},
-                    "payload": [],
-                }),
-            )?;
+            let outcome = state.worker.execute(code)?;
+
+            if !silent && !outcome.stdout.is_empty() {
+                publish_stream(
+                    iopub_socket,
+                    state,
+                    request.header_value.clone(),
+                    "stdout",
+                    &outcome.stdout,
+                )?;
+            }
+            if !silent && !outcome.stderr.is_empty() {
+                publish_stream(
+                    iopub_socket,
+                    state,
+                    request.header_value.clone(),
+                    "stderr",
+                    &outcome.stderr,
+                )?;
+            }
+
+            if outcome.status == "ok" {
+                if !silent {
+                    if let Some(result) = outcome.result {
+                        publish_iopub_message(
+                            iopub_socket,
+                            state,
+                            request.header_value.clone(),
+                            "execute_result",
+                            json!({
+                                "execution_count": execution_count,
+                                "data": result.data,
+                                "metadata": result.metadata,
+                            }),
+                        )?;
+                    }
+                }
+
+                send_reply(
+                    reply_socket,
+                    state,
+                    request,
+                    "execute_reply",
+                    json!({
+                        "status": "ok",
+                        "execution_count": execution_count,
+                        "user_expressions": {},
+                        "payload": [],
+                    }),
+                )?;
+            } else {
+                let ename = outcome.ename.unwrap_or_else(|| "ExecutionError".to_owned());
+                let evalue = outcome.evalue.unwrap_or_default();
+                let traceback = outcome.traceback;
+
+                if !silent {
+                    publish_iopub_message(
+                        iopub_socket,
+                        state,
+                        request.header_value.clone(),
+                        "error",
+                        json!({
+                            "ename": ename,
+                            "evalue": evalue,
+                            "traceback": traceback,
+                        }),
+                    )?;
+                }
+
+                send_reply(
+                    reply_socket,
+                    state,
+                    request,
+                    "execute_reply",
+                    json!({
+                        "status": "error",
+                        "execution_count": execution_count,
+                        "ename": ename,
+                        "evalue": evalue,
+                        "traceback": traceback,
+                    }),
+                )?;
+            }
             Ok(false)
         }
         "is_complete_request" => {
@@ -622,6 +698,7 @@ fn handle_control_request(
         }
         "shutdown_request" => handle_shutdown_request(reply_socket, state, request),
         "interrupt_request" => {
+            state.worker.restart()?;
             send_reply(
                 reply_socket,
                 state,
@@ -645,6 +722,11 @@ fn handle_shutdown_request(
         .get("restart")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+
+    if restart {
+        state.worker.restart()?;
+    }
+
     send_reply(
         reply_socket,
         state,
@@ -655,7 +737,7 @@ fn handle_shutdown_request(
             "restart": restart,
         }),
     )?;
-    Ok(true)
+    Ok(!restart)
 }
 
 fn send_unsupported_reply(
@@ -741,6 +823,25 @@ fn publish_iopub_message(
     );
     socket.send_multipart(state.signer.encode(&message)?, 0)?;
     Ok(())
+}
+
+fn publish_stream(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    parent_header: Value,
+    name: &str,
+    text: &str,
+) -> Result<(), KernelError> {
+    publish_iopub_message(
+        socket,
+        state,
+        parent_header,
+        "stream",
+        json!({
+            "name": name,
+            "text": text,
+        }),
+    )
 }
 
 fn reply_type_for(msg_type: &str) -> String {
@@ -844,6 +945,7 @@ pub fn runtime_info() -> KernelRuntimeInfo {
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -852,8 +954,14 @@ mod tests {
     use super::{ConnectionConfig, ConnectionInfo, KernelError, start_kernel};
     use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
 
+    fn test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
     #[test]
     fn accepts_valid_connection_config() {
+        let _guard = test_lock();
         let config: ConnectionConfig = serde_json::from_str(
             r#"{
                 "transport": "tcp",
@@ -879,6 +987,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_transport() {
+        let _guard = test_lock();
         let config: ConnectionConfig = serde_json::from_str(
             r#"{
                 "transport": "",
@@ -903,6 +1012,7 @@ mod tests {
 
     #[test]
     fn builds_channel_endpoints_from_connection() {
+        let _guard = test_lock();
         let connection = test_connection_info();
         let endpoints = connection.channel_endpoints();
 
@@ -930,6 +1040,7 @@ mod tests {
 
     #[test]
     fn heartbeat_channel_echoes_messages() {
+        let _guard = test_lock();
         let connection = test_connection_info();
         let mut runtime = start_kernel(connection).unwrap();
 
@@ -951,6 +1062,7 @@ mod tests {
 
     #[test]
     fn shell_channel_replies_to_kernel_info_and_publishes_status() {
+        let _guard = test_lock();
         let connection = test_connection_info();
         let mut runtime = start_kernel(connection.clone()).unwrap();
         let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
@@ -977,6 +1089,7 @@ mod tests {
 
     #[test]
     fn execute_request_publishes_execute_input_and_reply() {
+        let _guard = test_lock();
         let connection = test_connection_info();
         let mut runtime = start_kernel(connection.clone()).unwrap();
         let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
@@ -1007,24 +1120,149 @@ mod tests {
         assert_eq!(reply.content.get("status"), Some(&json!("ok")));
         assert_eq!(reply.content.get("execution_count"), Some(&json!(1)));
 
-        let published = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 3);
+        let published = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 4);
         let msg_types: Vec<_> = published
             .iter()
             .map(|message| message.header.msg_type.as_str())
             .collect();
-        assert_eq!(msg_types, vec!["status", "execute_input", "status"]);
+        assert_eq!(
+            msg_types,
+            vec!["status", "execute_input", "stream", "status"]
+        );
         assert_eq!(
             published[1].content.get("code"),
             Some(&json!("print('hello')"))
         );
         assert_eq!(published[1].content.get("execution_count"), Some(&json!(1)));
+        assert_eq!(published[2].content.get("name"), Some(&json!("stdout")));
+        assert_eq!(published[2].content.get("text"), Some(&json!("hello\n")));
         assert_eq!(status_message_states(&published), vec!["busy", "idle"]);
 
         runtime.stop().unwrap();
     }
 
     #[test]
+    fn execute_request_publishes_execute_result() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let request = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "1 + 2",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &request);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "execute_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+
+        let published = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 4);
+        let msg_types: Vec<_> = published
+            .iter()
+            .map(|message| message.header.msg_type.as_str())
+            .collect();
+        assert_eq!(
+            msg_types,
+            vec!["status", "execute_input", "execute_result", "status"]
+        );
+        assert_eq!(
+            published[2]
+                .content
+                .get("data")
+                .and_then(|data| data.get("text/plain")),
+            Some(&json!("3"))
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn execute_request_preserves_state_across_cells() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let first = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 40",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &first);
+        let first_reply = recv_message(&shell, &signer);
+        assert_eq!(first_reply.content.get("status"), Some(&json!("ok")));
+        let first_published =
+            recv_iopub_messages_for_parent(&iopub, &signer, &first.header.msg_id, 3);
+        let first_types: Vec<_> = first_published
+            .iter()
+            .map(|message| message.header.msg_type.as_str())
+            .collect();
+        assert_eq!(first_types, vec!["status", "execute_input", "status"]);
+
+        let second = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value + 2",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &second);
+        let second_reply = recv_message(&shell, &signer);
+        assert_eq!(second_reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(second_reply.content.get("execution_count"), Some(&json!(2)));
+
+        let second_published =
+            recv_iopub_messages_for_parent(&iopub, &signer, &second.header.msg_id, 4);
+        assert_eq!(
+            second_published[2]
+                .content
+                .get("data")
+                .and_then(|data| data.get("text/plain")),
+            Some(&json!("42"))
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn stdin_channel_accepts_input_reply_without_stopping_kernel() {
+        let _guard = test_lock();
         let connection = test_connection_info();
         let mut runtime = start_kernel(connection.clone()).unwrap();
         let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
@@ -1058,7 +1296,68 @@ mod tests {
     }
 
     #[test]
+    fn control_channel_interrupt_request_restarts_worker_state() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+
+        let define = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 99",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &define);
+        let _ = recv_message(&shell, &signer);
+
+        let interrupt = client_request("client-session", "interrupt_request", json!({}));
+        send_client_message(&control, &signer, &interrupt);
+        let interrupt_reply = recv_message(&control, &signer);
+        assert_eq!(interrupt_reply.header.msg_type, "interrupt_reply");
+        assert_eq!(interrupt_reply.content.get("status"), Some(&json!("ok")));
+
+        let probe = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &probe);
+        let probe_reply = recv_message(&shell, &signer);
+        assert_eq!(probe_reply.header.msg_type, "execute_reply");
+        assert_eq!(probe_reply.content.get("status"), Some(&json!("error")));
+        assert_eq!(probe_reply.content.get("ename"), Some(&json!("NameError")));
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn control_channel_shutdown_request_stops_kernel() {
+        let _guard = test_lock();
         let connection = test_connection_info();
         let mut runtime = start_kernel(connection.clone()).unwrap();
         let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
@@ -1084,6 +1383,77 @@ mod tests {
 
         runtime.wait_for_shutdown();
         assert!(!runtime.is_running());
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn control_channel_shutdown_request_with_restart_keeps_kernel_running() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+
+        let define = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 7",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &define);
+        let _ = recv_message(&shell, &signer);
+
+        let restart = client_request(
+            "client-session",
+            "shutdown_request",
+            json!({
+                "restart": true,
+            }),
+        );
+        send_client_message(&control, &signer, &restart);
+        let restart_reply = recv_message(&control, &signer);
+        assert_eq!(restart_reply.header.msg_type, "shutdown_reply");
+        assert_eq!(restart_reply.content.get("restart"), Some(&json!(true)));
+        assert!(runtime.is_running());
+
+        let probe = client_request("client-session", "kernel_info_request", json!({}));
+        send_client_message(&shell, &signer, &probe);
+        let probe_reply = recv_message(&shell, &signer);
+        assert_eq!(probe_reply.header.msg_type, "kernel_info_reply");
+
+        let state_probe = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &state_probe);
+        let state_reply = recv_message(&shell, &signer);
+        assert_eq!(state_reply.content.get("status"), Some(&json!("error")));
+        assert_eq!(state_reply.content.get("ename"), Some(&json!("NameError")));
+
         runtime.stop().unwrap();
     }
 
