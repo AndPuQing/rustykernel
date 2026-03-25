@@ -36,8 +36,15 @@ run:
 uv run maturin develop
 ```
 
-`cargo test` exercises the pure Rust layer by default. If you need to compile
-the PyO3 bindings in tests as well, use:
+`cargo test` exercises the pure Rust layer by default. For the installed Python
+surface, run:
+
+```bash
+uv run pytest
+```
+
+Only if you specifically need to compile the PyO3 bindings into the Rust test
+harness as well, use:
 
 ```bash
 LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))')" cargo test --features python
@@ -47,6 +54,7 @@ LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_confi
 
 - `src/`: Rust extension module exposed as `rustykernel._core`
 - `python/rustykernel/`: Python package, CLI entrypoint, future kernel launcher
+- `tests/`: Python-side integration tests for the installed extension module
 
 ## Next steps
 

@@ -16,6 +16,11 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+]
+
 [project.scripts]
 rustykernel = "rustykernel.__main__:main"
 

@@ -19,6 +19,21 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v7
+      - name: Run Rust tests
+        run: cargo test
+      - name: Sync Python environment
+        run: uv sync
+      - name: Run Python integration tests
+        run: uv run pytest
+
   linux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
