@@ -20,10 +20,20 @@ considered stale. For a `maturin` project that means the Rust and Python source
 files must be covered by `tool.uv.cache-keys`, and the project must be installed
 through the project environment (`uv sync`).
 
+To install a real Jupyter kernelspec into the current environment, run:
+
+```bash
+uv run python -m rustykernel install --sys-prefix
+```
+
+That writes a `kernel.json` using `python -m rustykernel -f {connection_file}`
+as the launcher, so Jupyter frontends can discover and start the kernel like a
+normal installed runtime.
+
 To bind a real Jupyter connection file and keep the process alive, run:
 
 ```bash
-uv run python -m rustykernel --connection-file /path/to/kernel-connection.json
+uv run python -m rustykernel -f /path/to/kernel-connection.json
 ```
 
 That startup path now binds the `shell`, `iopub`, `stdin`, `control`, and
@@ -40,9 +50,10 @@ Implemented today:
 - `execute_request` with persistent Python state across cells
 - `complete_request`
 - `inspect_request`
+- `history_request`
 - completion metadata via `_jupyter_types_experimental`
 - `is_complete_request` with syntax-aware complete / incomplete / invalid replies
-- `history_request` and `comm_info_request` placeholder replies
+- `comm_info_request` placeholder replies
 - `interrupt_request` on the control channel
 - explicit `display_data` / `update_display_data` publishing for `IPython.display`-style rich output updates
 - `shutdown_request` on shell/control
@@ -93,6 +104,6 @@ LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_confi
 
 ## Next steps
 
+- Improve kernelspec resources and launcher ergonomics beyond the minimal installed `kernel.json`
 - Implement richer `inspect_request` / `complete_request` behavior closer to notebook clients
-- Add real stdin request plumbing from kernel to frontend instead of only accepting `input_reply`
 - Improve protocol coverage for more frontend-driven requests as compatibility needs become clearer

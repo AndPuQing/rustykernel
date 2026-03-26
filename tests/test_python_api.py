@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import hashlib
 import hmac
+import json
 import socket
 import subprocess
 import sys
@@ -200,6 +200,50 @@ def test_module_cli_prints_json_description() -> None:
     assert payload["connection"] is None
 
 
+def test_connect_request_reports_bound_ports(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(kernel.endpoints.iopub)
+    shell.setsockopt(zmq.RCVTIMEO, 2000)
+    iopub.setsockopt(zmq.RCVTIMEO, 2000)
+    time.sleep(0.1)
+
+    try:
+        connect_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "connect_request",
+            {},
+        )
+        connect_reply = recv_message(shell, str(payload["key"]))
+        assert connect_reply["header"]["msg_type"] == "connect_reply"
+        assert connect_reply["content"]["status"] == "ok"
+        assert connect_reply["content"]["shell_port"] == payload["shell_port"]
+        assert connect_reply["content"]["control_port"] == payload["control_port"]
+        assert connect_reply["content"]["hb_port"] == payload["hb_port"]
+
+        published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), connect_header["msg_id"], 2
+        )
+        assert [message["content"]["execution_state"] for message in published] == [
+            "busy",
+            "idle",
+        ]
+    finally:
+        shell.close(0)
+        iopub.close(0)
+        kernel.stop()
+
+
 def test_execute_request_persists_state_and_publishes_result(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:
@@ -266,6 +310,196 @@ def test_execute_request_persists_state_and_publishes_result(
             "status",
         ]
         assert published[2]["content"]["data"]["text/plain"] == "42"
+    finally:
+        shell.close(0)
+        iopub.close(0)
+        kernel.stop()
+
+
+def test_execute_reply_includes_user_expressions(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(kernel.endpoints.iopub)
+    shell.setsockopt(zmq.RCVTIMEO, 2000)
+    iopub.setsockopt(zmq.RCVTIMEO, 2000)
+    time.sleep(0.1)
+
+    try:
+        execute_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value = 21",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {
+                    "double": "value * 2",
+                    "missing": "unknown_name",
+                },
+                "stop_on_error": True,
+            },
+        )
+        execute_reply = recv_message(shell, str(payload["key"]))
+        assert execute_reply["header"]["msg_type"] == "execute_reply"
+        assert execute_reply["content"]["status"] == "ok"
+        assert execute_reply["content"]["user_expressions"]["double"] == {
+            "status": "ok",
+            "data": {"text/plain": "42"},
+            "metadata": {},
+        }
+        assert (
+            execute_reply["content"]["user_expressions"]["missing"]["status"] == "error"
+        )
+        assert (
+            execute_reply["content"]["user_expressions"]["missing"]["ename"]
+            == "NameError"
+        )
+
+        published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), execute_header["msg_id"], 3
+        )
+        assert [message["header"]["msg_type"] for message in published] == [
+            "status",
+            "execute_input",
+            "status",
+        ]
+    finally:
+        shell.close(0)
+        iopub.close(0)
+        kernel.stop()
+
+
+def test_history_request_returns_recorded_entries(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(kernel.endpoints.iopub)
+    shell.setsockopt(zmq.RCVTIMEO, 2000)
+    iopub.setsockopt(zmq.RCVTIMEO, 2000)
+    time.sleep(0.1)
+
+    try:
+        first_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value = 40",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        first_reply = recv_message(shell, str(payload["key"]))
+        assert first_reply["content"]["status"] == "ok"
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), first_header["msg_id"], 3
+        )
+
+        second_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value + 2",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        second_reply = recv_message(shell, str(payload["key"]))
+        assert second_reply["content"]["status"] == "ok"
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), second_header["msg_id"], 4
+        )
+
+        range_reply_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "history_request",
+            {
+                "hist_access_type": "range",
+                "output": True,
+                "raw": True,
+                "session": 0,
+                "start": 0,
+                "stop": 3,
+            },
+        )
+        range_reply = recv_message(shell, str(payload["key"]))
+        assert range_reply["header"]["msg_type"] == "history_reply"
+        assert range_reply["content"]["status"] == "ok"
+        assert range_reply["content"]["history"] == [
+            [0, 0, ["", None]],
+            [0, 1, ["value = 40", None]],
+            [0, 2, ["value + 2", "42"]],
+        ]
+        published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), range_reply_header["msg_id"], 2
+        )
+        assert [message["content"]["execution_state"] for message in published] == [
+            "busy",
+            "idle",
+        ]
+
+        search_reply = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "history_request",
+            {
+                "hist_access_type": "range",
+                "output": False,
+                "raw": True,
+                "session": 1,
+                "start": -1,
+            },
+        )
+        current_session_range = recv_message(shell, str(payload["key"]))
+        assert current_session_range["content"]["history"] == [[0, 2, "value + 2"]]
+
+        search_reply = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "history_request",
+            {
+                "hist_access_type": "search",
+                "output": False,
+                "raw": True,
+                "session": 0,
+                "pattern": "value*",
+                "n": 1,
+            },
+        )
+        assert search_reply["msg_id"]
+        search_message = recv_message(shell, str(payload["key"]))
+        assert search_message["content"]["history"] == [[1, 2, "value + 2"]]
     finally:
         shell.close(0)
         iopub.close(0)
@@ -927,6 +1161,44 @@ def test_control_restart_clears_worker_state(
         probe_reply = recv_message(shell, str(payload["key"]))
         assert probe_reply["content"]["status"] == "error"
         assert probe_reply["content"]["ename"] == "NameError"
+        assert probe_reply["content"]["execution_count"] == 1
+
+        send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "history_request",
+            {
+                "hist_access_type": "range",
+                "output": False,
+                "raw": True,
+                "session": -1,
+                "start": 1,
+                "stop": 2,
+            },
+        )
+        previous_session_reply = recv_message(shell, str(payload["key"]))
+        assert previous_session_reply["content"]["history"] == [[1, 1, "value = 7"]]
+
+        send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "history_request",
+            {
+                "hist_access_type": "search",
+                "output": False,
+                "raw": True,
+                "session": 0,
+                "pattern": "value*",
+                "n": 10,
+            },
+        )
+        search_reply = recv_message(shell, str(payload["key"]))
+        assert search_reply["content"]["history"] == [
+            [1, 1, "value = 7"],
+            [2, 1, "value"],
+        ]
     finally:
         shell.close(0)
         control.close(0)
@@ -995,6 +1267,26 @@ def test_control_interrupt_restarts_worker_state(
         probe_reply = recv_message(shell, str(payload["key"]))
         assert probe_reply["content"]["status"] == "error"
         assert probe_reply["content"]["ename"] == "NameError"
+        assert probe_reply["content"]["execution_count"] == 1
+
+        send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "history_request",
+            {
+                "hist_access_type": "tail",
+                "output": False,
+                "raw": True,
+                "session": 0,
+                "n": 10,
+            },
+        )
+        history_reply = recv_message(shell, str(payload["key"]))
+        assert history_reply["content"]["history"] == [
+            [1, 1, "value = 123"],
+            [2, 1, "value"],
+        ]
     finally:
         shell.close(0)
         control.close(0)

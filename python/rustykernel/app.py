@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -15,6 +16,7 @@ from ._core import (
     runtime_info,
     start_kernel,
 )
+from .kernelspec import KERNEL_NAME, install as install_kernel_spec
 
 
 @dataclass(slots=True)
@@ -45,17 +47,8 @@ class KernelApp:
             )
             return 0
 
-        connection = connection_to_dict(parse_connection_file(self.connection_file))
+        parse_connection_file(self.connection_file)
         kernel = start_kernel(self.connection_file)
-        print(
-            "rustykernel channels bound "
-            f"(shell={kernel.endpoints.shell}, "
-            f"iopub={kernel.endpoints.iopub}, "
-            f"stdin={kernel.endpoints.stdin}, "
-            f"control={kernel.endpoints.control}, "
-            f"hb={kernel.endpoints.hb}, "
-            f"signature_scheme={connection['signature_scheme']})"
-        )
 
         try:
             while kernel.is_running:
@@ -80,19 +73,61 @@ def build_parser() -> argparse.ArgumentParser:
         description="Rust-first Python kernel runtime scaffold.",
     )
     parser.add_argument(
+        "-f",
         "--connection-file",
-        help="Future Jupyter connection file path.",
+        help="Jupyter connection file path.",
     )
     parser.add_argument(
         "--json",
         action="store_true",
         help="Print runtime metadata as JSON.",
     )
+    subparsers = parser.add_subparsers(dest="command")
+    install_parser = subparsers.add_parser(
+        "install",
+        help="Install the rustykernel kernelspec.",
+    )
+    install_parser.add_argument(
+        "--user",
+        action="store_true",
+        help="Install for the current user instead of system-wide.",
+    )
+    install_parser.add_argument(
+        "--prefix",
+        help="Install into the given prefix.",
+    )
+    install_parser.add_argument(
+        "--sys-prefix",
+        action="store_const",
+        const=sys.prefix,
+        dest="prefix",
+        help="Install into the active Python environment prefix.",
+    )
+    install_parser.add_argument(
+        "--name",
+        default=KERNEL_NAME,
+        help="Kernel spec name to install.",
+    )
+    install_parser.add_argument(
+        "--display-name",
+        help="Display name shown by Jupyter frontends.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.command == "install":
+        destination = install_kernel_spec(
+            user=args.user,
+            kernel_name=args.name,
+            display_name=args.display_name,
+            prefix=args.prefix,
+        )
+        print(destination)
+        return 0
+
     app = KernelApp(connection_file=args.connection_file)
 
     if args.json:

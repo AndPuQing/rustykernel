@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ast
 import builtins
 import codeop
@@ -29,7 +31,15 @@ namespace: dict[str, object] = {"__name__": "__main__"}
 completer = rlcompleter.Completer(namespace)
 COMPLETION_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)$")
 DISPLAY_EVENTS: list[dict[str, object]] = []
-CURRENT_REQUEST_ID: Optional[int] = None
+CURRENT_REQUEST_ID: int | None = None
+
+
+def protocol_stdout() -> io.TextIOBase:
+    return sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
+
+
+def protocol_stdin() -> io.TextIOBase:
+    return sys.__stdin__ if sys.__stdin__ is not None else sys.stdin
 
 
 def completion_kind(value: object) -> str:
@@ -329,7 +339,7 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
     if CURRENT_REQUEST_ID is None:
         raise RuntimeError("input() is only available while handling a request")
 
-    sys.stdout.write(
+    protocol_stdout().write(
         json.dumps(
             {
                 "id": CURRENT_REQUEST_ID,
@@ -340,10 +350,10 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
         )
         + "\n"
     )
-    sys.stdout.flush()
+    protocol_stdout().flush()
 
     while True:
-        raw_line = sys.stdin.readline()
+        raw_line = protocol_stdin().readline()
         if not raw_line:
             raise EOFError("stdin channel closed")
         if not raw_line.strip():
@@ -393,7 +403,42 @@ install_display_api()
 install_input_api()
 
 
-def execute(code: str, request_id: int) -> dict[str, object]:
+def evaluate_user_expressions(user_expressions: object) -> dict[str, object]:
+    if not isinstance(user_expressions, dict):
+        return {}
+
+    results: dict[str, object] = {}
+    for name, expression in user_expressions.items():
+        expression_name = str(name)
+        try:
+            if not isinstance(expression, str):
+                raise TypeError("user_expressions values must be strings")
+            value = eval(
+                compile(expression, "<rustykernel:user_expression>", "eval"),
+                namespace,
+                namespace,
+            )
+            data, metadata = rich_display_data(value)
+            results[expression_name] = {
+                "status": "ok",
+                "data": data,
+                "metadata": metadata,
+            }
+        except BaseException as exc:
+            results[expression_name] = {
+                "status": "error",
+                "ename": exc.__class__.__name__,
+                "evalue": str(exc),
+                "traceback": traceback.format_exception(
+                    type(exc), exc, exc.__traceback__
+                ),
+            }
+    return results
+
+
+def execute(
+    code: str, request_id: int, user_expressions: object | None = None
+) -> dict[str, object]:
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
     payload: dict[str, object] = {
@@ -402,6 +447,7 @@ def execute(code: str, request_id: int) -> dict[str, object]:
         "stderr": "",
         "displays": [],
         "result": None,
+        "user_expressions": {},
         "ename": None,
         "evalue": None,
         "traceback": [],
@@ -434,6 +480,7 @@ def execute(code: str, request_id: int) -> dict[str, object]:
                         "data": data,
                         "metadata": metadata,
                     }
+            payload["user_expressions"] = evaluate_user_expressions(user_expressions)
     except BaseException as exc:
         payload["status"] = "error"
         payload["ename"] = exc.__class__.__name__
@@ -670,7 +717,16 @@ def is_complete(code: str) -> dict[str, object]:
     }
 
 
-for raw_line in sys.stdin:
+def kernel_info_payload() -> dict[str, object]:
+    version_info = sys.version_info
+    return {
+        "language_version": sys.version.split()[0],
+        "language_version_major": version_info.major,
+        "language_version_minor": version_info.minor,
+    }
+
+
+for raw_line in protocol_stdin():
     if not raw_line.strip():
         continue
     request = json.loads(raw_line)
@@ -694,12 +750,21 @@ for raw_line in sys.stdin:
                 int(request.get("detail_level", 0)),
             ),
         }
+    elif kind == "kernel_info":
+        response = {
+            "id": request["id"],
+            **kernel_info_payload(),
+        }
     elif kind == "input_reply":
         continue
     else:
         response = {
             "id": request["id"],
-            **execute(request.get("code", ""), int(request["id"])),
+            **execute(
+                request.get("code", ""),
+                int(request["id"]),
+                request.get("user_expressions", {}),
+            ),
         }
     sys.stdout.write(json.dumps(response) + "\n")
     sys.stdout.flush()

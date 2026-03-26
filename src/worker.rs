@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::kernel::KernelError;
 
@@ -38,6 +38,8 @@ pub struct ExecutionOutcome {
     pub displays: Vec<ExecutionDisplayEvent>,
     #[serde(default)]
     pub result: Option<ExecutionDisplay>,
+    #[serde(default)]
+    pub user_expressions: Map<String, Value>,
     #[serde(default)]
     pub ename: Option<String>,
     #[serde(default)]
@@ -75,11 +77,22 @@ pub struct IsCompleteOutcome {
     pub indent: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkerKernelInfo {
+    pub language_version: String,
+    pub language_version_major: u8,
+    pub language_version_minor: u8,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind")]
 enum WorkerRequest<'a> {
     #[serde(rename = "execute")]
-    Execute { id: u64, code: &'a str },
+    Execute {
+        id: u64,
+        code: &'a str,
+        user_expressions: &'a Value,
+    },
     #[serde(rename = "input_reply")]
     InputReply {
         id: u64,
@@ -102,6 +115,8 @@ enum WorkerRequest<'a> {
         cursor_pos: usize,
         detail_level: u8,
     },
+    #[serde(rename = "kernel_info")]
+    KernelInfo { id: u64 },
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +173,7 @@ impl PythonWorker {
     pub fn execute<F>(
         &mut self,
         code: &str,
+        user_expressions: &Value,
         mut on_input: F,
     ) -> Result<ExecutionOutcome, KernelError>
     where
@@ -168,6 +184,7 @@ impl PythonWorker {
         let request = WorkerRequest::Execute {
             id: request_id,
             code,
+            user_expressions,
         };
 
         let payload = serde_json::to_vec(&request).map_err(|error| {
@@ -290,6 +307,14 @@ impl PythonWorker {
         };
         let response: WorkerEnvelope<IsCompleteOutcome> =
             self.send_request(&request, request_id)?;
+        Ok(response.payload)
+    }
+
+    pub fn kernel_info(&mut self) -> Result<WorkerKernelInfo, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::KernelInfo { id: request_id };
+        let response: WorkerEnvelope<WorkerKernelInfo> = self.send_request(&request, request_id)?;
         Ok(response.payload)
     }
 

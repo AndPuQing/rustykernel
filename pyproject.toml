@@ -17,10 +17,12 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "jedi>=0.19,<0.20",
+    "jupyter-client>=8,<9",
 ]
 
 [dependency-groups]
 dev = [
+    "ipykernel>=6,<8",
     "pytest>=8,<9",
     "pyzmq>=26,<27",
 ]

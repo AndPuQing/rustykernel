@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::sync::mpsc;
@@ -14,7 +15,7 @@ use crate::protocol::{
     IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, JupyterMessage, LANGUAGE, MessageHeader,
     MessageSigner, ProtocolError,
 };
-use crate::worker::PythonWorker;
+use crate::worker::{ExecutionOutcome, PythonWorker, WorkerKernelInfo};
 
 const CHANNEL_POLL_INTERVAL_MS: i64 = 100;
 const HEARTBEAT_POLL_INTERVAL_MS: i32 = 100;
@@ -197,22 +198,52 @@ impl ShutdownSignal {
 }
 
 struct MessageLoopState {
+    connection: ConnectionInfo,
     signer: MessageSigner,
     kernel_session: String,
     execution_count: u32,
+    history: HistoryStore,
     worker: PythonWorker,
+    worker_kernel_info: WorkerKernelInfo,
+}
+
+struct HistoryStore {
+    sessions: Vec<HistorySession>,
+}
+
+struct HistorySession {
+    id: u32,
+    entries: Vec<HistoryEntry>,
+}
+
+struct HistoryEntry {
+    line: u32,
+    input: String,
+    output: Option<String>,
+}
+
+struct HistoryReplyEntry {
+    session: u32,
+    line: u32,
+    input: String,
+    output: Option<String>,
 }
 
 impl MessageLoopState {
     fn new(connection: &ConnectionInfo) -> Result<Self, KernelError> {
+        let mut worker = PythonWorker::start()?;
+        let worker_kernel_info = worker.kernel_info()?;
         Ok(Self {
+            connection: connection.clone(),
             signer: MessageSigner::new(&connection.signature_scheme, &connection.key)?,
             kernel_session: connection
                 .kernel_name
                 .clone()
                 .unwrap_or_else(|| IMPLEMENTATION.to_owned()),
             execution_count: 0,
-            worker: PythonWorker::start()?,
+            history: HistoryStore::new(),
+            worker,
+            worker_kernel_info,
         })
     }
 
@@ -237,6 +268,394 @@ impl MessageLoopState {
     fn new_header(&self, msg_type: &str) -> MessageHeader {
         MessageHeader::new(msg_type, &self.kernel_session)
     }
+
+    fn connect_reply_content(&self) -> Value {
+        json!({
+            "status": "ok",
+            "shell_port": self.connection.shell_port,
+            "iopub_port": self.connection.iopub_port,
+            "stdin_port": self.connection.stdin_port,
+            "control_port": self.connection.control_port,
+            "hb_port": self.connection.hb_port,
+        })
+    }
+
+    fn record_history(&mut self, line: u32, input: &str, outcome: &ExecutionOutcome) {
+        self.history.record(line, input, outcome);
+    }
+
+    fn history_reply_content(&self, request: &Value) -> Value {
+        self.history.reply_content(request)
+    }
+
+    fn kernel_info_content(&self) -> Value {
+        let language_version = &self.worker_kernel_info.language_version;
+        let language_version_major = self.worker_kernel_info.language_version_major;
+        let language_version_minor = self.worker_kernel_info.language_version_minor;
+
+        json!({
+            "status": "ok",
+            "protocol_version": JUPYTER_PROTOCOL_VERSION,
+            "implementation": IMPLEMENTATION,
+            "implementation_version": env!("CARGO_PKG_VERSION"),
+            "banner": format!(
+                "{IMPLEMENTATION} {} (Python {language_version})",
+                env!("CARGO_PKG_VERSION"),
+            ),
+            // Some clients still probe the pre-v5 aliases before falling back to
+            // language_info, so keep them in sync to reduce frontend branching.
+            "language": LANGUAGE,
+            "language_version": language_version,
+            "debugger": false,
+            "help_links": [{
+                "text": "Python Reference",
+                "url": format!("https://docs.python.org/{language_version_major}.{language_version_minor}"),
+            }],
+            "supported_features": [],
+            "language_info": {
+                "name": LANGUAGE,
+                "version": language_version,
+                "mimetype": "text/x-python",
+                "file_extension": ".py",
+                "pygments_lexer": format!("ipython{language_version_major}"),
+                "nbconvert_exporter": "python",
+                "codemirror_mode": {
+                    "name": "ipython",
+                    "version": language_version_major,
+                },
+            },
+        })
+    }
+
+    fn restart(&mut self) -> Result<(), KernelError> {
+        self.worker.restart()?;
+        self.worker_kernel_info = self.worker.kernel_info()?;
+        self.execution_count = 0;
+        self.history.start_new_session();
+        Ok(())
+    }
+}
+
+impl HistoryStore {
+    fn new() -> Self {
+        Self {
+            sessions: vec![HistorySession::new(1)],
+        }
+    }
+
+    fn record(&mut self, line: u32, input: &str, outcome: &ExecutionOutcome) {
+        self.current_session_mut().entries.push(HistoryEntry {
+            line,
+            input: input.to_owned(),
+            output: history_output(outcome),
+        });
+    }
+
+    fn reply_content(&self, request: &Value) -> Value {
+        let hist_access_type = request
+            .get("hist_access_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let output = request
+            .get("output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let session = request
+            .get("session")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0);
+        let start = request
+            .get("start")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0);
+        let stop = request
+            .get("stop")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let n = request
+            .get("n")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok());
+        let pattern = request
+            .get("pattern")
+            .and_then(Value::as_str)
+            .unwrap_or("*");
+        let unique = request
+            .get("unique")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let history = match hist_access_type {
+            "tail" => self
+                .tail_entries(n.unwrap_or_else(|| self.entry_count()))
+                .into_iter()
+                .map(|entry| entry.as_value(output))
+                .collect::<Vec<_>>(),
+            "range" => self
+                .range_entries(session, start, stop)
+                .into_iter()
+                .map(|entry| entry.as_value(output))
+                .collect::<Vec<_>>(),
+            "search" => self
+                .search_entries(pattern, n, unique)
+                .into_iter()
+                .map(|entry| entry.as_value(output))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+
+        json!({
+            "status": "ok",
+            "history": history,
+        })
+    }
+
+    fn start_new_session(&mut self) {
+        let next_id = self.current_session_id().saturating_add(1);
+        self.sessions.push(HistorySession::new(next_id));
+    }
+
+    fn entry_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .map(|session| session.entries.len())
+            .sum()
+    }
+
+    fn current_session(&self) -> &HistorySession {
+        self.sessions
+            .last()
+            .expect("history store must keep a current session")
+    }
+
+    fn current_session_mut(&mut self) -> &mut HistorySession {
+        self.sessions
+            .last_mut()
+            .expect("history store must keep a current session")
+    }
+
+    fn current_session_id(&self) -> u32 {
+        self.current_session().id
+    }
+
+    fn resolve_session(&self, requested_session: i32) -> Option<&HistorySession> {
+        let current_session = i32::try_from(self.current_session_id()).ok()?;
+        let target_session = if requested_session <= 0 {
+            current_session + requested_session
+        } else {
+            requested_session
+        };
+
+        if target_session <= 0 {
+            return None;
+        }
+
+        let target_session = u32::try_from(target_session).ok()?;
+        self.sessions
+            .iter()
+            .find(|session| session.id == target_session)
+    }
+
+    fn tail_entries(&self, n: usize) -> Vec<HistoryReplyEntry> {
+        let mut entries = self.all_entries();
+        keep_last_entries(&mut entries, n);
+        entries
+    }
+
+    fn range_entries(
+        &self,
+        requested_session: i32,
+        start: i32,
+        stop: Option<i32>,
+    ) -> Vec<HistoryReplyEntry> {
+        let Some(session) = self.resolve_session(requested_session) else {
+            return Vec::new();
+        };
+
+        if session.id == self.current_session_id() {
+            return self.current_session_range_entries(start, stop);
+        }
+
+        session
+            .entries
+            .iter()
+            .filter(|entry| {
+                i32::try_from(entry.line).ok().is_some_and(|line| {
+                    line >= start && stop.is_none_or(|stop_line| line < stop_line)
+                })
+            })
+            .map(|entry| HistoryReplyEntry::from_entry(session.id, entry))
+            .collect()
+    }
+
+    fn current_session_range_entries(
+        &self,
+        start: i32,
+        stop: Option<i32>,
+    ) -> Vec<HistoryReplyEntry> {
+        let session = self.current_session();
+        let line_count = i32::try_from(session.entries.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .unwrap_or(i32::MAX);
+        let start = normalize_history_index(start, line_count);
+        let stop = stop
+            .map(|stop_line| normalize_history_index(stop_line, line_count))
+            .unwrap_or(line_count);
+
+        if start >= stop {
+            return Vec::new();
+        }
+
+        let mut entries = Vec::new();
+        if start == 0 {
+            entries.push(HistoryReplyEntry {
+                session: 0,
+                line: 0,
+                input: String::new(),
+                output: None,
+            });
+        }
+
+        let first_line = start.max(1);
+        for line in first_line..stop {
+            let Some(index) = usize::try_from(line - 1).ok() else {
+                continue;
+            };
+            let Some(entry) = session.entries.get(index) else {
+                continue;
+            };
+            entries.push(HistoryReplyEntry::from_entry(0, entry));
+        }
+
+        entries
+    }
+
+    fn search_entries(
+        &self,
+        pattern: &str,
+        n: Option<usize>,
+        unique: bool,
+    ) -> Vec<HistoryReplyEntry> {
+        let mut matches = self
+            .all_entries()
+            .into_iter()
+            .filter(|entry| matches_history_pattern(&entry.input, pattern))
+            .collect::<Vec<_>>();
+
+        if unique {
+            let mut latest_indices = HashMap::new();
+            for (index, entry) in matches.iter().enumerate() {
+                latest_indices.insert(entry.input.clone(), index);
+            }
+            matches = matches
+                .into_iter()
+                .enumerate()
+                .filter(|(index, entry)| latest_indices.get(&entry.input) == Some(index))
+                .map(|(_, entry)| entry)
+                .collect();
+        }
+
+        if let Some(limit) = n {
+            keep_last_entries(&mut matches, limit);
+        }
+
+        matches
+    }
+
+    fn all_entries(&self) -> Vec<HistoryReplyEntry> {
+        self.sessions
+            .iter()
+            .flat_map(|session| {
+                session
+                    .entries
+                    .iter()
+                    .map(move |entry| HistoryReplyEntry::from_entry(session.id, entry))
+            })
+            .collect()
+    }
+}
+
+impl HistorySession {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl HistoryReplyEntry {
+    fn from_entry(session: u32, entry: &HistoryEntry) -> Self {
+        Self {
+            session,
+            line: entry.line,
+            input: entry.input.clone(),
+            output: entry.output.clone(),
+        }
+    }
+
+    fn as_value(&self, include_output: bool) -> Value {
+        if include_output {
+            json!([self.session, self.line, [self.input, self.output]])
+        } else {
+            json!([self.session, self.line, self.input])
+        }
+    }
+}
+
+fn history_output(outcome: &ExecutionOutcome) -> Option<String> {
+    outcome
+        .result
+        .as_ref()
+        .and_then(|result| result.data.get("text/plain"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn matches_history_pattern(input: &str, pattern: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let input = input.chars().collect::<Vec<_>>();
+    let mut states = vec![vec![false; input.len() + 1]; pattern.len() + 1];
+    states[0][0] = true;
+
+    for pattern_index in 0..pattern.len() {
+        if pattern[pattern_index] == '*' {
+            states[pattern_index + 1][0] = states[pattern_index][0];
+        }
+    }
+
+    for pattern_index in 0..pattern.len() {
+        for input_index in 0..input.len() {
+            states[pattern_index + 1][input_index + 1] = match pattern[pattern_index] {
+                '*' => {
+                    states[pattern_index][input_index + 1] || states[pattern_index + 1][input_index]
+                }
+                '?' => states[pattern_index][input_index],
+                literal => states[pattern_index][input_index] && literal == input[input_index],
+            };
+        }
+    }
+
+    states[pattern.len()][input.len()]
+}
+
+fn keep_last_entries<T>(entries: &mut Vec<T>, limit: usize) {
+    if entries.len() > limit {
+        let drop_count = entries.len() - limit;
+        entries.drain(0..drop_count);
+    }
+}
+
+fn normalize_history_index(index: i32, line_count: i32) -> i32 {
+    let adjusted = if index < 0 {
+        index.saturating_add(line_count)
+    } else {
+        index
+    };
+    adjusted.clamp(0, line_count)
 }
 
 enum ChannelKind {
@@ -490,7 +909,17 @@ fn handle_shell_request(
                 state,
                 request,
                 "kernel_info_reply",
-                kernel_info_content(),
+                state.kernel_info_content(),
+            )?;
+            Ok(false)
+        }
+        "connect_request" => {
+            send_reply(
+                reply_socket,
+                state,
+                request,
+                "connect_reply",
+                state.connect_reply_content(),
             )?;
             Ok(false)
         }
@@ -500,6 +929,15 @@ fn handle_shell_request(
                 .get("silent")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let user_expressions = request
+                .content
+                .get("user_expressions")
+                .unwrap_or(&Value::Null);
+            let store_history = request
+                .content
+                .get("store_history")
+                .and_then(Value::as_bool)
+                .unwrap_or(!silent);
             let code = request
                 .content
                 .get("code")
@@ -529,18 +967,20 @@ fn handle_shell_request(
             let kernel_session = state.kernel_session.clone();
             let request_identities = request.identities.clone();
             let parent_header = request.header_value.clone();
-            let outcome = state.worker.execute(code, |prompt, password| {
-                request_stdin_input(
-                    stdin_socket,
-                    &signer,
-                    &kernel_session,
-                    &request_identities,
-                    &parent_header,
-                    prompt,
-                    password,
-                    allow_stdin,
-                )
-            })?;
+            let outcome = state
+                .worker
+                .execute(code, user_expressions, |prompt, password| {
+                    request_stdin_input(
+                        stdin_socket,
+                        &signer,
+                        &kernel_session,
+                        &request_identities,
+                        &parent_header,
+                        prompt,
+                        password,
+                        allow_stdin,
+                    )
+                })?;
 
             if !silent && !outcome.stdout.is_empty() {
                 publish_stream(
@@ -559,6 +999,10 @@ fn handle_shell_request(
                     "stderr",
                     &outcome.stderr,
                 )?;
+            }
+
+            if !silent && store_history {
+                state.record_history(execution_count, code, &outcome);
             }
 
             if outcome.status == "ok" {
@@ -598,7 +1042,7 @@ fn handle_shell_request(
                     json!({
                         "status": "ok",
                         "execution_count": execution_count,
-                        "user_expressions": {},
+                        "user_expressions": outcome.user_expressions,
                         "payload": [],
                     }),
                 )?;
@@ -723,10 +1167,7 @@ fn handle_shell_request(
                 state,
                 request,
                 "history_reply",
-                json!({
-                    "status": "ok",
-                    "history": [],
-                }),
+                state.history_reply_content(&request.content),
             )?;
             Ok(false)
         }
@@ -761,13 +1202,23 @@ fn handle_control_request(
                 state,
                 request,
                 "kernel_info_reply",
-                kernel_info_content(),
+                state.kernel_info_content(),
+            )?;
+            Ok(false)
+        }
+        "connect_request" => {
+            send_reply(
+                reply_socket,
+                state,
+                request,
+                "connect_reply",
+                state.connect_reply_content(),
             )?;
             Ok(false)
         }
         "shutdown_request" => handle_shutdown_request(reply_socket, state, request),
         "interrupt_request" => {
-            state.worker.restart()?;
+            state.restart()?;
             send_reply(
                 reply_socket,
                 state,
@@ -793,7 +1244,7 @@ fn handle_shutdown_request(
         .unwrap_or(false);
 
     if restart {
-        state.worker.restart()?;
+        state.restart()?;
     }
 
     send_reply(
@@ -996,30 +1447,6 @@ fn reply_type_for(msg_type: &str) -> String {
     } else {
         "error".to_owned()
     }
-}
-
-fn kernel_info_content() -> Value {
-    json!({
-        "status": "ok",
-        "protocol_version": JUPYTER_PROTOCOL_VERSION,
-        "implementation": IMPLEMENTATION,
-        "implementation_version": env!("CARGO_PKG_VERSION"),
-        "banner": format!("{IMPLEMENTATION} {}", env!("CARGO_PKG_VERSION")),
-        "debugger": false,
-        "help_links": [],
-        "language_info": {
-            "name": LANGUAGE,
-            "version": "3",
-            "mimetype": "text/x-python",
-            "file_extension": ".py",
-            "pygments_lexer": "python",
-            "nbconvert_exporter": "python",
-            "codemirror_mode": {
-                "name": "ipython",
-                "version": 3,
-            },
-        },
-    })
 }
 
 fn spawn_heartbeat_thread(
@@ -1229,6 +1656,80 @@ mod tests {
         let reply = recv_message(&shell, &signer);
         assert_eq!(reply.header.msg_type, "kernel_info_reply");
         assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(
+            reply.content.get("implementation"),
+            Some(&json!("rustykernel"))
+        );
+        assert_eq!(reply.content.get("protocol_version"), Some(&json!("5.3")));
+        assert_eq!(reply.content.get("language"), Some(&json!("python")));
+        assert_eq!(
+            reply.content.get("language_version"),
+            reply.content.pointer("/language_info/version")
+        );
+        assert_eq!(
+            reply.content.pointer("/language_info/name"),
+            Some(&json!("python"))
+        );
+        assert_eq!(
+            reply.content.pointer("/language_info/mimetype"),
+            Some(&json!("text/x-python"))
+        );
+        assert_eq!(
+            reply.content.pointer("/language_info/file_extension"),
+            Some(&json!(".py"))
+        );
+        assert_eq!(
+            reply.content.pointer("/language_info/nbconvert_exporter"),
+            Some(&json!("python"))
+        );
+        assert_eq!(
+            reply.content.pointer("/language_info/codemirror_mode/name"),
+            Some(&json!("ipython"))
+        );
+        assert_eq!(
+            reply.content.pointer("/help_links/0/text"),
+            Some(&json!("Python Reference"))
+        );
+        assert_eq!(reply.content.get("supported_features"), Some(&json!([])));
+
+        let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn shell_channel_replies_to_connect_request() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let request = client_request("client-session", "connect_request", json!({}));
+        send_client_message(&shell, &signer, &request);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "connect_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(
+            reply.content.get("shell_port"),
+            Some(&json!(connection.shell_port))
+        );
+        assert_eq!(
+            reply.content.get("control_port"),
+            Some(&json!(connection.control_port))
+        );
+        assert_eq!(
+            reply.content.get("hb_port"),
+            Some(&json!(connection.hb_port))
+        );
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
         assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
@@ -1343,6 +1844,71 @@ mod tests {
     }
 
     #[test]
+    fn execute_reply_includes_user_expressions() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let request = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 21",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {
+                    "double": "value * 2",
+                    "missing": "unknown_name",
+                },
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &request);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "execute_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(
+            reply.content.pointer("/user_expressions/double/status"),
+            Some(&json!("ok"))
+        );
+        assert_eq!(
+            reply
+                .content
+                .pointer("/user_expressions/double/data/text~1plain"),
+            Some(&json!("42"))
+        );
+        assert_eq!(
+            reply.content.pointer("/user_expressions/missing/status"),
+            Some(&json!("error"))
+        );
+        assert_eq!(
+            reply.content.pointer("/user_expressions/missing/ename"),
+            Some(&json!("NameError"))
+        );
+
+        let published = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 3);
+        assert_eq!(
+            published
+                .iter()
+                .map(|message| message.header.msg_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["status", "execute_input", "status"]
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn execute_request_preserves_state_across_cells() {
         let _guard = test_lock();
         let connection = test_connection_info();
@@ -1405,6 +1971,114 @@ mod tests {
                 .and_then(|data| data.get("text/plain")),
             Some(&json!("42"))
         );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn history_request_returns_recorded_entries() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let first = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 40",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &first);
+        let _ = recv_message(&shell, &signer);
+        let _ = recv_iopub_messages_for_parent(&iopub, &signer, &first.header.msg_id, 3);
+
+        let second = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value + 2",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &second);
+        let _ = recv_message(&shell, &signer);
+        let _ = recv_iopub_messages_for_parent(&iopub, &signer, &second.header.msg_id, 4);
+
+        let range = client_request(
+            "client-session",
+            "history_request",
+            json!({
+                "hist_access_type": "range",
+                "output": true,
+                "raw": true,
+                "session": 0,
+                "start": 0,
+                "stop": 3,
+            }),
+        );
+        send_client_message(&shell, &signer, &range);
+        let range_reply = recv_message(&shell, &signer);
+        assert_eq!(range_reply.header.msg_type, "history_reply");
+        assert_eq!(range_reply.content.get("status"), Some(&json!("ok")));
+        let history = range_reply.content["history"].as_array().unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0], json!([0, 0, ["", null]]));
+        assert_eq!(history[1], json!([0, 1, ["value = 40", null]]));
+        assert_eq!(history[2], json!([0, 2, ["value + 2", "42"]]));
+
+        let current_session = client_request(
+            "client-session",
+            "history_request",
+            json!({
+                "hist_access_type": "range",
+                "output": false,
+                "raw": true,
+                "session": 1,
+                "start": -1,
+                "stop": null,
+            }),
+        );
+        send_client_message(&shell, &signer, &current_session);
+        let current_session_reply = recv_message(&shell, &signer);
+        assert_eq!(
+            current_session_reply.content.get("history"),
+            Some(&json!([[0, 2, "value + 2"]]))
+        );
+
+        let search = client_request(
+            "client-session",
+            "history_request",
+            json!({
+                "hist_access_type": "search",
+                "output": false,
+                "raw": true,
+                "session": 0,
+                "pattern": "value*",
+                "n": 1,
+            }),
+        );
+        send_client_message(&shell, &signer, &search);
+        let search_reply = recv_message(&shell, &signer);
+        let matches = search_reply.content["history"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], json!([1, 2, "value + 2"]));
 
         runtime.stop().unwrap();
     }
@@ -1745,6 +2419,79 @@ mod tests {
     }
 
     #[test]
+    fn execute_request_supports_input_via_stdin_channel() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let client_identity = b"stdin-client";
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            client_identity,
+        );
+        let stdin_socket = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().stdin,
+            client_identity,
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let request = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "name = input('Name: ')\nname",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": true,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &request);
+
+        let input_request = recv_message(&stdin_socket, &signer);
+        assert_eq!(input_request.header.msg_type, "input_request");
+        assert_eq!(input_request.content.get("prompt"), Some(&json!("Name: ")));
+        assert_eq!(input_request.content.get("password"), Some(&json!(false)));
+
+        let input_reply = client_request(
+            "client-session",
+            "input_reply",
+            json!({
+                "value": "Ada",
+            }),
+        );
+        send_client_message(&stdin_socket, &signer, &input_reply);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "execute_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(reply.content.get("execution_count"), Some(&json!(1)));
+
+        let published = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 4);
+        let msg_types: Vec<_> = published
+            .iter()
+            .map(|message| message.header.msg_type.as_str())
+            .collect();
+        assert_eq!(
+            msg_types,
+            vec!["status", "execute_input", "execute_result", "status"]
+        );
+        assert_eq!(
+            published[2]
+                .content
+                .get("data")
+                .and_then(|data| data.get("text/plain")),
+            Some(&json!("'Ada'"))
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn stdin_channel_accepts_input_reply_without_stopping_kernel() {
         let _guard = test_lock();
         let connection = test_connection_info();
@@ -1835,6 +2582,25 @@ mod tests {
         assert_eq!(probe_reply.header.msg_type, "execute_reply");
         assert_eq!(probe_reply.content.get("status"), Some(&json!("error")));
         assert_eq!(probe_reply.content.get("ename"), Some(&json!("NameError")));
+        assert_eq!(probe_reply.content.get("execution_count"), Some(&json!(1)));
+
+        let history = client_request(
+            "client-session",
+            "history_request",
+            json!({
+                "hist_access_type": "tail",
+                "output": false,
+                "raw": true,
+                "session": 0,
+                "n": 10,
+            }),
+        );
+        send_client_message(&shell, &signer, &history);
+        let history_reply = recv_message(&shell, &signer);
+        assert_eq!(
+            history_reply.content.get("history"),
+            Some(&json!([[1, 1, "value = 99"], [2, 1, "value"]]))
+        );
 
         runtime.stop().unwrap();
     }
@@ -1937,6 +2703,44 @@ mod tests {
         let state_reply = recv_message(&shell, &signer);
         assert_eq!(state_reply.content.get("status"), Some(&json!("error")));
         assert_eq!(state_reply.content.get("ename"), Some(&json!("NameError")));
+
+        let previous_session = client_request(
+            "client-session",
+            "history_request",
+            json!({
+                "hist_access_type": "range",
+                "output": false,
+                "raw": true,
+                "session": -1,
+                "start": 1,
+                "stop": 2,
+            }),
+        );
+        send_client_message(&shell, &signer, &previous_session);
+        let previous_session_reply = recv_message(&shell, &signer);
+        assert_eq!(
+            previous_session_reply.content.get("history"),
+            Some(&json!([[1, 1, "value = 7"]]))
+        );
+
+        let search = client_request(
+            "client-session",
+            "history_request",
+            json!({
+                "hist_access_type": "search",
+                "output": false,
+                "raw": true,
+                "session": 0,
+                "pattern": "value*",
+                "n": 10,
+            }),
+        );
+        send_client_message(&shell, &signer, &search);
+        let search_reply = recv_message(&shell, &signer);
+        assert_eq!(
+            search_reply.content.get("history"),
+            Some(&json!([[1, 1, "value = 7"], [2, 1, "value"]]))
+        );
 
         runtime.stop().unwrap();
     }
