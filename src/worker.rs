@@ -192,6 +192,15 @@ struct WorkerInputRequest {
     password: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkerStreamEvent {
+    id: u64,
+    event: String,
+    name: String,
+    #[serde(default)]
+    text: String,
+}
+
 #[derive(Deserialize)]
 struct WorkerEnvelope<T> {
     id: u64,
@@ -315,7 +324,7 @@ impl PythonWorker {
         self.interrupt_handle.clone()
     }
 
-    pub fn execute<F>(
+    pub fn execute<F, G>(
         &mut self,
         code: &str,
         user_expressions: &Value,
@@ -323,9 +332,11 @@ impl PythonWorker {
         silent: bool,
         store_history: bool,
         mut on_input: F,
+        mut on_stream: G,
     ) -> Result<ExecutionOutcome, KernelError>
     where
         F: FnMut(&str, bool) -> Result<String, String>,
+        G: FnMut(&str, &str) -> Result<(), KernelError>,
     {
         let request_id = self.next_id;
         self.next_id += 1;
@@ -365,38 +376,63 @@ impl PythonWorker {
             })?;
 
             if raw.get("event").is_some() {
-                let event: WorkerInputRequest = serde_json::from_value(raw).map_err(|error| {
-                    KernelError::Worker(format!("failed to decode worker input request: {error}"))
-                })?;
-                if event.id != request_id || event.event != "input_request" {
-                    return Err(KernelError::Worker(format!(
-                        "unexpected worker event for request {}",
-                        request_id
-                    )));
+                match raw.get("event").and_then(Value::as_str).unwrap_or_default() {
+                    "input_request" => {
+                        let event: WorkerInputRequest =
+                            serde_json::from_value(raw).map_err(|error| {
+                                KernelError::Worker(format!(
+                                    "failed to decode worker input request: {error}"
+                                ))
+                            })?;
+                        if event.id != request_id || event.event != "input_request" {
+                            return Err(KernelError::Worker(format!(
+                                "unexpected worker event for request {}",
+                                request_id
+                            )));
+                        }
+                        let response = match on_input(&event.prompt, event.password) {
+                            Ok(value) => WorkerRequest::InputReply {
+                                id: request_id,
+                                value,
+                                error: None,
+                            },
+                            Err(error) => WorkerRequest::InputReply {
+                                id: request_id,
+                                value: String::new(),
+                                error: Some(error),
+                            },
+                        };
+                        let payload = serde_json::to_vec(&response).map_err(|error| {
+                            KernelError::Worker(format!(
+                                "failed to encode worker input reply: {error}"
+                            ))
+                        })?;
+                        self.stdin.write_all(&payload).map_err(KernelError::Io)?;
+                        self.stdin.write_all(b"\n").map_err(KernelError::Io)?;
+                        self.stdin.flush().map_err(KernelError::Io)?;
+                    }
+                    "stream" => {
+                        let event: WorkerStreamEvent =
+                            serde_json::from_value(raw).map_err(|error| {
+                                KernelError::Worker(format!(
+                                    "failed to decode worker stream event: {error}"
+                                ))
+                            })?;
+                        if event.id != request_id || event.event != "stream" {
+                            return Err(KernelError::Worker(format!(
+                                "unexpected worker stream event for request {}",
+                                request_id
+                            )));
+                        }
+                        on_stream(&event.name, &event.text)?;
+                    }
+                    event_name => {
+                        return Err(KernelError::Worker(format!(
+                            "unexpected worker event kind {event_name:?} for request {}",
+                            request_id
+                        )));
+                    }
                 }
-                let response = match on_input(&event.prompt, event.password) {
-                    Ok(value) => WorkerRequest::InputReply {
-                        id: request_id,
-                        value,
-                        error: None,
-                    },
-                    Err(error) => WorkerRequest::InputReply {
-                        id: request_id,
-                        value: String::new(),
-                        error: Some(error),
-                    },
-                };
-                let payload = serde_json::to_vec(&response).map_err(|error| {
-                    KernelError::Worker(format!("failed to encode worker input reply: {error}"))
-                })?;
-                self.stdin.write_all(&payload).map_err(KernelError::Io)?;
-                self.stdin
-                    .write_all(
-                        b"
-",
-                    )
-                    .map_err(KernelError::Io)?;
-                self.stdin.flush().map_err(KernelError::Io)?;
                 continue;
             }
 

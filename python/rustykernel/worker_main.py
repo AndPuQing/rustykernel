@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import codecs
 import contextlib
+import ctypes
 import getpass
 import html
 import inspect
@@ -13,6 +15,7 @@ import os
 import re
 import rlcompleter
 import sys
+import threading
 import time
 import token as token_types
 import tokenize
@@ -48,6 +51,11 @@ AUTOAWAIT_ENABLED = True
 AUTOAWAIT_RUNNER = "asyncio"
 EXECUTE_RESULT: dict[str, object] | None = None
 _PROTOCOL_STREAM: io.TextIOBase | None = None
+_PROTOCOL_LOCK = threading.Lock()
+_LIBC = ctypes.CDLL(None)
+_LIBC.fflush.argtypes = [ctypes.c_void_p]
+_LIBC.fflush.restype = ctypes.c_int
+STREAM_FDS = {"stdout": 1, "stderr": 2}
 
 
 def protocol_stdout() -> io.TextIOBase:
@@ -75,9 +83,191 @@ def protocol_stdin() -> io.TextIOBase:
 
 
 def emit_protocol_message(message: object) -> None:
-    stream = protocol_stdout()
-    stream.write(json.dumps(message) + "\n")
-    stream.flush()
+    with _PROTOCOL_LOCK:
+        stream = protocol_stdout()
+        stream.write(json.dumps(message) + "\n")
+        stream.flush()
+
+
+def flush_standard_streams() -> None:
+    for stream in (sys.__stdout__, sys.__stderr__):
+        if stream is None:
+            continue
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    _LIBC.fflush(None)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    total = 0
+    while total < len(view):
+        written = os.write(fd, view[total:])
+        total += written
+
+
+class WorkerBinaryStream(io.RawIOBase):
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def writable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def isatty(self) -> bool:
+        return os.isatty(self._fd)
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        chunk = bytes(data)
+        if not chunk:
+            return 0
+        write_all(self._fd, chunk)
+        return len(chunk)
+
+    def flush(self) -> None:
+        flush_standard_streams()
+
+
+class WorkerStream(io.TextIOBase):
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._buffer = WorkerBinaryStream(fd)
+
+    @property
+    def buffer(self) -> WorkerBinaryStream:
+        return self._buffer
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    @property
+    def errors(self) -> str:
+        return "replace"
+
+    def writable(self) -> bool:
+        return True
+
+    def isatty(self) -> bool:
+        return os.isatty(self._fd)
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def flush(self) -> None:
+        flush_standard_streams()
+
+    def write(self, data: str) -> int:
+        if not isinstance(data, str):
+            raise TypeError(f"write() argument must be str, not {type(data)}")
+
+        if not data:
+            return 0
+
+        write_all(self._fd, data.encode(self.encoding, self.errors))
+        return len(data)
+
+
+class FdCapture:
+    def __init__(self, request_id: int | None = None) -> None:
+        self._request_id = request_id
+        self._buffer_lock = threading.Lock()
+        self._emit_lock = threading.Lock()
+        self._buffers: dict[str, list[str]] = {"stdout": [], "stderr": []}
+        self._pending: dict[str, str] = {"stdout": "", "stderr": ""}
+        self._saved_fds: dict[str, int] = {}
+        self._read_fds: dict[str, int] = {}
+        self._threads: list[threading.Thread] = []
+
+    def __enter__(self) -> FdCapture:
+        flush_standard_streams()
+        for name, fd in STREAM_FDS.items():
+            self._saved_fds[name] = os.dup(fd)
+            read_fd, write_fd = os.pipe()
+            self._read_fds[name] = read_fd
+            os.dup2(write_fd, fd)
+            os.close(write_fd)
+            thread = threading.Thread(
+                target=self._watch_stream,
+                args=(name, read_fd),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        flush_standard_streams()
+        for name, fd in STREAM_FDS.items():
+            saved_fd = self._saved_fds.pop(name)
+            os.dup2(saved_fd, fd)
+            os.close(saved_fd)
+        for thread in self._threads:
+            thread.join()
+
+    @property
+    def stdout(self) -> str:
+        return "".join(self._buffers["stdout"])
+
+    @property
+    def stderr(self) -> str:
+        return "".join(self._buffers["stderr"])
+
+    def _watch_stream(self, name: str, read_fd: int) -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        try:
+            while True:
+                chunk = os.read(read_fd, 4096)
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                if text:
+                    self._handle_text(name, text, final=False)
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                self._handle_text(name, tail, final=False)
+            self._handle_text(name, "", final=True)
+        finally:
+            os.close(read_fd)
+
+    def _handle_text(self, name: str, text: str, *, final: bool) -> None:
+        with self._buffer_lock:
+            self._buffers[name].append(text)
+            combined = self._pending[name] + text
+            emit_chunks: list[str] = []
+            while True:
+                newline = combined.find("\n")
+                if newline == -1:
+                    break
+                emit_chunks.append(combined[: newline + 1])
+                combined = combined[newline + 1 :]
+            if final and combined:
+                emit_chunks.append(combined)
+                combined = ""
+            self._pending[name] = combined
+
+        if self._request_id is None:
+            return
+
+        for chunk in emit_chunks:
+            with self._emit_lock:
+                emit_protocol_message(
+                    {
+                        "id": self._request_id,
+                        "event": "stream",
+                        "name": name,
+                        "text": chunk,
+                    }
+                )
+
+
+def install_streams() -> None:
+    sys.stdout = WorkerStream(STREAM_FDS["stdout"])
+    sys.stderr = WorkerStream(STREAM_FDS["stderr"])
 
 
 def completion_kind(value: object) -> str:
@@ -1079,6 +1269,7 @@ def execute_with_ipython(
     )
 
 
+install_streams()
 install_display_api()
 install_ipython_api()
 install_input_api()
@@ -1114,13 +1305,9 @@ def handle_comm_open(
     data: object = None,
     metadata: object = None,
 ) -> dict[str, object]:
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
     COMM_EVENTS.clear()
 
-    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
-        stderr_buffer
-    ):
+    with FdCapture() as capture:
         callback = COMM_TARGETS.get(target_name)
         if callback is None:
             print(f"No such comm target registered: {target_name}", file=sys.stderr)
@@ -1142,8 +1329,8 @@ def handle_comm_open(
                 comm.close()
 
     return {
-        "stdout": stdout_buffer.getvalue(),
-        "stderr": stderr_buffer.getvalue(),
+        "stdout": capture.stdout,
+        "stderr": capture.stderr,
         "events": list(COMM_EVENTS),
         "registered": comm_id in COMMS,
     }
@@ -1152,13 +1339,9 @@ def handle_comm_open(
 def handle_comm_msg(
     comm_id: str, data: object = None, metadata: object = None
 ) -> dict[str, object]:
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
     COMM_EVENTS.clear()
 
-    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
-        stderr_buffer
-    ):
+    with FdCapture() as capture:
         comm = COMMS.get(comm_id)
         if comm is None:
             print(f"No such comm: {comm_id}", file=sys.stderr)
@@ -1169,8 +1352,8 @@ def handle_comm_msg(
                 traceback.print_exc()
 
     return {
-        "stdout": stdout_buffer.getvalue(),
-        "stderr": stderr_buffer.getvalue(),
+        "stdout": capture.stdout,
+        "stderr": capture.stderr,
         "events": list(COMM_EVENTS),
         "registered": comm_id in COMMS,
     }
@@ -1179,13 +1362,9 @@ def handle_comm_msg(
 def handle_comm_close(
     comm_id: str, data: object = None, metadata: object = None
 ) -> dict[str, object]:
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
     COMM_EVENTS.clear()
 
-    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
-        stderr_buffer
-    ):
+    with FdCapture() as capture:
         comm = COMMS.get(comm_id)
         if comm is None:
             print(f"No such comm: {comm_id}", file=sys.stderr)
@@ -1198,8 +1377,8 @@ def handle_comm_close(
                 traceback.print_exc()
 
     return {
-        "stdout": stdout_buffer.getvalue(),
-        "stderr": stderr_buffer.getvalue(),
+        "stdout": capture.stdout,
+        "stderr": capture.stderr,
         "events": list(COMM_EVENTS),
         "registered": comm_id in COMMS,
     }
@@ -1214,8 +1393,6 @@ def execute(
     silent: bool,
     store_history: bool,
 ) -> dict[str, object]:
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
     payload: dict[str, object] = {
         "status": "ok",
         "stdout": "",
@@ -1237,13 +1414,11 @@ def execute(
     CURRENT_REQUEST_ID = request_id
 
     try:
-        if PENDING_INTERRUPT:
-            PENDING_INTERRUPT = False
-            raise KeyboardInterrupt()
+        with FdCapture(request_id=request_id):
+            if PENDING_INTERRUPT:
+                PENDING_INTERRUPT = False
+                raise KeyboardInterrupt()
 
-        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
-            stderr_buffer
-        ):
             result = execute_with_ipython(
                 code,
                 execution_count=execution_count,
@@ -1275,8 +1450,8 @@ def execute(
             type(exc), exc, exc.__traceback__
         )
 
-    payload["stdout"] = stdout_buffer.getvalue()
-    payload["stderr"] = stderr_buffer.getvalue()
+    sys.stdout.flush()
+    sys.stderr.flush()
     payload["displays"] = list(DISPLAY_EVENTS)
     payload["comm_events"] = list(COMM_EVENTS)
     payload["payload"] = list(INTERACTIVE_SHELL.payload_manager.read_payload())

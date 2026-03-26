@@ -141,15 +141,20 @@ value + 2
         )
 
     assert reply["content"]["status"] == "ok"
-    assert [message["header"]["msg_type"] for message in published] == [
-        "status",
-        "execute_input",
-        "stream",
-        "execute_result",
-        "status",
+    assert published[0]["header"]["msg_type"] == "status"
+    assert published[1]["header"]["msg_type"] == "execute_input"
+    assert published[-2]["header"]["msg_type"] == "execute_result"
+    assert published[-1]["header"]["msg_type"] == "status"
+    stream_messages = [
+        message
+        for message in published[2:-2]
+        if message["header"]["msg_type"] == "stream"
     ]
-    assert "Wall time:" in published[2]["content"]["text"]
-    assert published[3]["content"]["data"]["text/plain"] == "42"
+    assert stream_messages
+    assert "Wall time:" in "".join(
+        message["content"]["text"] for message in stream_messages
+    )
+    assert published[-2]["content"]["data"]["text/plain"] == "42"
 
 
 def test_timeit_magics_emit_timing_summary(

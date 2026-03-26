@@ -214,7 +214,10 @@ struct MessageLoopState {
     pending_execute: Option<PendingExecute>,
 }
 
-struct PendingExecute;
+struct PendingExecute {
+    parent_header: Value,
+    silent: bool,
+}
 
 struct ExecuteCompletion {
     request: JupyterMessage,
@@ -223,6 +226,11 @@ struct ExecuteCompletion {
     silent: bool,
     store_history: bool,
     outcome: Result<ExecutionOutcome, KernelError>,
+}
+
+enum ExecuteUpdate {
+    Stream { name: String, text: String },
+    Completion(ExecuteCompletion),
 }
 
 struct HistoryStore {
@@ -1006,8 +1014,20 @@ fn spawn_message_loop_thread(
                 return Ok(());
             }
 
-            while let Ok(completion) = execute_rx.try_recv() {
-                finalize_execute_completion(&shell_socket, &iopub_socket, &mut state, completion)?;
+            while let Ok(update) = execute_rx.try_recv() {
+                match update {
+                    ExecuteUpdate::Stream { name, text } => {
+                        publish_execute_stream(&iopub_socket, &state, &name, &text)?;
+                    }
+                    ExecuteUpdate::Completion(completion) => {
+                        finalize_execute_completion(
+                            &shell_socket,
+                            &iopub_socket,
+                            &mut state,
+                            completion,
+                        )?;
+                    }
+                }
             }
 
             let poll_shell = !state.is_executing();
@@ -1076,7 +1096,7 @@ fn handle_request(
     stdin_socket: &zmq::Socket,
     iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
-    execute_tx: &mpsc::Sender<ExecuteCompletion>,
+    execute_tx: &mpsc::Sender<ExecuteUpdate>,
     shutdown: &ShutdownSignal,
 ) -> Result<(), KernelError> {
     let request = match state.signer.decode(frames) {
@@ -1116,7 +1136,7 @@ fn handle_request(
 }
 
 fn spawn_execute_request(
-    execute_tx: &mpsc::Sender<ExecuteCompletion>,
+    execute_tx: &mpsc::Sender<ExecuteUpdate>,
     worker: Arc<Mutex<PythonWorker>>,
     request: JupyterMessage,
     code: String,
@@ -1140,16 +1160,28 @@ fn spawn_execute_request(
                     |_prompt, _password| {
                         Err("stdin is not enabled for this execute_request".to_owned())
                     },
+                    |name, text| {
+                        execute_tx
+                            .send(ExecuteUpdate::Stream {
+                                name: name.to_owned(),
+                                text: text.to_owned(),
+                            })
+                            .map_err(|error| {
+                                KernelError::Worker(format!(
+                                    "failed to send execute stream update: {error}"
+                                ))
+                            })
+                    },
                 )
             });
-        let _ = execute_tx.send(ExecuteCompletion {
+        let _ = execute_tx.send(ExecuteUpdate::Completion(ExecuteCompletion {
             request,
             code,
             execution_count,
             silent,
             store_history,
             outcome,
-        });
+        }));
     });
 }
 
@@ -1300,7 +1332,7 @@ fn handle_shell_request(
     stdin_socket: &zmq::Socket,
     iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
-    execute_tx: &mpsc::Sender<ExecuteCompletion>,
+    execute_tx: &mpsc::Sender<ExecuteUpdate>,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
     match request.header.msg_type.as_str() {
@@ -1388,6 +1420,18 @@ fn handle_shell_request(
                             allow_stdin,
                         )
                     },
+                    |name, text| {
+                        if !silent {
+                            publish_stream(
+                                iopub_socket,
+                                state,
+                                request.header_value.clone(),
+                                name,
+                                text,
+                            )?;
+                        }
+                        Ok(())
+                    },
                 )?;
 
                 finalize_execute_completion(
@@ -1405,7 +1449,10 @@ fn handle_shell_request(
                 )?;
                 Ok(RequestDisposition::Deferred)
             } else {
-                state.pending_execute = Some(PendingExecute);
+                state.pending_execute = Some(PendingExecute {
+                    parent_header: request.header_value.clone(),
+                    silent,
+                });
                 spawn_execute_request(
                     execute_tx,
                     Arc::clone(&state.worker),
@@ -1870,6 +1917,25 @@ fn publish_stream(
             "text": text,
         }),
     )
+}
+
+fn publish_execute_stream(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    name: &str,
+    text: &str,
+) -> Result<(), KernelError> {
+    let Some(pending) = state.pending_execute.as_ref() else {
+        return Err(KernelError::Worker(
+            "received execute stream update without a pending execute".to_owned(),
+        ));
+    };
+
+    if pending.silent {
+        return Ok(());
+    }
+
+    publish_stream(socket, state, pending.parent_header.clone(), name, text)
 }
 
 fn handle_comm_outcome(

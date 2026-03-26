@@ -95,7 +95,7 @@ def test_execute_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None
     assert published[2]["content"]["data"]["text/plain"] == "3"
 
 
-def test_fd_stdout_output_no_longer_corrupts_worker_protocol(
+def test_fd_and_subprocess_output_are_published_as_streams(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:
     with running_kernel_client(tmp_path, zmq_context) as client:
@@ -104,14 +104,76 @@ def test_fd_stdout_output_no_longer_corrupts_worker_protocol(
             "execute_request",
             {
                 "code": """
+import faulthandler
 import os
 import subprocess
 import sys
 
+print("py-out")
 os.write(1, b"fd-out\\n")
-subprocess.run([sys.executable, "-c", "print('child-out')"], check=True)
+os.write(2, b"fd-err\\n")
+subprocess.run(
+    [
+        sys.executable,
+        "-c",
+        "import sys; print('child-out'); print('child-err', file=sys.stderr)",
+    ],
+    check=True,
+)
+faulthandler.dump_traceback()
 40 + 2
 """,
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+
+    assert reply["header"]["msg_type"] == "execute_reply"
+    assert reply["content"]["status"] == "ok"
+    assert published[0]["header"]["msg_type"] == "status"
+    assert published[1]["header"]["msg_type"] == "execute_input"
+    assert published[-2]["header"]["msg_type"] == "execute_result"
+    assert published[-1]["header"]["msg_type"] == "status"
+
+    stream_messages = [
+        message
+        for message in published[2:-2]
+        if message["header"]["msg_type"] == "stream"
+    ]
+    assert stream_messages
+
+    stdout_text = "".join(
+        message["content"]["text"]
+        for message in stream_messages
+        if message["content"]["name"] == "stdout"
+    )
+    stderr_text = "".join(
+        message["content"]["text"]
+        for message in stream_messages
+        if message["content"]["name"] == "stderr"
+    )
+
+    assert "py-out\n" in stdout_text
+    assert "fd-out\n" in stdout_text
+    assert "child-out\n" in stdout_text
+    assert "fd-err\n" in stderr_text
+    assert "child-err\n" in stderr_text
+    assert "Current thread" in stderr_text
+    assert published[-2]["content"]["data"]["text/plain"] == "42"
+
+
+def test_execute_request_publishes_python_stdout_as_stream(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        reply, published = client.request(
+            "shell",
+            "execute_request",
+            {
+                "code": "print('hello')\n40 + 2",
                 "silent": False,
                 "store_history": True,
                 "allow_stdin": False,
@@ -125,10 +187,12 @@ subprocess.run([sys.executable, "-c", "print('child-out')"], check=True)
     assert [message["header"]["msg_type"] for message in published] == [
         "status",
         "execute_input",
+        "stream",
         "execute_result",
         "status",
     ]
-    assert published[2]["content"]["data"]["text/plain"] == "42"
+    assert published[2]["content"] == {"name": "stdout", "text": "hello\n"}
+    assert published[3]["content"]["data"]["text/plain"] == "42"
 
 
 def test_execute_request_error_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None:
