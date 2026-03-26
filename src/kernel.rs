@@ -10,12 +10,16 @@ use std::thread::{self, JoinHandle};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sysinfo::{Pid, System};
 
 use crate::protocol::{
     IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, JupyterMessage, LANGUAGE, MessageHeader,
     MessageSigner, ProtocolError,
 };
-use crate::worker::{ExecutionOutcome, PythonWorker, WorkerKernelInfo};
+use crate::worker::{
+    CommOutcome, ExecutionOutcome, PythonWorker, WorkerCommEvent, WorkerInterruptHandle,
+    WorkerKernelInfo,
+};
 
 const CHANNEL_POLL_INTERVAL_MS: i64 = 100;
 const HEARTBEAT_POLL_INTERVAL_MS: i32 = 100;
@@ -203,8 +207,22 @@ struct MessageLoopState {
     kernel_session: String,
     execution_count: u32,
     history: HistoryStore,
-    worker: PythonWorker,
+    comms: CommStore,
+    worker: Arc<Mutex<PythonWorker>>,
+    worker_interrupt: WorkerInterruptHandle,
     worker_kernel_info: WorkerKernelInfo,
+    pending_execute: Option<PendingExecute>,
+}
+
+struct PendingExecute;
+
+struct ExecuteCompletion {
+    request: JupyterMessage,
+    code: String,
+    execution_count: u32,
+    silent: bool,
+    store_history: bool,
+    outcome: Result<ExecutionOutcome, KernelError>,
 }
 
 struct HistoryStore {
@@ -229,10 +247,19 @@ struct HistoryReplyEntry {
     output: Option<String>,
 }
 
+struct CommStore {
+    entries: HashMap<String, CommEntry>,
+}
+
+struct CommEntry {
+    target_name: String,
+}
+
 impl MessageLoopState {
     fn new(connection: &ConnectionInfo) -> Result<Self, KernelError> {
         let mut worker = PythonWorker::start()?;
         let worker_kernel_info = worker.kernel_info()?;
+        let worker_interrupt = worker.interrupt_handle();
         Ok(Self {
             connection: connection.clone(),
             signer: MessageSigner::new(&connection.signature_scheme, &connection.key)?,
@@ -242,9 +269,18 @@ impl MessageLoopState {
                 .unwrap_or_else(|| IMPLEMENTATION.to_owned()),
             execution_count: 0,
             history: HistoryStore::new(),
-            worker,
+            comms: CommStore::new(),
+            worker: Arc::new(Mutex::new(worker)),
+            worker_interrupt,
             worker_kernel_info,
+            pending_execute: None,
         })
+    }
+
+    fn lock_worker(&self) -> Result<std::sync::MutexGuard<'_, PythonWorker>, KernelError> {
+        self.worker
+            .lock()
+            .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))
     }
 
     fn next_execution_count(&mut self, content: &Value) -> u32 {
@@ -280,12 +316,70 @@ impl MessageLoopState {
         })
     }
 
+    fn usage_reply_content(&self) -> Value {
+        let mut system = System::new_all();
+        system.refresh_all();
+
+        let kernel_pid = Pid::from_u32(std::process::id());
+        let kernel_processes = system
+            .processes()
+            .keys()
+            .copied()
+            .filter(|pid| process_is_kernel_descendant(&system, *pid, kernel_pid));
+
+        let kernel_cpu = kernel_processes
+            .clone()
+            .filter_map(|pid| system.process(pid))
+            .map(|process| f64::from(process.cpu_usage()))
+            .sum::<f64>();
+        let kernel_memory = kernel_processes
+            .filter_map(|pid| system.process(pid))
+            .map(|process| process.memory())
+            .sum::<u64>();
+
+        let mut content = json!({
+            "hostname": System::host_name().unwrap_or_default(),
+            "pid": std::process::id(),
+            "kernel_cpu": kernel_cpu,
+            "kernel_memory": kernel_memory,
+            "cpu_count": system.cpus().len(),
+            "host_virtual_memory": {
+                "total": system.total_memory(),
+                "available": system.available_memory(),
+                "used": system.used_memory(),
+                "free": system.free_memory(),
+                "total_swap": system.total_swap(),
+                "used_swap": system.used_swap(),
+                "free_swap": system.free_swap(),
+            },
+        });
+
+        let host_cpu_percent = f64::from(system.global_cpu_usage());
+        if host_cpu_percent > 0.0 {
+            content["host_cpu_percent"] = json!(host_cpu_percent);
+        }
+
+        content
+    }
+
     fn record_history(&mut self, line: u32, input: &str, outcome: &ExecutionOutcome) {
         self.history.record(line, input, outcome);
     }
 
     fn history_reply_content(&self, request: &Value) -> Value {
         self.history.reply_content(request)
+    }
+
+    fn register_comm(&mut self, content: &Value) {
+        self.comms.register(content);
+    }
+
+    fn close_comm(&mut self, content: &Value) {
+        self.comms.close(content);
+    }
+
+    fn comm_info_reply_content(&self, request: &Value) -> Value {
+        self.comms.reply_content(request)
     }
 
     fn kernel_info_content(&self) -> Value {
@@ -328,12 +422,40 @@ impl MessageLoopState {
     }
 
     fn restart(&mut self) -> Result<(), KernelError> {
-        self.worker.restart()?;
-        self.worker_kernel_info = self.worker.kernel_info()?;
+        let worker_kernel_info = {
+            let mut worker = self.lock_worker()?;
+            worker.restart()?;
+            worker.kernel_info()?
+        };
+        self.worker_kernel_info = worker_kernel_info;
         self.execution_count = 0;
         self.history.start_new_session();
+        self.comms.clear();
         Ok(())
     }
+
+    fn interrupt(&self) -> Result<(), KernelError> {
+        self.worker_interrupt.interrupt()
+    }
+
+    fn is_executing(&self) -> bool {
+        self.pending_execute.is_some()
+    }
+}
+
+fn process_is_kernel_descendant(system: &System, pid: Pid, kernel_pid: Pid) -> bool {
+    let mut current_pid = Some(pid);
+    while let Some(candidate) = current_pid {
+        if candidate == kernel_pid {
+            return true;
+        }
+
+        current_pid = system
+            .process(candidate)
+            .and_then(|process| process.parent());
+    }
+
+    false
 }
 
 impl HistoryStore {
@@ -606,6 +728,71 @@ impl HistoryReplyEntry {
     }
 }
 
+impl CommStore {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, content: &Value) {
+        let Some(comm_id) = content.get("comm_id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(target_name) = content.get("target_name").and_then(Value::as_str) else {
+            return;
+        };
+
+        self.entries.insert(
+            comm_id.to_owned(),
+            CommEntry {
+                target_name: target_name.to_owned(),
+            },
+        );
+    }
+
+    fn close(&mut self, content: &Value) {
+        let Some(comm_id) = content.get("comm_id").and_then(Value::as_str) else {
+            return;
+        };
+        self.entries.remove(comm_id);
+    }
+
+    fn reply_content(&self, request: &Value) -> Value {
+        let target_name = request.get("target_name").and_then(Value::as_str);
+        let comms = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| target_name.is_none_or(|target| entry.target_name == target))
+            .map(|(comm_id, entry)| {
+                (
+                    comm_id.clone(),
+                    json!({
+                        "target_name": entry.target_name,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+
+        json!({
+            "status": "ok",
+            "comms": comms,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn apply_event(&mut self, event: &WorkerCommEvent) {
+        match event.msg_type.as_str() {
+            "comm_open" => self.register(&event.content),
+            "comm_close" => self.close(&event.content),
+            _ => {}
+        }
+    }
+}
+
 fn history_output(outcome: &ExecutionOutcome) -> Option<String> {
     outcome
         .result
@@ -661,6 +848,11 @@ fn normalize_history_index(index: i32, line_count: i32) -> i32 {
 enum ChannelKind {
     Shell,
     Control,
+}
+
+enum RequestDisposition {
+    Complete { should_stop: bool },
+    Deferred,
 }
 
 pub struct KernelRuntime {
@@ -804,6 +996,7 @@ fn spawn_message_loop_thread(
         let stdin_socket = bind_socket(&context, zmq::ROUTER, &endpoints.stdin)?;
         let control_socket = bind_socket(&context, zmq::ROUTER, &endpoints.control)?;
         let mut state = MessageLoopState::new(&connection)?;
+        let (execute_tx, execute_rx) = mpsc::channel();
 
         publish_status(&iopub_socket, &state, json!({}), "starting")?;
         let _ = ready_tx.send(Ok(()));
@@ -813,18 +1006,30 @@ fn spawn_message_loop_thread(
                 return Ok(());
             }
 
-            let mut poll_items = [
-                shell_socket.as_poll_item(zmq::POLLIN),
-                control_socket.as_poll_item(zmq::POLLIN),
-                stdin_socket.as_poll_item(zmq::POLLIN),
-            ];
+            while let Ok(completion) = execute_rx.try_recv() {
+                finalize_execute_completion(&shell_socket, &iopub_socket, &mut state, completion)?;
+            }
+
+            let poll_shell = !state.is_executing();
+            let mut poll_items = if poll_shell {
+                vec![
+                    shell_socket.as_poll_item(zmq::POLLIN),
+                    control_socket.as_poll_item(zmq::POLLIN),
+                    stdin_socket.as_poll_item(zmq::POLLIN),
+                ]
+            } else {
+                vec![
+                    control_socket.as_poll_item(zmq::POLLIN),
+                    stdin_socket.as_poll_item(zmq::POLLIN),
+                ]
+            };
             match zmq::poll(&mut poll_items, CHANNEL_POLL_INTERVAL_MS) {
                 Ok(_) => {}
                 Err(zmq::Error::ETERM) if shutdown.is_stopped() => return Ok(()),
                 Err(error) => return Err(KernelError::Zmq(error)),
             }
 
-            if poll_items[0].is_readable() {
+            if poll_shell && poll_items[0].is_readable() {
                 let frames = shell_socket.recv_multipart(0)?;
                 handle_request(
                     ChannelKind::Shell,
@@ -833,11 +1038,13 @@ fn spawn_message_loop_thread(
                     &stdin_socket,
                     &iopub_socket,
                     &mut state,
+                    &execute_tx,
                     shutdown.as_ref(),
                 )?;
             }
 
-            if poll_items[1].is_readable() {
+            let control_index = if poll_shell { 1 } else { 0 };
+            if poll_items[control_index].is_readable() {
                 let frames = control_socket.recv_multipart(0)?;
                 handle_request(
                     ChannelKind::Control,
@@ -846,11 +1053,13 @@ fn spawn_message_loop_thread(
                     &stdin_socket,
                     &iopub_socket,
                     &mut state,
+                    &execute_tx,
                     shutdown.as_ref(),
                 )?;
             }
 
-            if poll_items[2].is_readable() {
+            let stdin_index = if poll_shell { 2 } else { 1 };
+            if poll_items[stdin_index].is_readable() {
                 let frames = stdin_socket.recv_multipart(0)?;
                 handle_stdin_message(frames, &state)?;
             }
@@ -867,6 +1076,7 @@ fn handle_request(
     stdin_socket: &zmq::Socket,
     iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
+    execute_tx: &mpsc::Sender<ExecuteCompletion>,
     shutdown: &ShutdownSignal,
 ) -> Result<(), KernelError> {
     let request = match state.signer.decode(frames) {
@@ -877,21 +1087,211 @@ fn handle_request(
     let parent_header = request.header_value.clone();
     publish_status(iopub_socket, state, parent_header.clone(), "busy")?;
 
-    let should_stop = match channel {
-        ChannelKind::Shell => {
-            handle_shell_request(reply_socket, stdin_socket, iopub_socket, state, &request)?
-        }
+    let disposition = match channel {
+        ChannelKind::Shell => handle_shell_request(
+            reply_socket,
+            stdin_socket,
+            iopub_socket,
+            state,
+            execute_tx,
+            &request,
+        )?,
         ChannelKind::Control => {
             handle_control_request(reply_socket, iopub_socket, state, &request)?
         }
     };
 
-    publish_status(iopub_socket, state, parent_header, "idle")?;
+    match disposition {
+        RequestDisposition::Complete { should_stop } => {
+            publish_status(iopub_socket, state, parent_header, "idle")?;
 
-    if should_stop {
-        shutdown.request_stop();
+            if should_stop {
+                shutdown.request_stop();
+            }
+        }
+        RequestDisposition::Deferred => {}
     }
 
+    Ok(())
+}
+
+fn spawn_execute_request(
+    execute_tx: &mpsc::Sender<ExecuteCompletion>,
+    worker: Arc<Mutex<PythonWorker>>,
+    request: JupyterMessage,
+    code: String,
+    user_expressions: Value,
+    execution_count: u32,
+    silent: bool,
+    store_history: bool,
+) {
+    let execute_tx = execute_tx.clone();
+    thread::spawn(move || {
+        let outcome = worker
+            .lock()
+            .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))
+            .and_then(|mut worker| {
+                worker.execute(
+                    &code,
+                    &user_expressions,
+                    execution_count,
+                    silent,
+                    store_history,
+                    |_prompt, _password| {
+                        Err("stdin is not enabled for this execute_request".to_owned())
+                    },
+                )
+            });
+        let _ = execute_tx.send(ExecuteCompletion {
+            request,
+            code,
+            execution_count,
+            silent,
+            store_history,
+            outcome,
+        });
+    });
+}
+
+fn finalize_execute_completion(
+    reply_socket: &zmq::Socket,
+    iopub_socket: &zmq::Socket,
+    state: &mut MessageLoopState,
+    completion: ExecuteCompletion,
+) -> Result<(), KernelError> {
+    state.pending_execute = None;
+
+    let ExecuteCompletion {
+        request,
+        code,
+        execution_count,
+        silent,
+        store_history,
+        outcome,
+    } = completion;
+    let outcome = outcome?;
+
+    if !silent && !outcome.stdout.is_empty() {
+        publish_stream(
+            iopub_socket,
+            state,
+            request.header_value.clone(),
+            "stdout",
+            &outcome.stdout,
+        )?;
+    }
+    if !silent && !outcome.stderr.is_empty() {
+        publish_stream(
+            iopub_socket,
+            state,
+            request.header_value.clone(),
+            "stderr",
+            &outcome.stderr,
+        )?;
+    }
+    if !silent {
+        publish_comm_events(
+            iopub_socket,
+            state,
+            request.header_value.clone(),
+            &outcome.comm_events,
+        )?;
+    }
+
+    if !silent && store_history {
+        state.record_history(execution_count, &code, &outcome);
+    }
+
+    if outcome.status == "ok" {
+        if !silent {
+            for display in outcome.displays {
+                if !display.content.is_null() {
+                    publish_iopub_message(
+                        iopub_socket,
+                        state,
+                        request.header_value.clone(),
+                        &display.msg_type,
+                        display.content,
+                    )?;
+                } else {
+                    publish_display_event(
+                        iopub_socket,
+                        state,
+                        request.header_value.clone(),
+                        &display.msg_type,
+                        display.data,
+                        display.metadata,
+                        display.transient,
+                    )?;
+                }
+            }
+
+            if let Some(result) = outcome.result {
+                publish_iopub_message(
+                    iopub_socket,
+                    state,
+                    request.header_value.clone(),
+                    "execute_result",
+                    json!({
+                        "execution_count": execution_count,
+                        "data": result.data,
+                        "metadata": result.metadata,
+                    }),
+                )?;
+            }
+        }
+
+        send_reply(
+            reply_socket,
+            state,
+            &request,
+            "execute_reply",
+            json!({
+                "status": "ok",
+                "execution_count": execution_count,
+                "user_expressions": outcome.user_expressions,
+                "payload": outcome.payload,
+            }),
+        )?;
+    } else {
+        let ename = outcome.ename.unwrap_or_else(|| "ExecutionError".to_owned());
+        let evalue = outcome.evalue.unwrap_or_default();
+        let user_expressions = outcome.user_expressions;
+        let payload = outcome.payload;
+        let traceback = outcome.traceback;
+
+        if !silent {
+            publish_iopub_message(
+                iopub_socket,
+                state,
+                request.header_value.clone(),
+                "error",
+                json!({
+                    "ename": ename,
+                    "evalue": evalue,
+                    "traceback": traceback,
+                }),
+            )?;
+        }
+
+        send_reply(
+            reply_socket,
+            state,
+            &request,
+            "execute_reply",
+            json!({
+                "status": "error",
+                "execution_count": execution_count,
+                "ename": ename,
+                "evalue": evalue,
+                "user_expressions": user_expressions,
+                "payload": payload,
+                "traceback": traceback,
+            }),
+        )?;
+    }
+
+    publish_status(iopub_socket, state, request.header_value.clone(), "idle")?;
     Ok(())
 }
 
@@ -900,8 +1300,9 @@ fn handle_shell_request(
     stdin_socket: &zmq::Socket,
     iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
+    execute_tx: &mpsc::Sender<ExecuteCompletion>,
     request: &JupyterMessage,
-) -> Result<bool, KernelError> {
+) -> Result<RequestDisposition, KernelError> {
     match request.header.msg_type.as_str() {
         "kernel_info_request" => {
             send_reply(
@@ -911,7 +1312,7 @@ fn handle_shell_request(
                 "kernel_info_reply",
                 state.kernel_info_content(),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         "connect_request" => {
             send_reply(
@@ -921,7 +1322,7 @@ fn handle_shell_request(
                 "connect_reply",
                 state.connect_reply_content(),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         "execute_request" => {
             let silent = request
@@ -938,12 +1339,18 @@ fn handle_shell_request(
                 .get("store_history")
                 .and_then(Value::as_bool)
                 .unwrap_or(!silent);
+            let allow_stdin = request
+                .content
+                .get("allow_stdin")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let code = request
                 .content
                 .get("code")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let execution_count = state.next_execution_count(&request.content);
+            let code_owned = code.to_owned();
 
             if !silent {
                 publish_iopub_message(
@@ -958,128 +1365,59 @@ fn handle_shell_request(
                 )?;
             }
 
-            let allow_stdin = request
-                .content
-                .get("allow_stdin")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let signer = state.signer.clone();
-            let kernel_session = state.kernel_session.clone();
-            let request_identities = request.identities.clone();
-            let parent_header = request.header_value.clone();
-            let outcome = state
-                .worker
-                .execute(code, user_expressions, |prompt, password| {
-                    request_stdin_input(
-                        stdin_socket,
-                        &signer,
-                        &kernel_session,
-                        &request_identities,
-                        &parent_header,
-                        prompt,
-                        password,
-                        allow_stdin,
-                    )
-                })?;
-
-            if !silent && !outcome.stdout.is_empty() {
-                publish_stream(
-                    iopub_socket,
-                    state,
-                    request.header_value.clone(),
-                    "stdout",
-                    &outcome.stdout,
+            if allow_stdin {
+                let signer = state.signer.clone();
+                let kernel_session = state.kernel_session.clone();
+                let request_identities = request.identities.clone();
+                let parent_header = request.header_value.clone();
+                let outcome = state.lock_worker()?.execute(
+                    code,
+                    user_expressions,
+                    execution_count,
+                    silent,
+                    store_history,
+                    |prompt, password| {
+                        request_stdin_input(
+                            stdin_socket,
+                            &signer,
+                            &kernel_session,
+                            &request_identities,
+                            &parent_header,
+                            prompt,
+                            password,
+                            allow_stdin,
+                        )
+                    },
                 )?;
-            }
-            if !silent && !outcome.stderr.is_empty() {
-                publish_stream(
-                    iopub_socket,
-                    state,
-                    request.header_value.clone(),
-                    "stderr",
-                    &outcome.stderr,
-                )?;
-            }
 
-            if !silent && store_history {
-                state.record_history(execution_count, code, &outcome);
-            }
-
-            if outcome.status == "ok" {
-                if !silent {
-                    for display in outcome.displays {
-                        publish_display_event(
-                            iopub_socket,
-                            state,
-                            request.header_value.clone(),
-                            &display.msg_type,
-                            display.data,
-                            display.metadata,
-                            display.transient,
-                        )?;
-                    }
-
-                    if let Some(result) = outcome.result {
-                        publish_iopub_message(
-                            iopub_socket,
-                            state,
-                            request.header_value.clone(),
-                            "execute_result",
-                            json!({
-                                "execution_count": execution_count,
-                                "data": result.data,
-                                "metadata": result.metadata,
-                            }),
-                        )?;
-                    }
-                }
-
-                send_reply(
+                finalize_execute_completion(
                     reply_socket,
+                    iopub_socket,
                     state,
-                    request,
-                    "execute_reply",
-                    json!({
-                        "status": "ok",
-                        "execution_count": execution_count,
-                        "user_expressions": outcome.user_expressions,
-                        "payload": [],
-                    }),
+                    ExecuteCompletion {
+                        request: request.clone(),
+                        code: code_owned,
+                        execution_count,
+                        silent,
+                        store_history,
+                        outcome: Ok(outcome),
+                    },
                 )?;
+                Ok(RequestDisposition::Deferred)
             } else {
-                let ename = outcome.ename.unwrap_or_else(|| "ExecutionError".to_owned());
-                let evalue = outcome.evalue.unwrap_or_default();
-                let traceback = outcome.traceback;
-
-                if !silent {
-                    publish_iopub_message(
-                        iopub_socket,
-                        state,
-                        request.header_value.clone(),
-                        "error",
-                        json!({
-                            "ename": ename,
-                            "evalue": evalue,
-                            "traceback": traceback,
-                        }),
-                    )?;
-                }
-
-                send_reply(
-                    reply_socket,
-                    state,
-                    request,
-                    "execute_reply",
-                    json!({
-                        "status": "error",
-                        "execution_count": execution_count,
-                        "ename": ename,
-                        "evalue": evalue,
-                        "traceback": traceback,
-                    }),
-                )?;
+                state.pending_execute = Some(PendingExecute);
+                spawn_execute_request(
+                    execute_tx,
+                    Arc::clone(&state.worker),
+                    request.clone(),
+                    code_owned,
+                    user_expressions.clone(),
+                    execution_count,
+                    silent,
+                    store_history,
+                );
+                Ok(RequestDisposition::Deferred)
             }
-            Ok(false)
         }
         "is_complete_request" => {
             let code = request
@@ -1087,7 +1425,7 @@ fn handle_shell_request(
                 .get("code")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let outcome = state.worker.is_complete(code)?;
+            let outcome = state.lock_worker()?.is_complete(code)?;
             send_reply(
                 reply_socket,
                 state,
@@ -1098,7 +1436,7 @@ fn handle_shell_request(
                     "indent": outcome.indent,
                 }),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         "complete_request" => {
             let code = request
@@ -1111,7 +1449,9 @@ fn handle_shell_request(
                 .get("cursor_pos")
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
-            let completion = state.worker.complete(code, cursor_pos.max(0) as usize)?;
+            let completion = state
+                .lock_worker()?
+                .complete(code, cursor_pos.max(0) as usize)?;
             send_reply(
                 reply_socket,
                 state,
@@ -1125,7 +1465,7 @@ fn handle_shell_request(
                     "metadata": completion.metadata,
                 }),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         "inspect_request" => {
             let code = request
@@ -1143,10 +1483,11 @@ fn handle_shell_request(
                 .get("detail_level")
                 .and_then(Value::as_u64)
                 .unwrap_or_default();
-            let inspection =
-                state
-                    .worker
-                    .inspect(code, cursor_pos.max(0) as usize, detail_level as u8)?;
+            let inspection = state.lock_worker()?.inspect(
+                code,
+                cursor_pos.max(0) as usize,
+                detail_level as u8,
+            )?;
             send_reply(
                 reply_socket,
                 state,
@@ -1159,7 +1500,7 @@ fn handle_shell_request(
                     "metadata": inspection.metadata,
                 }),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         "history_request" => {
             send_reply(
@@ -1169,7 +1510,56 @@ fn handle_shell_request(
                 "history_reply",
                 state.history_reply_content(&request.content),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
+        "comm_open" => {
+            let comm_id = request
+                .content
+                .get("comm_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let target_name = request
+                .content
+                .get("target_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = request.content.get("data").unwrap_or(&Value::Null);
+            let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
+            let outcome = state
+                .lock_worker()?
+                .comm_open(comm_id, target_name, data, metadata)?;
+            handle_comm_outcome(iopub_socket, state, request, &outcome)?;
+            if outcome.registered {
+                state.register_comm(&request.content);
+            } else {
+                state.close_comm(&request.content);
+            }
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
+        "comm_msg" => {
+            let comm_id = request
+                .content
+                .get("comm_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = request.content.get("data").unwrap_or(&Value::Null);
+            let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
+            let outcome = state.lock_worker()?.comm_msg(comm_id, data, metadata)?;
+            handle_comm_outcome(iopub_socket, state, request, &outcome)?;
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
+        "comm_close" => {
+            let comm_id = request
+                .content
+                .get("comm_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = request.content.get("data").unwrap_or(&Value::Null);
+            let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
+            let outcome = state.lock_worker()?.comm_close(comm_id, data, metadata)?;
+            handle_comm_outcome(iopub_socket, state, request, &outcome)?;
+            state.close_comm(&request.content);
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         "comm_info_request" => {
             send_reply(
@@ -1177,24 +1567,21 @@ fn handle_shell_request(
                 state,
                 request,
                 "comm_info_reply",
-                json!({
-                    "status": "ok",
-                    "comms": {},
-                }),
+                state.comm_info_reply_content(&request.content),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
-        "shutdown_request" => handle_shutdown_request(reply_socket, state, request),
+        "shutdown_request" => handle_shutdown_request(reply_socket, iopub_socket, state, request),
         _ => send_unsupported_reply(reply_socket, state, request),
     }
 }
 
 fn handle_control_request(
     reply_socket: &zmq::Socket,
-    _iopub_socket: &zmq::Socket,
+    iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
-) -> Result<bool, KernelError> {
+) -> Result<RequestDisposition, KernelError> {
     match request.header.msg_type.as_str() {
         "kernel_info_request" => {
             send_reply(
@@ -1204,7 +1591,7 @@ fn handle_control_request(
                 "kernel_info_reply",
                 state.kernel_info_content(),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         "connect_request" => {
             send_reply(
@@ -1214,11 +1601,13 @@ fn handle_control_request(
                 "connect_reply",
                 state.connect_reply_content(),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
-        "shutdown_request" => handle_shutdown_request(reply_socket, state, request),
+        "shutdown_request" => handle_shutdown_request(reply_socket, iopub_socket, state, request),
         "interrupt_request" => {
-            state.restart()?;
+            if state.is_executing() {
+                state.interrupt()?;
+            }
             send_reply(
                 reply_socket,
                 state,
@@ -1226,7 +1615,17 @@ fn handle_control_request(
                 "interrupt_reply",
                 json!({ "status": "ok" }),
             )?;
-            Ok(false)
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
+        "usage_request" => {
+            send_reply(
+                reply_socket,
+                state,
+                request,
+                "usage_reply",
+                state.usage_reply_content(),
+            )?;
+            Ok(RequestDisposition::Complete { should_stop: false })
         }
         _ => send_unsupported_reply(reply_socket, state, request),
     }
@@ -1234,9 +1633,10 @@ fn handle_control_request(
 
 fn handle_shutdown_request(
     reply_socket: &zmq::Socket,
+    iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
-) -> Result<bool, KernelError> {
+) -> Result<RequestDisposition, KernelError> {
     let restart = request
         .content
         .get("restart")
@@ -1257,14 +1657,26 @@ fn handle_shutdown_request(
             "restart": restart,
         }),
     )?;
-    Ok(!restart)
+    publish_iopub_message(
+        iopub_socket,
+        state,
+        request.header_value.clone(),
+        "shutdown_reply",
+        json!({
+            "status": "ok",
+            "restart": restart,
+        }),
+    )?;
+    Ok(RequestDisposition::Complete {
+        should_stop: !restart,
+    })
 }
 
 fn send_unsupported_reply(
     reply_socket: &zmq::Socket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
-) -> Result<bool, KernelError> {
+) -> Result<RequestDisposition, KernelError> {
     let reply_type = reply_type_for(&request.header.msg_type);
     send_reply(
         reply_socket,
@@ -1278,7 +1690,7 @@ fn send_unsupported_reply(
             "traceback": [],
         }),
     )?;
-    Ok(false)
+    Ok(RequestDisposition::Complete { should_stop: false })
 }
 
 fn request_stdin_input(
@@ -1422,6 +1834,25 @@ fn publish_display_event(
     )
 }
 
+fn publish_comm_events(
+    socket: &zmq::Socket,
+    state: &mut MessageLoopState,
+    parent_header: Value,
+    events: &[WorkerCommEvent],
+) -> Result<(), KernelError> {
+    for event in events {
+        publish_iopub_message(
+            socket,
+            state,
+            parent_header.clone(),
+            &event.msg_type,
+            event.content.clone(),
+        )?;
+        state.comms.apply_event(event);
+    }
+    Ok(())
+}
+
 fn publish_stream(
     socket: &zmq::Socket,
     state: &MessageLoopState,
@@ -1439,6 +1870,39 @@ fn publish_stream(
             "text": text,
         }),
     )
+}
+
+fn handle_comm_outcome(
+    iopub_socket: &zmq::Socket,
+    state: &mut MessageLoopState,
+    request: &JupyterMessage,
+    outcome: &CommOutcome,
+) -> Result<(), KernelError> {
+    if !outcome.stdout.is_empty() {
+        publish_stream(
+            iopub_socket,
+            state,
+            request.header_value.clone(),
+            "stdout",
+            &outcome.stdout,
+        )?;
+    }
+    if !outcome.stderr.is_empty() {
+        publish_stream(
+            iopub_socket,
+            state,
+            request.header_value.clone(),
+            "stderr",
+            &outcome.stderr,
+        )?;
+    }
+    publish_comm_events(
+        iopub_socket,
+        state,
+        request.header_value.clone(),
+        &outcome.events,
+    )?;
+    Ok(())
 }
 
 fn reply_type_for(msg_type: &str) -> String {
@@ -1690,6 +2154,7 @@ mod tests {
             reply.content.pointer("/help_links/0/text"),
             Some(&json!("Python Reference"))
         );
+        assert_eq!(reply.content.get("debugger"), Some(&json!(false)));
         assert_eq!(reply.content.get("supported_features"), Some(&json!([])));
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
@@ -1909,6 +2374,67 @@ mod tests {
     }
 
     #[test]
+    fn execute_error_reply_includes_empty_user_expressions_and_payload() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let request = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "1 / 0",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &request);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "execute_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("error")));
+        assert_eq!(
+            reply.content.get("ename"),
+            Some(&json!("ZeroDivisionError"))
+        );
+        assert_eq!(reply.content.get("user_expressions"), Some(&json!({})));
+        assert_eq!(reply.content.get("payload"), Some(&json!([])));
+        assert!(
+            reply
+                .content
+                .get("traceback")
+                .and_then(|value| value.as_array())
+                .is_some_and(|traceback| !traceback.is_empty())
+        );
+
+        let published = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 4);
+        assert_eq!(
+            published
+                .iter()
+                .map(|message| message.header.msg_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["status", "execute_input", "error", "status"]
+        );
+        assert_eq!(
+            published[2].content.get("ename"),
+            Some(&json!("ZeroDivisionError"))
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn execute_request_preserves_state_across_cells() {
         let _guard = test_lock();
         let connection = test_connection_info();
@@ -2079,6 +2605,114 @@ mod tests {
         let matches = search_reply.content["history"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0], json!([1, 2, "value + 2"]));
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn comm_info_request_reports_registered_comms() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let setup = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "from rustykernel.comm import register_target\n\ndef target(comm, msg):\n    pass\n\nregister_target('jupyter.widget', target)",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &setup);
+        let setup_reply = recv_message(&shell, &signer);
+        assert_eq!(setup_reply.content.get("status"), Some(&json!("ok")));
+        let _ = recv_iopub_messages_for_parent(&iopub, &signer, &setup.header.msg_id, 3);
+
+        let open = client_request(
+            "client-session",
+            "comm_open",
+            json!({
+                "comm_id": "comm-1",
+                "target_name": "jupyter.widget",
+                "data": {},
+            }),
+        );
+        send_client_message(&shell, &signer, &open);
+        let open_statuses = recv_iopub_messages_for_parent(&iopub, &signer, &open.header.msg_id, 2);
+        assert_eq!(status_message_states(&open_statuses), vec!["busy", "idle"]);
+
+        let list_all = client_request("client-session", "comm_info_request", json!({}));
+        send_client_message(&shell, &signer, &list_all);
+        let list_all_reply = recv_message(&shell, &signer);
+        assert_eq!(list_all_reply.header.msg_type, "comm_info_reply");
+        assert_eq!(list_all_reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(
+            list_all_reply.content.get("comms"),
+            Some(&json!({
+                "comm-1": {
+                    "target_name": "jupyter.widget",
+                },
+            }))
+        );
+        let list_all_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &list_all.header.msg_id, 2);
+        assert_eq!(
+            status_message_states(&list_all_statuses),
+            vec!["busy", "idle"]
+        );
+
+        let filtered = client_request(
+            "client-session",
+            "comm_info_request",
+            json!({
+                "target_name": "other.target",
+            }),
+        );
+        send_client_message(&shell, &signer, &filtered);
+        let filtered_reply = recv_message(&shell, &signer);
+        assert_eq!(filtered_reply.content.get("comms"), Some(&json!({})));
+        let filtered_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &filtered.header.msg_id, 2);
+        assert_eq!(
+            status_message_states(&filtered_statuses),
+            vec!["busy", "idle"]
+        );
+
+        let close = client_request(
+            "client-session",
+            "comm_close",
+            json!({
+                "comm_id": "comm-1",
+                "data": {},
+            }),
+        );
+        send_client_message(&shell, &signer, &close);
+        let close_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &close.header.msg_id, 2);
+        assert_eq!(status_message_states(&close_statuses), vec!["busy", "idle"]);
+
+        let after_close = client_request("client-session", "comm_info_request", json!({}));
+        send_client_message(&shell, &signer, &after_close);
+        let after_close_reply = recv_message(&shell, &signer);
+        assert_eq!(after_close_reply.content.get("comms"), Some(&json!({})));
+        let after_close_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &after_close.header.msg_id, 2);
+        assert_eq!(
+            status_message_states(&after_close_statuses),
+            vec!["busy", "idle"]
+        );
 
         runtime.stop().unwrap();
     }
@@ -2527,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn control_channel_interrupt_request_restarts_worker_state() {
+    fn control_channel_interrupt_request_preserves_worker_state() {
         let _guard = test_lock();
         let connection = test_connection_info();
         let mut runtime = start_kernel(connection.clone()).unwrap();
@@ -2580,9 +3214,8 @@ mod tests {
         send_client_message(&shell, &signer, &probe);
         let probe_reply = recv_message(&shell, &signer);
         assert_eq!(probe_reply.header.msg_type, "execute_reply");
-        assert_eq!(probe_reply.content.get("status"), Some(&json!("error")));
-        assert_eq!(probe_reply.content.get("ename"), Some(&json!("NameError")));
-        assert_eq!(probe_reply.content.get("execution_count"), Some(&json!(1)));
+        assert_eq!(probe_reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(probe_reply.content.get("execution_count"), Some(&json!(2)));
 
         let history = client_request(
             "client-session",
@@ -2599,7 +3232,203 @@ mod tests {
         let history_reply = recv_message(&shell, &signer);
         assert_eq!(
             history_reply.content.get("history"),
-            Some(&json!([[1, 1, "value = 99"], [2, 1, "value"]]))
+            Some(&json!([[1, 1, "value = 99"], [1, 2, "value"]]))
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn control_channel_usage_request_reports_kernel_metrics() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let request = client_request("client-session", "usage_request", json!({}));
+        send_client_message(&control, &signer, &request);
+
+        let reply = recv_message(&control, &signer);
+        assert_eq!(reply.header.msg_type, "usage_reply");
+        assert!(
+            reply
+                .content
+                .get("hostname")
+                .and_then(Value::as_str)
+                .is_some_and(|hostname| !hostname.is_empty())
+        );
+        assert!(
+            reply
+                .content
+                .get("pid")
+                .and_then(Value::as_u64)
+                .is_some_and(|pid| pid > 0)
+        );
+        assert!(reply.content.get("kernel_cpu").is_some());
+        assert!(
+            reply
+                .content
+                .get("kernel_memory")
+                .and_then(Value::as_u64)
+                .is_some_and(|memory| memory > 0)
+        );
+        assert!(
+            reply
+                .content
+                .get("cpu_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0)
+        );
+        assert!(
+            reply
+                .content
+                .pointer("/host_virtual_memory/total")
+                .and_then(Value::as_u64)
+                .is_some_and(|total| total > 0)
+        );
+
+        let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn control_channel_interrupt_request_interrupts_running_execution() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let define = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 99",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &define);
+        let define_reply = recv_message(&shell, &signer);
+        assert_eq!(define_reply.content.get("status"), Some(&json!("ok")));
+        let define_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &define.header.msg_id, 3);
+        assert_eq!(
+            status_message_states(&define_statuses),
+            vec!["busy", "idle"]
+        );
+
+        let long_running = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "import time\ntime.sleep(30)",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &long_running);
+        thread::sleep(std::time::Duration::from_millis(200));
+
+        let interrupt = client_request("client-session", "interrupt_request", json!({}));
+        send_client_message(&control, &signer, &interrupt);
+        let interrupt_reply = recv_message(&control, &signer);
+        assert_eq!(interrupt_reply.header.msg_type, "interrupt_reply");
+        assert_eq!(interrupt_reply.content.get("status"), Some(&json!("ok")));
+        let interrupt_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &interrupt.header.msg_id, 2);
+        assert_eq!(
+            status_message_states(&interrupt_statuses),
+            vec!["busy", "idle"]
+        );
+
+        let long_running_reply = recv_message(&shell, &signer);
+        assert_eq!(long_running_reply.header.msg_type, "execute_reply");
+        assert_eq!(
+            long_running_reply.content.get("status"),
+            Some(&json!("error"))
+        );
+        assert_eq!(
+            long_running_reply.content.get("ename"),
+            Some(&json!("KeyboardInterrupt"))
+        );
+        assert_eq!(
+            long_running_reply.content.get("execution_count"),
+            Some(&json!(2))
+        );
+        let long_running_messages =
+            recv_iopub_messages_for_parent(&iopub, &signer, &long_running.header.msg_id, 2);
+        assert_eq!(
+            long_running_messages
+                .iter()
+                .map(|message| message.header.msg_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["error", "status"]
+        );
+
+        let probe = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &probe);
+        let probe_reply = recv_message(&shell, &signer);
+        assert_eq!(probe_reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(probe_reply.content.get("execution_count"), Some(&json!(3)));
+
+        let history = client_request(
+            "client-session",
+            "history_request",
+            json!({
+                "hist_access_type": "tail",
+                "output": false,
+                "raw": true,
+                "session": 0,
+                "n": 10,
+            }),
+        );
+        send_client_message(&shell, &signer, &history);
+        let history_reply = recv_message(&shell, &signer);
+        assert_eq!(
+            history_reply.content.get("history"),
+            Some(&json!([
+                [1, 1, "value = 99"],
+                [1, 2, "import time\ntime.sleep(30)"],
+                [1, 3, "value"]
+            ]))
         );
 
         runtime.stop().unwrap();
@@ -2617,6 +3446,7 @@ mod tests {
             &runtime.channel_endpoints().control,
             b"control-client",
         );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
 
         let request = client_request(
             "client-session",
@@ -2630,6 +3460,14 @@ mod tests {
         let reply = recv_message(&control, &signer);
         assert_eq!(reply.header.msg_type, "shutdown_reply");
         assert_eq!(reply.content.get("restart"), Some(&json!(false)));
+        let published = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 3);
+        assert_eq!(
+            published
+                .iter()
+                .map(|message| message.header.msg_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["status", "shutdown_reply", "status"]
+        );
 
         runtime.wait_for_shutdown();
         assert!(!runtime.is_running());

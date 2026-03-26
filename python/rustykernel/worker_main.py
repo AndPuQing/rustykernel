@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import ast
+import asyncio
 import builtins
-import codeop
 import contextlib
 import getpass
 import html
@@ -10,9 +9,11 @@ import inspect
 import io
 import json
 import keyword
+import os
 import re
 import rlcompleter
 import sys
+import time
 import token as token_types
 import tokenize
 import traceback
@@ -20,6 +21,12 @@ import types
 import uuid
 from io import StringIO
 from typing import Optional
+
+from IPython import get_ipython as ipython_get_ipython
+from IPython.core.displayhook import DisplayHook as IPythonDisplayHook
+from IPython.core.displaypub import DisplayPublisher as IPythonDisplayPublisher
+from IPython.core.error import UsageError
+from IPython.core.interactiveshell import InteractiveShell
 
 try:
     import jedi
@@ -31,15 +38,46 @@ namespace: dict[str, object] = {"__name__": "__main__"}
 completer = rlcompleter.Completer(namespace)
 COMPLETION_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)$")
 DISPLAY_EVENTS: list[dict[str, object]] = []
+COMM_EVENTS: list[dict[str, object]] = []
+COMM_TARGETS: dict[str, object] = {}
+COMMS: dict[str, "Comm"] = {}
+PAYLOADS: list[dict[str, object]] = []
 CURRENT_REQUEST_ID: int | None = None
+PENDING_INTERRUPT = False
+AUTOAWAIT_ENABLED = True
+AUTOAWAIT_RUNNER = "asyncio"
+EXECUTE_RESULT: dict[str, object] | None = None
+_PROTOCOL_STREAM: io.TextIOBase | None = None
 
 
 def protocol_stdout() -> io.TextIOBase:
-    return sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
+    global _PROTOCOL_STREAM
+
+    if _PROTOCOL_STREAM is not None:
+        return _PROTOCOL_STREAM
+
+    protocol_fd = os.environ.get("RUSTYKERNEL_PROTOCOL_FD")
+    if protocol_fd is None:
+        return sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
+
+    _PROTOCOL_STREAM = os.fdopen(
+        int(protocol_fd),
+        "w",
+        buffering=1,
+        encoding="utf-8",
+        closefd=False,
+    )
+    return _PROTOCOL_STREAM
 
 
 def protocol_stdin() -> io.TextIOBase:
     return sys.__stdin__ if sys.__stdin__ is not None else sys.stdin
+
+
+def emit_protocol_message(message: object) -> None:
+    stream = protocol_stdout()
+    stream.write(json.dumps(message) + "\n")
+    stream.flush()
 
 
 def completion_kind(value: object) -> str:
@@ -252,6 +290,7 @@ def rich_display_data(value: object) -> tuple[dict[str, object], dict[str, objec
         ("text/latex", "_repr_latex_"),
         ("image/svg+xml", "_repr_svg_"),
         ("application/json", "_repr_json_"),
+        ("application/javascript", "_repr_javascript_"),
     ]
 
     for mime_type, method_name in rich_repr_names:
@@ -275,9 +314,334 @@ def rich_display_data(value: object) -> tuple[dict[str, object], dict[str, objec
     return data, metadata
 
 
+class DisplayFormatter:
+    def format(self, value: object) -> tuple[dict[str, object], dict[str, object]]:
+        return rich_display_data(value)
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 1e-3:
+        return f"{seconds * 1_000_000:.0f} us"
+    if seconds < 1:
+        return f"{seconds * 1_000:.3f} ms"
+    return f"{seconds:.3f} s"
+
+
+def _parse_magic_invocation(source: str, prefix: str) -> tuple[str, str]:
+    stripped = source.strip()
+    if not stripped.startswith(prefix):
+        raise UsageError(f"expected {prefix!r} magic prefix")
+
+    body = stripped[len(prefix) :].strip()
+    if not body:
+        raise UsageError("magic name is required")
+
+    name, _, args = body.partition(" ")
+    return name, args.lstrip()
+
+
+class RustyInteractiveShell:
+    def __init__(self) -> None:
+        self.display_formatter = DisplayFormatter()
+        self.user_ns = namespace
+        self.user_module = None
+        self.autoawait = True
+        self.loop_runner = AUTOAWAIT_RUNNER
+        self.active_eventloop: str | None = None
+        self._line_magics: dict[str, object] = {}
+        self._cell_magics: dict[str, object] = {}
+        self._register_default_magics()
+
+    def __repr__(self) -> str:
+        return "<RustyInteractiveShell>"
+
+    @property
+    def magics_manager(self) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            magics={
+                "line": dict(self._line_magics),
+                "cell": dict(self._cell_magics),
+            }
+        )
+
+    def register_magic_function(
+        self,
+        function: object,
+        magic_kind: str = "line",
+        magic_name: object = None,
+    ) -> None:
+        name = str(magic_name or getattr(function, "__name__", "")).strip()
+        if not name:
+            raise UsageError("magic_name is required")
+        if magic_kind == "line":
+            self._line_magics[name] = function
+        elif magic_kind == "cell":
+            self._cell_magics[name] = function
+        else:
+            raise UsageError(f"unsupported magic kind: {magic_kind}")
+
+    def run_line_magic(self, magic_name: str, line: str) -> object:
+        magic = self._line_magics.get(str(magic_name))
+        if magic is None:
+            raise UsageError(f"line magic %{magic_name} not found")
+        return magic(str(line))
+
+    def run_cell_magic(self, magic_name: str, line: str, cell: str) -> object:
+        magic = self._cell_magics.get(str(magic_name))
+        if magic is None:
+            raise UsageError(f"cell magic %%{magic_name} not found")
+        return magic(str(line), str(cell))
+
+    def set_next_input(self, text: str, replace: bool = False) -> None:
+        payload = {
+            "text": str(text),
+            "replace": bool(replace),
+        }
+        self.user_ns["_rustykernel_next_input"] = payload
+        PAYLOADS[:] = [
+            item for item in PAYLOADS if item.get("source") != "set_next_input"
+        ]
+        PAYLOADS.append(
+            {
+                "source": "set_next_input",
+                "text": payload["text"],
+                "replace": payload["replace"],
+            }
+        )
+
+    def object_inspect(self, name: object) -> dict[str, object]:
+        symbol = str(name)
+        try:
+            value = eval(symbol, namespace, namespace)
+        except BaseException:
+            return {"found": False}
+
+        data, metadata = self.display_formatter.format(value)
+        return {
+            "found": True,
+            "string_form": repr(value),
+            "type_name": type(value).__name__,
+            "data": data,
+            "metadata": metadata,
+        }
+
+    def _register_default_magics(self) -> None:
+        self.register_magic_function(self._magic_pwd, "line", "pwd")
+        self.register_magic_function(self._magic_cd, "line", "cd")
+        self.register_magic_function(self._magic_lsmagic, "line", "lsmagic")
+        self.register_magic_function(self._magic_time, "line", "time")
+        self.register_magic_function(self._magic_timeit, "line", "timeit")
+        self.register_magic_function(self._magic_autoawait, "line", "autoawait")
+        self.register_magic_function(self._magic_matplotlib, "line", "matplotlib")
+        self.register_magic_function(self._cell_magic_time, "cell", "time")
+        self.register_magic_function(self._cell_magic_timeit, "cell", "timeit")
+
+    def _magic_pwd(self, line: str) -> str:
+        if line.strip():
+            raise UsageError("%pwd does not accept arguments")
+        return os.getcwd()
+
+    def _magic_cd(self, line: str) -> str:
+        target = line.strip()
+        if not target:
+            return os.getcwd()
+
+        path = os.path.abspath(os.path.expanduser(target))
+        os.chdir(path)
+        return os.getcwd()
+
+    def _magic_lsmagic(self, line: str) -> dict[str, list[str]]:
+        if line.strip():
+            raise UsageError("%lsmagic does not accept arguments")
+        return {
+            "line": sorted(self._line_magics),
+            "cell": sorted(self._cell_magics),
+        }
+
+    def _magic_time(self, line: str) -> object:
+        return self._run_timed_code(line)
+
+    def _cell_magic_time(self, line: str, cell: str) -> object:
+        if line.strip():
+            raise UsageError("%%time does not accept arguments")
+        return self._run_timed_code(cell)
+
+    def _magic_timeit(self, line: str) -> None:
+        if not line.strip():
+            raise UsageError("%timeit requires code to run")
+        self._run_timeit(line)
+        return None
+
+    def _cell_magic_timeit(self, line: str, cell: str) -> None:
+        if line.strip():
+            raise UsageError("%%timeit does not accept arguments")
+        self._run_timeit(cell)
+        return None
+
+    def _magic_autoawait(self, line: str) -> str:
+        global AUTOAWAIT_ENABLED, AUTOAWAIT_RUNNER
+
+        argument = line.strip().lower()
+        if argument in {"", "asyncio", "on", "true", "1"}:
+            AUTOAWAIT_ENABLED = True
+            AUTOAWAIT_RUNNER = "asyncio"
+            self.autoawait = True
+            self.loop_runner = AUTOAWAIT_RUNNER
+        elif argument in {"off", "false", "0", "no"}:
+            AUTOAWAIT_ENABLED = False
+            self.autoawait = False
+            self.loop_runner = "sync"
+        else:
+            raise UsageError(
+                "rustykernel currently only supports %autoawait asyncio or %autoawait off"
+            )
+
+        status = "on" if AUTOAWAIT_ENABLED else "off"
+        runner = AUTOAWAIT_RUNNER if AUTOAWAIT_ENABLED else "sync"
+        return f"autoawait={status}, runner={runner}"
+
+    def _magic_matplotlib(self, line: str) -> None:
+        backend = line.strip().lower()
+        if backend not in {"", "inline"}:
+            raise UsageError(
+                "rustykernel currently only accepts %matplotlib inline as a compatibility no-op"
+            )
+        self.active_eventloop = "inline"
+        self.user_ns["_rustykernel_matplotlib_backend"] = "inline"
+        return None
+
+    def _run_timed_code(self, code: str) -> object:
+        start = time.perf_counter()
+        try:
+            return run_interactive_code(code)
+        finally:
+            elapsed = time.perf_counter() - start
+            print(f"Wall time: {_format_duration(elapsed)}")
+
+    def _run_timeit(self, code: str, *, repeat: int = 3) -> None:
+        loops = 1
+        while loops < 100_000:
+            elapsed = self._timeit_batch(code, loops)
+            if elapsed >= 0.02:
+                break
+            loops *= 10
+
+        timings = [self._timeit_batch(code, loops) for _ in range(repeat)]
+        best = min(timings) / loops
+        print(f"{loops} loops, best of {repeat}: {_format_duration(best)} per loop")
+
+    def _timeit_batch(self, code: str, loops: int) -> float:
+        start = time.perf_counter()
+        sink = io.StringIO()
+        for _ in range(loops):
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                run_interactive_code_silently(code)
+        return time.perf_counter() - start
+
+
+class RustyDisplayHook(IPythonDisplayHook):
+    def write_output_prompt(self) -> None:
+        return None
+
+    def write_format_data(self, format_dict, md_dict=None) -> None:
+        global EXECUTE_RESULT
+        EXECUTE_RESULT = {
+            "data": dict(format_dict),
+            "metadata": dict(md_dict or {}),
+        }
+
+
+class RustyDisplayPublisher(IPythonDisplayPublisher):
+    def publish(
+        self,
+        data,
+        metadata=None,
+        source=None,
+        *,
+        transient=None,
+        update=False,
+        **kwargs,
+    ) -> None:
+        DISPLAY_EVENTS.append(
+            {
+                "msg_type": "update_display_data" if update else "display_data",
+                "data": dict(data),
+                "metadata": dict(metadata or {}),
+                "transient": dict(transient or {}),
+            }
+        )
+
+    def clear_output(self, wait: bool = False) -> None:
+        DISPLAY_EVENTS.append(
+            {
+                "msg_type": "clear_output",
+                "content": {"wait": bool(wait)},
+            }
+        )
+
+
+def build_interactive_shell() -> InteractiveShell:
+    global namespace, completer
+
+    user_module = types.ModuleType("__main__")
+    namespace = user_module.__dict__
+    namespace["__name__"] = "__main__"
+    completer = rlcompleter.Completer(namespace)
+
+    InteractiveShell.clear_instance()
+    shell = InteractiveShell.instance(user_ns=namespace, user_module=user_module)
+
+    displayhook = RustyDisplayHook(shell=shell, cache_size=shell.cache_size)
+    shell.displayhook = displayhook
+    shell.display_trap.hook = displayhook
+    shell.display_pub = RustyDisplayPublisher(shell=shell)
+    shell.showtraceback = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    shell.showsyntaxerror = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    def rustykernel_set_next_input(text: str, replace: bool = False) -> None:
+        shell.rl_next_input = text
+        shell.payload_manager.write_payload(
+            {
+                "source": "set_next_input",
+                "text": text,
+                "replace": replace,
+            }
+        )
+
+    shell.set_next_input = rustykernel_set_next_input  # type: ignore[method-assign]
+
+    matplotlib_magic = shell.find_line_magic("matplotlib")
+    if callable(matplotlib_magic):
+
+        def rustykernel_matplotlib(line: str):
+            try:
+                return matplotlib_magic(line)
+            except ModuleNotFoundError as exc:
+                backend = line.strip().lower()
+                if exc.name == "matplotlib" and backend in {"", "inline"}:
+                    shell.user_ns["_rustykernel_matplotlib_backend"] = "inline"
+                    return None
+                raise
+
+        shell.register_magic_function(rustykernel_matplotlib, "line", "matplotlib")
+
+    return shell
+
+
+INTERACTIVE_SHELL = build_interactive_shell()
+
+
 def publish_display_event(
-    value: object, *, msg_type: str, transient: Optional[dict[str, object]] = None
+    value: object,
+    *,
+    msg_type: str,
+    transient: Optional[dict[str, object]] = None,
+    content: Optional[dict[str, object]] = None,
 ) -> None:
+    if content is not None:
+        DISPLAY_EVENTS.append({"msg_type": msg_type, "content": content})
+        return
+
     data, metadata = rich_display_data(value)
     DISPLAY_EVENTS.append(
         {
@@ -289,17 +653,91 @@ def publish_display_event(
     )
 
 
+def publish_comm_event(
+    msg_type: str,
+    *,
+    comm_id: str,
+    data: object = None,
+    metadata: object = None,
+    target_name: Optional[str] = None,
+) -> None:
+    content: dict[str, object] = {
+        "comm_id": comm_id,
+        "data": {} if data is None else data,
+        "metadata": {} if metadata is None else metadata,
+    }
+    if target_name is not None:
+        content["target_name"] = target_name
+    COMM_EVENTS.append({"msg_type": msg_type, "content": content})
+
+
 class DisplayHandle:
     def __init__(self, display_id: str):
         self.display_id = display_id
 
-    def display(self, value: object) -> "DisplayHandle":
-        display(value, display_id=self.display_id)
+    def display(self, *values: object, **kwargs: object) -> "DisplayHandle":
+        display(*values, display_id=self.display_id, **kwargs)
         return self
 
-    def update(self, value: object) -> "DisplayHandle":
-        update_display(value, display_id=self.display_id)
+    def update(self, value: object, **kwargs: object) -> "DisplayHandle":
+        update_display(value, display_id=self.display_id, **kwargs)
         return self
+
+
+class _MimeDisplayObject:
+    mime_type: str = ""
+
+    def __init__(self, data: object = "", metadata: Optional[dict[str, object]] = None):
+        self.data = data
+        self.metadata = {} if metadata is None else dict(metadata)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.data!r})"
+
+    def _repr_mimebundle_(self) -> tuple[dict[str, object], dict[str, object]]:
+        return {
+            "text/plain": repr(self),
+            self.mime_type: self.data,
+        }, self.metadata
+
+
+class HTML(_MimeDisplayObject):
+    mime_type = "text/html"
+
+
+class Markdown(_MimeDisplayObject):
+    mime_type = "text/markdown"
+
+
+class Latex(_MimeDisplayObject):
+    mime_type = "text/latex"
+
+
+class SVG(_MimeDisplayObject):
+    mime_type = "image/svg+xml"
+
+
+class Javascript(_MimeDisplayObject):
+    mime_type = "application/javascript"
+
+
+class Pretty(_MimeDisplayObject):
+    mime_type = "text/plain"
+
+
+class JSONDisplayObject:
+    def __init__(self, data: object, metadata: Optional[dict[str, object]] = None):
+        self.data = data
+        self.metadata = {} if metadata is None else dict(metadata)
+
+    def __repr__(self) -> str:
+        return f"JSON({self.data!r})"
+
+    def _repr_mimebundle_(self) -> tuple[dict[str, object], dict[str, object]]:
+        return {
+            "text/plain": repr(self),
+            "application/json": self.data,
+        }, self.metadata
 
 
 def _normalize_display_id(display_id: object) -> Optional[str]:
@@ -310,28 +748,98 @@ def _normalize_display_id(display_id: object) -> Optional[str]:
     return str(display_id)
 
 
-def display(value: object, *, display_id: object = None) -> Optional[DisplayHandle]:
+def _display_data_and_metadata(
+    value: object,
+    *,
+    raw: bool = False,
+    metadata: Optional[dict[str, object]] = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    if raw:
+        if not isinstance(value, dict):
+            raise TypeError("raw display expects a mimebundle dict")
+        return {str(key): bundle for key, bundle in value.items()}, metadata or {}
+
+    data, rich_metadata = rich_display_data(value)
+    if metadata:
+        rich_metadata = {**rich_metadata, **metadata}
+    return data, rich_metadata
+
+
+def _publish_display_bundle(
+    data: dict[str, object],
+    metadata: dict[str, object],
+    *,
+    msg_type: str,
+    transient: Optional[dict[str, object]] = None,
+) -> None:
+    DISPLAY_EVENTS.append(
+        {
+            "msg_type": msg_type,
+            "data": data,
+            "metadata": metadata,
+            "transient": transient or {},
+        }
+    )
+
+
+def display(
+    *values: object,
+    display_id: object = None,
+    raw: bool = False,
+    metadata: Optional[dict[str, object]] = None,
+) -> Optional[DisplayHandle]:
     normalized_display_id = _normalize_display_id(display_id)
     transient: dict[str, object] = {}
     if normalized_display_id is not None:
         transient["display_id"] = normalized_display_id
 
-    publish_display_event(value, msg_type="display_data", transient=transient)
+    for value in values:
+        data, rich_metadata = _display_data_and_metadata(
+            value,
+            raw=raw,
+            metadata=metadata,
+        )
+        _publish_display_bundle(
+            data,
+            rich_metadata,
+            msg_type="display_data",
+            transient=transient,
+        )
 
     if normalized_display_id is None:
         return None
     return DisplayHandle(normalized_display_id)
 
 
-def update_display(value: object, *, display_id: object) -> None:
+def update_display(
+    value: object,
+    *,
+    display_id: object,
+    raw: bool = False,
+    metadata: Optional[dict[str, object]] = None,
+) -> None:
     normalized_display_id = _normalize_display_id(display_id)
     if normalized_display_id is None:
         raise ValueError("display_id is required for update_display")
 
-    publish_display_event(
+    data, rich_metadata = _display_data_and_metadata(
         value,
+        raw=raw,
+        metadata=metadata,
+    )
+    _publish_display_bundle(
+        data,
+        rich_metadata,
         msg_type="update_display_data",
         transient={"display_id": normalized_display_id},
+    )
+
+
+def clear_output(wait: bool = False) -> None:
+    publish_display_event(
+        None,
+        msg_type="clear_output",
+        content={"wait": bool(wait)},
     )
 
 
@@ -339,18 +847,14 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
     if CURRENT_REQUEST_ID is None:
         raise RuntimeError("input() is only available while handling a request")
 
-    protocol_stdout().write(
-        json.dumps(
-            {
-                "id": CURRENT_REQUEST_ID,
-                "event": "input_request",
-                "prompt": str(prompt),
-                "password": password,
-            }
-        )
-        + "\n"
+    emit_protocol_message(
+        {
+            "id": CURRENT_REQUEST_ID,
+            "event": "input_request",
+            "prompt": str(prompt),
+            "password": password,
+        }
     )
-    protocol_stdout().flush()
 
     while True:
         raw_line = protocol_stdin().readline()
@@ -380,64 +884,335 @@ def install_input_api() -> None:
 
 
 def install_display_api() -> None:
-    namespace["display"] = display
-    namespace["update_display"] = update_display
-    namespace["DisplayHandle"] = DisplayHandle
+    from IPython import display as display_module
 
-    ipython_module = sys.modules.get("IPython")
-    if ipython_module is None:
-        ipython_module = types.ModuleType("IPython")
-        ipython_module.__path__ = []
-        sys.modules["IPython"] = ipython_module
+    exported_names = [
+        "display",
+        "update_display",
+        "clear_output",
+        "DisplayHandle",
+        "HTML",
+        "Markdown",
+        "JSON",
+        "Javascript",
+        "Latex",
+        "SVG",
+        "Pretty",
+        "Image",
+    ]
+    for name in exported_names:
+        if hasattr(display_module, name):
+            namespace[name] = getattr(display_module, name)
 
-    display_module = types.ModuleType("IPython.display")
-    display_module.display = display
-    display_module.update_display = update_display
-    display_module.DisplayHandle = DisplayHandle
-    display_module.__all__ = ["display", "update_display", "DisplayHandle"]
-    sys.modules["IPython.display"] = display_module
-    ipython_module.display = display_module
+
+def get_ipython() -> InteractiveShell:
+    return ipython_get_ipython()
+
+
+def install_ipython_api() -> None:
+    namespace["get_ipython"] = get_ipython
+    builtins.get_ipython = get_ipython
+
+
+class Comm:
+    def __init__(
+        self,
+        *,
+        target_name: str = "",
+        comm_id: object = None,
+        data: object = None,
+        metadata: object = None,
+        primary: bool = True,
+    ):
+        self.comm_id = str(comm_id or uuid.uuid4())
+        self.target_name = str(target_name)
+        self.primary = primary
+        self._closed = False
+        self._msg_callback = None
+        self._close_callback = None
+
+        COMMS[self.comm_id] = self
+        if primary:
+            publish_comm_event(
+                "comm_open",
+                comm_id=self.comm_id,
+                target_name=self.target_name,
+                data=data,
+                metadata=metadata,
+            )
+
+    def send(self, data: object = None, metadata: object = None) -> None:
+        if self._closed:
+            raise RuntimeError(f"Cannot send on closed comm {self.comm_id}")
+        publish_comm_event(
+            "comm_msg",
+            comm_id=self.comm_id,
+            data=data,
+            metadata=metadata,
+        )
+
+    def close(self, data: object = None, metadata: object = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        COMMS.pop(self.comm_id, None)
+        publish_comm_event(
+            "comm_close",
+            comm_id=self.comm_id,
+            data=data,
+            metadata=metadata,
+        )
+
+    def on_msg(self, callback):
+        self._msg_callback = callback
+        return callback
+
+    def on_close(self, callback):
+        self._close_callback = callback
+        return callback
+
+    def handle_msg(self, msg: dict[str, object]) -> None:
+        if callable(self._msg_callback):
+            self._msg_callback(msg)
+
+    def handle_close(self, msg: dict[str, object]) -> None:
+        if callable(self._close_callback):
+            self._close_callback(msg)
+
+
+def register_target(target_name: object, callback: object) -> None:
+    COMM_TARGETS[str(target_name)] = callback
+
+
+def unregister_target(target_name: object) -> None:
+    COMM_TARGETS.pop(str(target_name), None)
+
+
+def install_comm_api() -> None:
+    namespace["Comm"] = Comm
+    namespace["register_comm_target"] = register_target
+    namespace["unregister_comm_target"] = unregister_target
+
+    rustykernel_module = sys.modules.get("rustykernel")
+    if rustykernel_module is None:
+        try:
+            __import__("rustykernel")
+            rustykernel_module = sys.modules.get("rustykernel")
+        except ImportError:
+            rustykernel_module = types.ModuleType("rustykernel")
+            rustykernel_module.__path__ = []
+            sys.modules["rustykernel"] = rustykernel_module
+
+    comm_module = types.ModuleType("rustykernel.comm")
+    comm_module.Comm = Comm
+    comm_module.register_target = register_target
+    comm_module.unregister_target = unregister_target
+    comm_module.__all__ = ["Comm", "register_target", "unregister_target"]
+    sys.modules["rustykernel.comm"] = comm_module
+    rustykernel_module.comm = comm_module
+
+
+def run_interactive_code_silently(code: str) -> None:
+    INTERACTIVE_SHELL.run_cell(code, store_history=False, silent=True)
+
+
+def run_interactive_code(code: str) -> object:
+    return INTERACTIVE_SHELL.run_cell(code, store_history=False, silent=False)
+
+
+def format_execution_error(error: BaseException) -> tuple[str, str, list[str]]:
+    if isinstance(error, SyntaxError):
+        traceback_lines = INTERACTIVE_SHELL.SyntaxTB.structured_traceback(
+            type(error), error, error.__traceback__
+        )
+    else:
+        traceback_lines = INTERACTIVE_SHELL.InteractiveTB.structured_traceback(
+            type(error), error, error.__traceback__
+        )
+    return error.__class__.__name__, str(error), list(traceback_lines)
+
+
+def execute_with_ipython(
+    code: str,
+    *,
+    execution_count: int,
+    silent: bool,
+    store_history: bool,
+) -> object:
+    global EXECUTE_RESULT, AUTOAWAIT_ENABLED
+
+    EXECUTE_RESULT = None
+    INTERACTIVE_SHELL.execution_count = max(1, execution_count)
+    AUTOAWAIT_ENABLED = bool(getattr(INTERACTIVE_SHELL, "autoawait", True))
+    INTERACTIVE_SHELL.payload_manager.clear_payload()
+
+    preprocessing_exc_tuple = None
+    try:
+        transformed_cell = INTERACTIVE_SHELL.transform_cell(code)
+    except Exception:
+        transformed_cell = code
+        preprocessing_exc_tuple = sys.exc_info()
+
+    if (
+        hasattr(INTERACTIVE_SHELL, "run_cell_async")
+        and hasattr(INTERACTIVE_SHELL, "should_run_async")
+        and INTERACTIVE_SHELL.should_run_async(
+            code,
+            transformed_cell=transformed_cell,
+            preprocessing_exc_tuple=preprocessing_exc_tuple,
+        )
+    ):
+        return asyncio.run(
+            INTERACTIVE_SHELL.run_cell_async(
+                code,
+                store_history=store_history,
+                silent=silent,
+                transformed_cell=transformed_cell,
+                preprocessing_exc_tuple=preprocessing_exc_tuple,
+            )
+        )
+
+    return INTERACTIVE_SHELL.run_cell(
+        code,
+        store_history=store_history,
+        silent=silent,
+    )
 
 
 install_display_api()
+install_ipython_api()
 install_input_api()
+install_comm_api()
 
 
 def evaluate_user_expressions(user_expressions: object) -> dict[str, object]:
     if not isinstance(user_expressions, dict):
         return {}
+    return dict(INTERACTIVE_SHELL.user_expressions(user_expressions))
 
-    results: dict[str, object] = {}
-    for name, expression in user_expressions.items():
-        expression_name = str(name)
-        try:
-            if not isinstance(expression, str):
-                raise TypeError("user_expressions values must be strings")
-            value = eval(
-                compile(expression, "<rustykernel:user_expression>", "eval"),
-                namespace,
-                namespace,
-            )
-            data, metadata = rich_display_data(value)
-            results[expression_name] = {
-                "status": "ok",
-                "data": data,
-                "metadata": metadata,
-            }
-        except BaseException as exc:
-            results[expression_name] = {
-                "status": "error",
-                "ename": exc.__class__.__name__,
-                "evalue": str(exc),
-                "traceback": traceback.format_exception(
-                    type(exc), exc, exc.__traceback__
-                ),
-            }
-    return results
+
+def comm_message(
+    comm_id: str,
+    *,
+    target_name: Optional[str] = None,
+    data: object = None,
+    metadata: object = None,
+) -> dict[str, object]:
+    content: dict[str, object] = {
+        "comm_id": comm_id,
+        "data": {} if data is None else data,
+        "metadata": {} if metadata is None else metadata,
+    }
+    if target_name is not None:
+        content["target_name"] = target_name
+    return {"content": content}
+
+
+def handle_comm_open(
+    comm_id: str,
+    target_name: str,
+    data: object = None,
+    metadata: object = None,
+) -> dict[str, object]:
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    COMM_EVENTS.clear()
+
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        callback = COMM_TARGETS.get(target_name)
+        if callback is None:
+            print(f"No such comm target registered: {target_name}", file=sys.stderr)
+            publish_comm_event("comm_close", comm_id=comm_id)
+        else:
+            comm = Comm(comm_id=comm_id, target_name=target_name, primary=False)
+            try:
+                callback(
+                    comm,
+                    comm_message(
+                        comm_id,
+                        target_name=target_name,
+                        data=data,
+                        metadata=metadata,
+                    ),
+                )
+            except BaseException:
+                traceback.print_exc()
+                comm.close()
+
+    return {
+        "stdout": stdout_buffer.getvalue(),
+        "stderr": stderr_buffer.getvalue(),
+        "events": list(COMM_EVENTS),
+        "registered": comm_id in COMMS,
+    }
+
+
+def handle_comm_msg(
+    comm_id: str, data: object = None, metadata: object = None
+) -> dict[str, object]:
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    COMM_EVENTS.clear()
+
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        comm = COMMS.get(comm_id)
+        if comm is None:
+            print(f"No such comm: {comm_id}", file=sys.stderr)
+        else:
+            try:
+                comm.handle_msg(comm_message(comm_id, data=data, metadata=metadata))
+            except BaseException:
+                traceback.print_exc()
+
+    return {
+        "stdout": stdout_buffer.getvalue(),
+        "stderr": stderr_buffer.getvalue(),
+        "events": list(COMM_EVENTS),
+        "registered": comm_id in COMMS,
+    }
+
+
+def handle_comm_close(
+    comm_id: str, data: object = None, metadata: object = None
+) -> dict[str, object]:
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    COMM_EVENTS.clear()
+
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+        stderr_buffer
+    ):
+        comm = COMMS.get(comm_id)
+        if comm is None:
+            print(f"No such comm: {comm_id}", file=sys.stderr)
+        else:
+            comm._closed = True
+            del COMMS[comm_id]
+            try:
+                comm.handle_close(comm_message(comm_id, data=data, metadata=metadata))
+            except BaseException:
+                traceback.print_exc()
+
+    return {
+        "stdout": stdout_buffer.getvalue(),
+        "stderr": stderr_buffer.getvalue(),
+        "events": list(COMM_EVENTS),
+        "registered": comm_id in COMMS,
+    }
 
 
 def execute(
-    code: str, request_id: int, user_expressions: object | None = None
+    code: str,
+    request_id: int,
+    user_expressions: object | None = None,
+    *,
+    execution_count: int,
+    silent: bool,
+    store_history: bool,
 ) -> dict[str, object]:
     stdout_buffer = io.StringIO()
     stderr_buffer = io.StringIO()
@@ -446,6 +1221,8 @@ def execute(
         "stdout": "",
         "stderr": "",
         "displays": [],
+        "comm_events": [],
+        "payload": [],
         "result": None,
         "user_expressions": {},
         "ename": None,
@@ -453,34 +1230,43 @@ def execute(
         "traceback": [],
     }
 
-    global CURRENT_REQUEST_ID
+    global CURRENT_REQUEST_ID, PENDING_INTERRUPT
     DISPLAY_EVENTS.clear()
+    COMM_EVENTS.clear()
+    PAYLOADS.clear()
     CURRENT_REQUEST_ID = request_id
 
     try:
-        tree = ast.parse(code, filename="<rustykernel>", mode="exec")
-        body = list(tree.body)
-        expr = None
-        if body and isinstance(body[-1], ast.Expr):
-            expr = ast.Expression(body.pop().value)
-        module = ast.Module(body=body, type_ignores=[])
+        if PENDING_INTERRUPT:
+            PENDING_INTERRUPT = False
+            raise KeyboardInterrupt()
 
         with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
             stderr_buffer
         ):
-            if body:
-                exec(compile(module, "<rustykernel>", "exec"), namespace, namespace)
-            if expr is not None:
-                value = eval(
-                    compile(expr, "<rustykernel>", "eval"), namespace, namespace
+            result = execute_with_ipython(
+                code,
+                execution_count=execution_count,
+                silent=silent,
+                store_history=store_history,
+            )
+
+            error = (
+                result.error_before_exec
+                if result.error_before_exec is not None
+                else result.error_in_exec
+            )
+            if error is None:
+                payload["user_expressions"] = evaluate_user_expressions(
+                    user_expressions
                 )
-                if value is not None:
-                    data, metadata = rich_display_data(value)
-                    payload["result"] = {
-                        "data": data,
-                        "metadata": metadata,
-                    }
-            payload["user_expressions"] = evaluate_user_expressions(user_expressions)
+            else:
+                payload["status"] = "error"
+                (
+                    payload["ename"],
+                    payload["evalue"],
+                    payload["traceback"],
+                ) = format_execution_error(error)
     except BaseException as exc:
         payload["status"] = "error"
         payload["ename"] = exc.__class__.__name__
@@ -492,6 +1278,11 @@ def execute(
     payload["stdout"] = stdout_buffer.getvalue()
     payload["stderr"] = stderr_buffer.getvalue()
     payload["displays"] = list(DISPLAY_EVENTS)
+    payload["comm_events"] = list(COMM_EVENTS)
+    payload["payload"] = list(INTERACTIVE_SHELL.payload_manager.read_payload())
+    INTERACTIVE_SHELL.payload_manager.clear_payload()
+    if payload["status"] == "ok" and EXECUTE_RESULT is not None and not silent:
+        payload["result"] = EXECUTE_RESULT
     CURRENT_REQUEST_ID = None
     return payload
 
@@ -697,23 +1488,12 @@ def completion_indent(code: str) -> str:
 
 
 def is_complete(code: str) -> dict[str, object]:
-    try:
-        compiled = codeop.compile_command(code, filename="<rustykernel>", symbol="exec")
-    except (SyntaxError, OverflowError, ValueError, TypeError):
-        return {
-            "status": "invalid",
-            "indent": "",
-        }
-
-    if compiled is None:
-        return {
-            "status": "incomplete",
-            "indent": completion_indent(code),
-        }
-
+    status, indent = INTERACTIVE_SHELL.input_transformer_manager.check_complete(code)
     return {
-        "status": "complete",
-        "indent": "",
+        "status": str(status),
+        "indent": ""
+        if indent is None
+        else (" " * int(indent) if isinstance(indent, int) else str(indent)),
     }
 
 
@@ -726,9 +1506,19 @@ def kernel_info_payload() -> dict[str, object]:
     }
 
 
-for raw_line in protocol_stdin():
+stdin = protocol_stdin()
+while True:
+    try:
+        raw_line = stdin.readline()
+    except KeyboardInterrupt:
+        PENDING_INTERRUPT = True
+        continue
+
+    if raw_line == "":
+        break
     if not raw_line.strip():
         continue
+
     request = json.loads(raw_line)
     kind = request.get("kind", "execute")
     if kind == "complete":
@@ -755,6 +1545,34 @@ for raw_line in protocol_stdin():
             "id": request["id"],
             **kernel_info_payload(),
         }
+    elif kind == "comm_open":
+        response = {
+            "id": request["id"],
+            **handle_comm_open(
+                str(request.get("comm_id", "")),
+                str(request.get("target_name", "")),
+                request.get("data", {}),
+                request.get("metadata", {}),
+            ),
+        }
+    elif kind == "comm_msg":
+        response = {
+            "id": request["id"],
+            **handle_comm_msg(
+                str(request.get("comm_id", "")),
+                request.get("data", {}),
+                request.get("metadata", {}),
+            ),
+        }
+    elif kind == "comm_close":
+        response = {
+            "id": request["id"],
+            **handle_comm_close(
+                str(request.get("comm_id", "")),
+                request.get("data", {}),
+                request.get("metadata", {}),
+            ),
+        }
     elif kind == "input_reply":
         continue
     else:
@@ -764,7 +1582,9 @@ for raw_line in protocol_stdin():
                 request.get("code", ""),
                 int(request["id"]),
                 request.get("user_expressions", {}),
+                execution_count=int(request.get("execution_count", 0)),
+                silent=bool(request.get("silent", False)),
+                store_history=bool(request.get("store_history", True)),
             ),
         }
-    sys.stdout.write(json.dumps(response) + "\n")
-    sys.stdout.flush()
+    emit_protocol_message(response)

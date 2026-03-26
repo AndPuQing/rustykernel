@@ -39,6 +39,7 @@ class RunningKernel:
     payload: dict[str, object]
     process: subprocess.Popen[bytes]
     shell: zmq.Socket
+    control: zmq.Socket
     iopub: zmq.Socket
 
     def request(self, msg_type: str, content: dict[str, object]) -> dict[str, object]:
@@ -202,6 +203,10 @@ def running_kernel(
     shell.connect(f"tcp://127.0.0.1:{payload['shell_port']}")
     shell.setsockopt(zmq.RCVTIMEO, 3000)
 
+    control = zmq_context.socket(zmq.DEALER)
+    control.connect(f"tcp://127.0.0.1:{payload['control_port']}")
+    control.setsockopt(zmq.RCVTIMEO, 3000)
+
     iopub = zmq_context.socket(zmq.SUB)
     iopub.setsockopt(zmq.SUBSCRIBE, b"")
     iopub.connect(f"tcp://127.0.0.1:{payload['iopub_port']}")
@@ -212,6 +217,7 @@ def running_kernel(
         payload=payload,
         process=process,
         shell=shell,
+        control=control,
         iopub=iopub,
     )
 
@@ -220,6 +226,7 @@ def running_kernel(
         yield kernel
     finally:
         shell.close(0)
+        control.close(0)
         iopub.close(0)
         process.terminate()
         try:
@@ -248,6 +255,10 @@ def collect_kernel_info(kernel: RunningKernel) -> dict[str, object]:
 
 def collect_comm_info(kernel: RunningKernel) -> dict[str, object]:
     return kernel.request("comm_info_request", {})["content"]
+
+
+def collect_connect_reply(kernel: RunningKernel) -> dict[str, object]:
+    return kernel.request("connect_request", {})["content"]
 
 
 def collect_complete_reply(kernel: RunningKernel) -> dict[str, object]:
@@ -280,11 +291,114 @@ def collect_is_complete_replies(kernel: RunningKernel) -> list[dict[str, object]
     ]
 
 
+def collect_history_reply(kernel: RunningKernel) -> dict[str, object]:
+    kernel.execute("value = 40")
+    kernel.execute("value + 2")
+    return kernel.request(
+        "history_request",
+        {
+            "hist_access_type": "range",
+            "output": True,
+            "raw": True,
+            "session": 0,
+            "start": 0,
+            "stop": 3,
+        },
+    )["content"]
+
+
+def collect_shutdown_flow(
+    kernel: RunningKernel,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    header, frames = client_request(
+        "compat-session",
+        "shutdown_request",
+        {"restart": False},
+    )
+    signature = sign_message(str(kernel.payload["key"]), frames)
+    kernel.control.send_multipart([b"<IDS|MSG>", signature, *frames])
+    reply = recv_message(kernel.control, str(kernel.payload["key"]))
+    published = recv_iopub_messages_for_parent(
+        kernel.iopub,
+        str(kernel.payload["key"]),
+        header["msg_id"],
+    )
+    return reply["content"], published
+
+
 def collect_execute_result(
     kernel: RunningKernel,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     kernel.execute("value = 40")
     return kernel.execute("value + 2")
+
+
+def collect_execute_error(
+    kernel: RunningKernel,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    return kernel.execute("1 / 0")
+
+
+def collect_execute_syntax_error(
+    kernel: RunningKernel,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    return kernel.execute("for i in range(2) print(i)")
+
+
+def collect_interrupt_flow(
+    kernel: RunningKernel,
+) -> tuple[
+    dict[str, object],
+    list[dict[str, object]],
+    dict[str, object],
+    list[dict[str, object]],
+]:
+    kernel.execute("value = 1")
+
+    execute_header, execute_frames = client_request(
+        "compat-session",
+        "execute_request",
+        {
+            "code": "import time\ntime.sleep(30)",
+            "silent": False,
+            "store_history": True,
+            "allow_stdin": False,
+            "user_expressions": {},
+            "stop_on_error": True,
+        },
+    )
+    execute_signature = sign_message(str(kernel.payload["key"]), execute_frames)
+    kernel.shell.send_multipart([b"<IDS|MSG>", execute_signature, *execute_frames])
+    time.sleep(0.2)
+
+    interrupt_header, interrupt_frames = client_request(
+        "compat-session",
+        "interrupt_request",
+        {},
+    )
+    interrupt_signature = sign_message(str(kernel.payload["key"]), interrupt_frames)
+    kernel.control.send_multipart(
+        [b"<IDS|MSG>", interrupt_signature, *interrupt_frames]
+    )
+    interrupt_reply = recv_message(kernel.control, str(kernel.payload["key"]))
+    interrupt_messages = recv_iopub_messages_for_parent(
+        kernel.iopub,
+        str(kernel.payload["key"]),
+        interrupt_header["msg_id"],
+    )
+
+    execute_reply = recv_message(kernel.shell, str(kernel.payload["key"]))
+    execute_messages = recv_iopub_messages_for_parent(
+        kernel.iopub,
+        str(kernel.payload["key"]),
+        execute_header["msg_id"],
+    )
+    return (
+        interrupt_reply["content"],
+        interrupt_messages,
+        execute_reply["content"],
+        execute_messages,
+    )
 
 
 def normalize_kernel_info(content: dict[str, object]) -> dict[str, object]:
@@ -307,12 +421,57 @@ def normalize_kernel_info(content: dict[str, object]) -> dict[str, object]:
     }
 
 
+def normalize_connect_reply(
+    content: dict[str, object], payload: dict[str, object]
+) -> dict[str, object]:
+    return {
+        "status": content["status"],
+        "shell_port": content["shell_port"] == payload["shell_port"],
+        "iopub_port": content["iopub_port"] == payload["iopub_port"],
+        "stdin_port": content["stdin_port"] == payload["stdin_port"],
+        "control_port": content["control_port"] == payload["control_port"],
+        "hb_port": content["hb_port"] == payload["hb_port"],
+    }
+
+
 def normalize_execute_reply(content: dict[str, object]) -> dict[str, object]:
     return {
         "status": content["status"],
         "execution_count": content["execution_count"],
         "user_expressions": content["user_expressions"],
         "payload": content["payload"],
+    }
+
+
+def normalize_execute_error_reply(content: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": content["status"],
+        "execution_count": content["execution_count"],
+        "ename": content["ename"],
+        "evalue": content["evalue"],
+        "user_expressions": content["user_expressions"],
+        "payload": content["payload"],
+        "traceback": content["traceback"],
+    }
+
+
+def normalize_syntax_error_reply(content: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": content["status"],
+        "execution_count": content["execution_count"],
+        "ename": content["ename"],
+        "evalue_message": content["evalue"].split(" (", 1)[0],
+        "user_expressions": content["user_expressions"],
+        "payload": content["payload"],
+        "traceback_tail": strip_ansi(content["traceback"][-1]),
+    }
+
+
+def normalize_syntax_error_content(content: dict[str, object]) -> dict[str, object]:
+    return {
+        "ename": content["ename"],
+        "evalue_message": content["evalue"].split(" (", 1)[0],
+        "traceback_tail": strip_ansi(content["traceback"][-1]),
     }
 
 
@@ -345,6 +504,32 @@ def normalize_iopub_messages(
                     },
                 )
             )
+        else:
+            normalized.append((msg_type, content))
+    return normalized
+
+
+def normalize_syntax_error_iopub_messages(
+    messages: list[dict[str, object]],
+) -> list[tuple[str, object]]:
+    normalized = []
+    for message in messages:
+        msg_type = message["header"]["msg_type"]
+        content = message["content"]
+        if msg_type == "status":
+            normalized.append((msg_type, content["execution_state"]))
+        elif msg_type == "execute_input":
+            normalized.append(
+                (
+                    msg_type,
+                    {
+                        "code": content["code"],
+                        "execution_count": content["execution_count"],
+                    },
+                )
+            )
+        elif msg_type == "error":
+            normalized.append((msg_type, normalize_syntax_error_content(content)))
         else:
             normalized.append((msg_type, content))
     return normalized
@@ -460,6 +645,26 @@ def test_kernel_info_reply_matches_ipykernel(
     )
 
 
+def test_connect_reply_matches_ipykernel_semantics(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply = collect_connect_reply(rustykernel)
+        rustykernel_payload = rustykernel.payload
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply = collect_connect_reply(ipykernel)
+        ipykernel_payload = ipykernel.payload
+
+    assert normalize_connect_reply(
+        rustykernel_reply, rustykernel_payload
+    ) == normalize_connect_reply(ipykernel_reply, ipykernel_payload)
+
+
 def test_execute_result_flow_matches_ipykernel(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:
@@ -479,6 +684,120 @@ def test_execute_result_flow_matches_ipykernel(
     assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
         ipykernel_messages
     )
+
+
+def test_history_reply_matches_ipykernel_for_range_query(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply = collect_history_reply(rustykernel)
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply = collect_history_reply(ipykernel)
+
+    assert rustykernel_reply == ipykernel_reply
+
+
+def test_shutdown_request_matches_ipykernel(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_shutdown_flow(rustykernel)
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_shutdown_flow(ipykernel)
+
+    assert rustykernel_reply == ipykernel_reply
+    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
+        ipykernel_messages
+    )
+
+
+def test_execute_error_flow_matches_ipykernel(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_execute_error(rustykernel)
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_execute_error(ipykernel)
+
+    assert normalize_execute_error_reply(
+        rustykernel_reply["content"]
+    ) == normalize_execute_error_reply(ipykernel_reply["content"])
+    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
+        ipykernel_messages
+    )
+
+
+def test_execute_syntax_error_flow_matches_ipykernel_semantics(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_execute_syntax_error(
+            rustykernel
+        )
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_execute_syntax_error(ipykernel)
+
+    assert normalize_syntax_error_reply(
+        rustykernel_reply["content"]
+    ) == normalize_syntax_error_reply(ipykernel_reply["content"])
+    assert normalize_syntax_error_iopub_messages(
+        rustykernel_messages
+    ) == normalize_syntax_error_iopub_messages(ipykernel_messages)
+
+
+def test_interrupt_request_matches_ipykernel_semantics(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        (
+            rustykernel_interrupt_reply,
+            rustykernel_interrupt_messages,
+            rustykernel_execute_reply,
+            rustykernel_execute_messages,
+        ) = collect_interrupt_flow(rustykernel)
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        (
+            ipykernel_interrupt_reply,
+            ipykernel_interrupt_messages,
+            ipykernel_execute_reply,
+            ipykernel_execute_messages,
+        ) = collect_interrupt_flow(ipykernel)
+
+    assert rustykernel_interrupt_reply == ipykernel_interrupt_reply
+    assert normalize_iopub_messages(
+        rustykernel_interrupt_messages
+    ) == normalize_iopub_messages(ipykernel_interrupt_messages)
+    assert normalize_execute_error_reply(
+        rustykernel_execute_reply
+    ) == normalize_execute_error_reply(ipykernel_execute_reply)
+    assert normalize_iopub_messages(
+        rustykernel_execute_messages
+    ) == normalize_iopub_messages(ipykernel_execute_messages)
 
 
 def test_comm_info_reply_matches_ipykernel(

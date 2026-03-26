@@ -293,6 +293,7 @@ def test_kernelspec_argv_starts_a_real_kernel(
         assert content["language_info"]["nbconvert_exporter"] == "python"
         assert content["language_info"]["codemirror_mode"]["name"] == "ipython"
         assert content["help_links"][0]["text"] == "Python Reference"
+        assert content["debugger"] is False
         assert content["supported_features"] == []
 
         execute_header = send_client_message(

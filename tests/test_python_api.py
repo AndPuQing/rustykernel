@@ -1205,7 +1205,7 @@ def test_control_restart_clears_worker_state(
         kernel.stop()
 
 
-def test_control_interrupt_restarts_worker_state(
+def test_control_interrupt_preserves_worker_state(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:
     payload = connection_payload()
@@ -1265,9 +1265,8 @@ def test_control_interrupt_restarts_worker_state(
             },
         )
         probe_reply = recv_message(shell, str(payload["key"]))
-        assert probe_reply["content"]["status"] == "error"
-        assert probe_reply["content"]["ename"] == "NameError"
-        assert probe_reply["content"]["execution_count"] == 1
+        assert probe_reply["content"]["status"] == "ok"
+        assert probe_reply["content"]["execution_count"] == 2
 
         send_client_message(
             shell,
@@ -1285,9 +1284,143 @@ def test_control_interrupt_restarts_worker_state(
         history_reply = recv_message(shell, str(payload["key"]))
         assert history_reply["content"]["history"] == [
             [1, 1, "value = 123"],
-            [2, 1, "value"],
+            [1, 2, "value"],
         ]
     finally:
         shell.close(0)
         control.close(0)
+        kernel.stop()
+
+
+def test_control_interrupt_interrupts_running_execution(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    control = zmq_context.socket(zmq.DEALER)
+    control.connect(kernel.endpoints.control)
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(kernel.endpoints.iopub)
+    shell.setsockopt(zmq.RCVTIMEO, 3000)
+    control.setsockopt(zmq.RCVTIMEO, 3000)
+    iopub.setsockopt(zmq.RCVTIMEO, 3000)
+    time.sleep(0.1)
+
+    try:
+        define_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value = 123",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        define_reply = recv_message(shell, str(payload["key"]))
+        assert define_reply["content"]["status"] == "ok"
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), str(define_header["msg_id"]), 3
+        )
+
+        long_running_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "import time\ntime.sleep(30)",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        time.sleep(0.2)
+
+        interrupt_header = send_client_message(
+            control,
+            str(payload["key"]),
+            "python-test-session",
+            "interrupt_request",
+            {},
+        )
+        interrupt_reply = recv_message(control, str(payload["key"]))
+        assert interrupt_reply["header"]["msg_type"] == "interrupt_reply"
+        assert interrupt_reply["content"]["status"] == "ok"
+        interrupt_published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), str(interrupt_header["msg_id"]), 2
+        )
+        assert [
+            message["content"]["execution_state"] for message in interrupt_published
+        ] == [
+            "busy",
+            "idle",
+        ]
+
+        long_running_reply = recv_message(shell, str(payload["key"]))
+        assert long_running_reply["content"]["status"] == "error"
+        assert long_running_reply["content"]["ename"] == "KeyboardInterrupt"
+        assert long_running_reply["content"]["execution_count"] == 2
+        long_running_published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), str(long_running_header["msg_id"]), 2
+        )
+        assert [
+            message["header"]["msg_type"] for message in long_running_published
+        ] == [
+            "error",
+            "status",
+        ]
+
+        send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "value",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        probe_reply = recv_message(shell, str(payload["key"]))
+        assert probe_reply["content"]["status"] == "ok"
+        assert probe_reply["content"]["execution_count"] == 3
+
+        send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "history_request",
+            {
+                "hist_access_type": "tail",
+                "output": False,
+                "raw": True,
+                "session": 0,
+                "n": 10,
+            },
+        )
+        history_reply = recv_message(shell, str(payload["key"]))
+        assert history_reply["content"]["history"] == [
+            [1, 1, "value = 123"],
+            [1, 2, "import time\ntime.sleep(30)"],
+            [1, 3, "value"],
+        ]
+    finally:
+        shell.close(0)
+        control.close(0)
+        iopub.close(0)
         kernel.stop()
