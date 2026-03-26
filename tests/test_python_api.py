@@ -81,7 +81,11 @@ def client_request(
 
 
 def send_client_message(
-    socket: zmq.Socket, key: str, session: str, msg_type: str, content: dict[str, object]
+    socket: zmq.Socket,
+    key: str,
+    session: str,
+    msg_type: str,
+    content: dict[str, object],
 ) -> dict[str, object]:
     header, frames = client_request(session, msg_type, content)
     signature = sign_message(key, frames)
@@ -230,7 +234,9 @@ def test_execute_request_persists_state_and_publishes_result(
         first_reply = recv_message(shell, str(payload["key"]))
         assert first_reply["header"]["msg_type"] == "execute_reply"
         assert first_reply["content"]["status"] == "ok"
-        recv_iopub_messages_for_parent(iopub, str(payload["key"]), first_header["msg_id"], 3)
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), first_header["msg_id"], 3
+        )
 
         second_header = send_client_message(
             shell,
@@ -520,7 +526,9 @@ def test_complete_request_returns_python_matches(
         )
         define_reply = recv_message(shell, str(payload["key"]))
         assert define_reply["content"]["status"] == "ok"
-        recv_iopub_messages_for_parent(iopub, str(payload["key"]), define_header["msg_id"], 3)
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), define_header["msg_id"], 3
+        )
 
         complete_header = send_client_message(
             shell,
@@ -592,7 +600,9 @@ def test_inspect_request_returns_python_details(
         )
         define_reply = recv_message(shell, str(payload["key"]))
         assert define_reply["content"]["status"] == "ok"
-        recv_iopub_messages_for_parent(iopub, str(payload["key"]), define_header["msg_id"], 3)
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), define_header["msg_id"], 3
+        )
 
         inspect_header = send_client_message(
             shell,
@@ -609,9 +619,13 @@ def test_inspect_request_returns_python_details(
         assert inspect_reply["header"]["msg_type"] == "inspect_reply"
         assert inspect_reply["content"]["status"] == "ok"
         assert inspect_reply["content"]["found"] is True
-        assert inspect_reply["content"]["data"]["text/plain"].startswith("40\ntype: int")
+        assert inspect_reply["content"]["data"]["text/plain"].startswith(
+            "40\ntype: int"
+        )
         assert inspect_reply["content"]["metadata"]["type_name"] == "int"
-        assert inspect_reply["content"]["metadata"]["doc_summary"] == "int([x]) -> integer"
+        assert (
+            inspect_reply["content"]["metadata"]["doc_summary"] == "int([x]) -> integer"
+        )
         assert "**type:** `int`" in inspect_reply["content"]["data"]["text/markdown"]
 
         published = recv_iopub_messages_for_parent(
@@ -660,7 +674,9 @@ def test_complete_request_reports_attribute_function_matches(
         )
         define_reply = recv_message(shell, str(payload["key"]))
         assert define_reply["content"]["status"] == "ok"
-        recv_iopub_messages_for_parent(iopub, str(payload["key"]), define_header["msg_id"], 3)
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), define_header["msg_id"], 3
+        )
 
         complete_header = send_client_message(
             shell,
@@ -678,7 +694,8 @@ def test_complete_request_reports_attribute_function_matches(
             not match.endswith("(") for match in complete_reply["content"]["matches"]
         )
         assert any(
-            item["text"] == "text.startswith" and item["type"] == "function"
+            item["text"] == "text.startswith"
+            and item["type"] == "function"
             and "signature" in item
             for item in complete_reply["content"]["metadata"][
                 "_jupyter_types_experimental"
@@ -731,7 +748,9 @@ def test_inspect_request_prioritizes_callable_context(
         )
         define_reply = recv_message(shell, str(payload["key"]))
         assert define_reply["content"]["status"] == "ok"
-        recv_iopub_messages_for_parent(iopub, str(payload["key"]), define_header["msg_id"], 3)
+        recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), define_header["msg_id"], 3
+        )
 
         inspect_header = send_client_message(
             shell,
@@ -747,7 +766,9 @@ def test_inspect_request_prioritizes_callable_context(
         inspect_reply = recv_message(shell, str(payload["key"]))
         assert inspect_reply["content"]["status"] == "ok"
         assert inspect_reply["content"]["found"] is True
-        assert inspect_reply["content"]["metadata"]["signature"] == "str(object='') -> str"
+        assert (
+            inspect_reply["content"]["metadata"]["signature"] == "str(object='') -> str"
+        )
         assert (
             "signature: str(object='') -> str"
             in inspect_reply["content"]["data"]["text/plain"]

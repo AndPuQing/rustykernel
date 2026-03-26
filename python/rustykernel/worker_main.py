@@ -131,12 +131,14 @@ def token_at_cursor(code: str, cursor_pos: int) -> str:
             last_index = probe + 1
             probe += 2
 
-        names.append({
-            "text": "".join(parts),
-            "start": start,
-            "end": end,
-            "end_index": last_index,
-        })
+        names.append(
+            {
+                "text": "".join(parts),
+                "start": start,
+                "end": end,
+                "end_index": last_index,
+            }
+        )
         token_index = last_index + 1
 
     call_ranges: list[dict[str, object]] = []
@@ -146,10 +148,12 @@ def token_at_cursor(code: str, cursor_pos: int) -> str:
     for index, tok in enumerate(significant):
         if tok.type == token_types.OP and tok.string == "(":
             caller = name_by_end_index.get(index - 1)
-            open_calls.append({
-                "name": caller["text"] if caller is not None else "",
-                "open": to_absolute(offsets, tok.start),
-            })
+            open_calls.append(
+                {
+                    "name": caller["text"] if caller is not None else "",
+                    "open": to_absolute(offsets, tok.start),
+                }
+            )
         elif tok.type == token_types.OP and tok.string == ")" and open_calls:
             current = open_calls.pop()
             current["close"] = to_absolute(offsets, tok.end)
@@ -265,12 +269,14 @@ def publish_display_event(
     value: object, *, msg_type: str, transient: Optional[dict[str, object]] = None
 ) -> None:
     data, metadata = rich_display_data(value)
-    DISPLAY_EVENTS.append({
-        "msg_type": msg_type,
-        "data": data,
-        "metadata": metadata,
-        "transient": transient or {},
-    })
+    DISPLAY_EVENTS.append(
+        {
+            "msg_type": msg_type,
+            "data": data,
+            "metadata": metadata,
+            "transient": transient or {},
+        }
+    )
 
 
 class DisplayHandle:
@@ -324,12 +330,14 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
         raise RuntimeError("input() is only available while handling a request")
 
     sys.stdout.write(
-        json.dumps({
-            "id": CURRENT_REQUEST_ID,
-            "event": "input_request",
-            "prompt": str(prompt),
-            "password": password,
-        })
+        json.dumps(
+            {
+                "id": CURRENT_REQUEST_ID,
+                "event": "input_request",
+                "prompt": str(prompt),
+                "password": password,
+            }
+        )
         + "\n"
     )
     sys.stdout.flush()
@@ -468,13 +476,15 @@ def complete(code: str, cursor_pos: int) -> dict[str, object]:
                 except BaseException:
                     if getattr(item, "type", None) == "function":
                         signature = None
-                completion_types.append({
-                    "start": cursor_start,
-                    "end": cursor_end,
-                    "text": normalized,
-                    "type": getattr(item, "type", None) or "unknown",
-                    "signature": signature,
-                })
+                completion_types.append(
+                    {
+                        "start": cursor_start,
+                        "end": cursor_end,
+                        "text": normalized,
+                        "type": getattr(item, "type", None) or "unknown",
+                        "signature": signature,
+                    }
+                )
 
             matches.sort()
             completion_types.sort(key=lambda item: str(item["text"]))
@@ -517,13 +527,15 @@ def complete(code: str, cursor_pos: int) -> dict[str, object]:
                     signature = safe_signature_text(value, normalized)
                 except BaseException:
                     item_type = "unknown"
-            completion_types.append({
-                "start": cursor_start,
-                "end": cursor_end,
-                "text": normalized,
-                "type": item_type,
-                "signature": signature,
-            })
+            completion_types.append(
+                {
+                    "start": cursor_start,
+                    "end": cursor_end,
+                    "text": normalized,
+                    "type": item_type,
+                    "signature": signature,
+                }
+            )
         state += 1
 
     matches.sort()
