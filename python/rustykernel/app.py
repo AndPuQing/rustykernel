@@ -16,7 +16,8 @@ from ._core import (
     runtime_info,
     start_kernel,
 )
-from .kernelspec import KERNEL_NAME, install as install_kernel_spec
+from .kernelspec import KERNEL_NAME
+from .kernelspec import install as install_kernel_spec
 
 
 @dataclass(slots=True)
