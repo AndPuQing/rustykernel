@@ -17,12 +17,25 @@ pub struct ExecutionDisplay {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ExecutionDisplayEvent {
+    pub msg_type: String,
+    #[serde(default)]
+    pub data: Value,
+    #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
+    pub transient: Value,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ExecutionOutcome {
     pub status: String,
     #[serde(default)]
     pub stdout: String,
     #[serde(default)]
     pub stderr: String,
+    #[serde(default)]
+    pub displays: Vec<ExecutionDisplayEvent>,
     #[serde(default)]
     pub result: Option<ExecutionDisplay>,
     #[serde(default)]
@@ -55,17 +68,33 @@ pub struct InspectionOutcome {
     pub status: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IsCompleteOutcome {
+    pub status: String,
+    #[serde(default)]
+    pub indent: String,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind")]
 enum WorkerRequest<'a> {
     #[serde(rename = "execute")]
     Execute { id: u64, code: &'a str },
+    #[serde(rename = "input_reply")]
+    InputReply {
+        id: u64,
+        value: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     #[serde(rename = "complete")]
     Complete {
         id: u64,
         code: &'a str,
         cursor_pos: usize,
     },
+    #[serde(rename = "is_complete")]
+    IsComplete { id: u64, code: &'a str },
     #[serde(rename = "inspect")]
     Inspect {
         id: u64,
@@ -73,6 +102,16 @@ enum WorkerRequest<'a> {
         cursor_pos: usize,
         detail_level: u8,
     },
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerInputRequest {
+    id: u64,
+    event: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    password: bool,
 }
 
 #[derive(Deserialize)]
@@ -116,15 +155,94 @@ impl PythonWorker {
         })
     }
 
-    pub fn execute(&mut self, code: &str) -> Result<ExecutionOutcome, KernelError> {
+    pub fn execute<F>(
+        &mut self,
+        code: &str,
+        mut on_input: F,
+    ) -> Result<ExecutionOutcome, KernelError>
+    where
+        F: FnMut(&str, bool) -> Result<String, String>,
+    {
         let request_id = self.next_id;
         self.next_id += 1;
         let request = WorkerRequest::Execute {
             id: request_id,
             code,
         };
-        let response: WorkerEnvelope<ExecutionOutcome> = self.send_request(&request, request_id)?;
-        Ok(response.payload)
+
+        let payload = serde_json::to_vec(&request).map_err(|error| {
+            KernelError::Worker(format!("failed to encode worker request: {error}"))
+        })?;
+        self.stdin.write_all(&payload).map_err(KernelError::Io)?;
+        self.stdin
+            .write_all(
+                b"
+",
+            )
+            .map_err(KernelError::Io)?;
+        self.stdin.flush().map_err(KernelError::Io)?;
+
+        loop {
+            let mut line = String::new();
+            let bytes_read = self.stdout.read_line(&mut line).map_err(KernelError::Io)?;
+            if bytes_read == 0 {
+                return Err(KernelError::Worker(self.stderr_summary()));
+            }
+
+            let raw: Value = serde_json::from_str(&line).map_err(|error| {
+                KernelError::Worker(format!("failed to decode worker response: {error}"))
+            })?;
+
+            if raw.get("event").is_some() {
+                let event: WorkerInputRequest = serde_json::from_value(raw).map_err(|error| {
+                    KernelError::Worker(format!("failed to decode worker input request: {error}"))
+                })?;
+                if event.id != request_id || event.event != "input_request" {
+                    return Err(KernelError::Worker(format!(
+                        "unexpected worker event for request {}",
+                        request_id
+                    )));
+                }
+                let response = match on_input(&event.prompt, event.password) {
+                    Ok(value) => WorkerRequest::InputReply {
+                        id: request_id,
+                        value,
+                        error: None,
+                    },
+                    Err(error) => WorkerRequest::InputReply {
+                        id: request_id,
+                        value: String::new(),
+                        error: Some(error),
+                    },
+                };
+                let payload = serde_json::to_vec(&response).map_err(|error| {
+                    KernelError::Worker(format!("failed to encode worker input reply: {error}"))
+                })?;
+                self.stdin.write_all(&payload).map_err(KernelError::Io)?;
+                self.stdin
+                    .write_all(
+                        b"
+",
+                    )
+                    .map_err(KernelError::Io)?;
+                self.stdin.flush().map_err(KernelError::Io)?;
+                continue;
+            }
+
+            let response: WorkerEnvelope<ExecutionOutcome> =
+                serde_json::from_value(raw).map_err(|error| {
+                    KernelError::Worker(format!("failed to decode worker response: {error}"))
+                })?;
+
+            if response.id != request_id {
+                return Err(KernelError::Worker(format!(
+                    "worker response id mismatch: expected {}, got {}",
+                    request_id, response.id
+                )));
+            }
+
+            return Ok(response.payload);
+        }
     }
 
     pub fn complete(
@@ -159,6 +277,18 @@ impl PythonWorker {
             detail_level,
         };
         let response: WorkerEnvelope<InspectionOutcome> =
+            self.send_request(&request, request_id)?;
+        Ok(response.payload)
+    }
+
+    pub fn is_complete(&mut self, code: &str) -> Result<IsCompleteOutcome, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::IsComplete {
+            id: request_id,
+            code,
+        };
+        let response: WorkerEnvelope<IsCompleteOutcome> =
             self.send_request(&request, request_id)?;
         Ok(response.payload)
     }

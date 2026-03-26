@@ -411,6 +411,7 @@ fn spawn_message_loop_thread(
                     ChannelKind::Shell,
                     frames,
                     &shell_socket,
+                    &stdin_socket,
                     &iopub_socket,
                     &mut state,
                     shutdown.as_ref(),
@@ -423,6 +424,7 @@ fn spawn_message_loop_thread(
                     ChannelKind::Control,
                     frames,
                     &control_socket,
+                    &stdin_socket,
                     &iopub_socket,
                     &mut state,
                     shutdown.as_ref(),
@@ -443,6 +445,7 @@ fn handle_request(
     channel: ChannelKind,
     frames: Vec<Vec<u8>>,
     reply_socket: &zmq::Socket,
+    stdin_socket: &zmq::Socket,
     iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
     shutdown: &ShutdownSignal,
@@ -456,7 +459,9 @@ fn handle_request(
     publish_status(iopub_socket, state, parent_header.clone(), "busy")?;
 
     let should_stop = match channel {
-        ChannelKind::Shell => handle_shell_request(reply_socket, iopub_socket, state, &request)?,
+        ChannelKind::Shell => {
+            handle_shell_request(reply_socket, stdin_socket, iopub_socket, state, &request)?
+        }
         ChannelKind::Control => {
             handle_control_request(reply_socket, iopub_socket, state, &request)?
         }
@@ -473,6 +478,7 @@ fn handle_request(
 
 fn handle_shell_request(
     reply_socket: &zmq::Socket,
+    stdin_socket: &zmq::Socket,
     iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
@@ -514,7 +520,27 @@ fn handle_shell_request(
                 )?;
             }
 
-            let outcome = state.worker.execute(code)?;
+            let allow_stdin = request
+                .content
+                .get("allow_stdin")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let signer = state.signer.clone();
+            let kernel_session = state.kernel_session.clone();
+            let request_identities = request.identities.clone();
+            let parent_header = request.header_value.clone();
+            let outcome = state.worker.execute(code, |prompt, password| {
+                request_stdin_input(
+                    stdin_socket,
+                    &signer,
+                    &kernel_session,
+                    &request_identities,
+                    &parent_header,
+                    prompt,
+                    password,
+                    allow_stdin,
+                )
+            })?;
 
             if !silent && !outcome.stdout.is_empty() {
                 publish_stream(
@@ -537,6 +563,18 @@ fn handle_shell_request(
 
             if outcome.status == "ok" {
                 if !silent {
+                    for display in outcome.displays {
+                        publish_display_event(
+                            iopub_socket,
+                            state,
+                            request.header_value.clone(),
+                            &display.msg_type,
+                            display.data,
+                            display.metadata,
+                            display.transient,
+                        )?;
+                    }
+
                     if let Some(result) = outcome.result {
                         publish_iopub_message(
                             iopub_socket,
@@ -600,14 +638,20 @@ fn handle_shell_request(
             Ok(false)
         }
         "is_complete_request" => {
+            let code = request
+                .content
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let outcome = state.worker.is_complete(code)?;
             send_reply(
                 reply_socket,
                 state,
                 request,
                 "is_complete_reply",
                 json!({
-                    "status": "complete",
-                    "indent": "",
+                    "status": outcome.status,
+                    "indent": outcome.indent,
                 }),
             )?;
             Ok(false)
@@ -786,6 +830,61 @@ fn send_unsupported_reply(
     Ok(false)
 }
 
+fn request_stdin_input(
+    stdin_socket: &zmq::Socket,
+    signer: &MessageSigner,
+    kernel_session: &str,
+    identities: &[Vec<u8>],
+    parent_header: &Value,
+    prompt: &str,
+    password: bool,
+    allow_stdin: bool,
+) -> Result<String, String> {
+    if !allow_stdin {
+        return Err("stdin is not enabled for this execute_request".to_owned());
+    }
+
+    let input_request = JupyterMessage::new(
+        identities.to_vec(),
+        MessageHeader::new("input_request", kernel_session),
+        parent_header.clone(),
+        json!({}),
+        json!({
+            "prompt": prompt,
+            "password": password,
+        }),
+    );
+
+    stdin_socket
+        .send_multipart(
+            signer
+                .encode(&input_request)
+                .map_err(|error| error.to_string())?,
+            0,
+        )
+        .map_err(|error| error.to_string())?;
+
+    loop {
+        let frames = stdin_socket
+            .recv_multipart(0)
+            .map_err(|error| error.to_string())?;
+        let message = match signer.decode(frames) {
+            Ok(message) => message,
+            Err(_) => continue,
+        };
+
+        if message.header.msg_type != "input_reply" {
+            continue;
+        }
+
+        if let Some(value) = message.content.get("value").and_then(Value::as_str) {
+            return Ok(value.to_owned());
+        }
+
+        return Ok(String::new());
+    }
+}
+
 fn handle_stdin_message(frames: Vec<Vec<u8>>, state: &MessageLoopState) -> Result<(), KernelError> {
     let message = match state.signer.decode(frames) {
         Ok(message) => message,
@@ -848,6 +947,28 @@ fn publish_iopub_message(
     );
     socket.send_multipart(state.signer.encode(&message)?, 0)?;
     Ok(())
+}
+
+fn publish_display_event(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    parent_header: Value,
+    msg_type: &str,
+    data: Value,
+    metadata: Value,
+    transient: Value,
+) -> Result<(), KernelError> {
+    publish_iopub_message(
+        socket,
+        state,
+        parent_header,
+        msg_type,
+        json!({
+            "data": data,
+            "metadata": metadata,
+            "transient": transient,
+        }),
+    )
 }
 
 fn publish_stream(
@@ -1340,6 +1461,20 @@ mod tests {
         );
         assert_eq!(reply.content.get("cursor_start"), Some(&json!(0)));
         assert_eq!(reply.content.get("cursor_end"), Some(&json!(3)));
+        assert!(
+            reply.content["metadata"]
+                .get("backend")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        let metadata_matches = reply.content["metadata"]["_jupyter_types_experimental"]
+            .as_array()
+            .unwrap();
+        assert!(
+            metadata_matches
+                .iter()
+                .any(|item| item.get("text") == Some(&json!("value")))
+        );
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &complete.header.msg_id, 2);
         assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
@@ -1401,8 +1536,209 @@ mod tests {
             reply.content["metadata"].get("type_name"),
             Some(&json!("int"))
         );
+        assert_eq!(
+            reply.content["metadata"].get("doc_summary"),
+            Some(&json!("int([x]) -> integer"))
+        );
+        assert!(
+            reply.content["data"]
+                .get("text/markdown")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("**type:** `int`")
+        );
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &inspect.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn complete_request_strips_call_parens_and_reports_completion_types() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let define = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "text = 'hello'",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &define);
+        let _ = recv_message(&shell, &signer);
+        let _ = recv_iopub_messages_for_parent(&iopub, &signer, &define.header.msg_id, 3);
+
+        let complete = client_request(
+            "client-session",
+            "complete_request",
+            json!({
+                "code": "text.st",
+                "cursor_pos": 7,
+            }),
+        );
+        send_client_message(&shell, &signer, &complete);
+        let reply = recv_message(&shell, &signer);
+        let matches = reply.content["matches"].as_array().unwrap();
+        assert!(matches.iter().any(|value| value == "text.startswith"));
+        assert!(
+            matches
+                .iter()
+                .all(|value| { value.as_str().is_some_and(|text| !text.ends_with('(')) })
+        );
+        assert!(
+            reply.content["metadata"]["_jupyter_types_experimental"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item.get("text") == Some(&json!("text.startswith"))
+                        && item.get("type") == Some(&json!("function"))
+                        && item.get("signature").is_some()
+                })
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn inspect_request_prioritizes_callable_context_like_ipykernel() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let define = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": "value = 40",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &define);
+        let _ = recv_message(&shell, &signer);
+        let _ = recv_iopub_messages_for_parent(&iopub, &signer, &define.header.msg_id, 3);
+
+        let inspect = client_request(
+            "client-session",
+            "inspect_request",
+            json!({
+                "code": "str(value)",
+                "cursor_pos": 8,
+                "detail_level": 0,
+            }),
+        );
+        send_client_message(&shell, &signer, &inspect);
+
+        let reply = recv_message(&shell, &signer);
+        assert_eq!(reply.header.msg_type, "inspect_reply");
+        assert_eq!(reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(reply.content.get("found"), Some(&json!(true)));
+        assert_eq!(
+            reply.content["metadata"].get("signature"),
+            Some(&json!("str(object='') -> str"))
+        );
+        assert!(
+            reply.content["data"]
+                .get("text/plain")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("signature: str(object='') -> str")
+        );
+        assert!(
+            reply.content["data"]
+                .get("text/html")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("type:")
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn is_complete_request_reports_complete_incomplete_and_invalid_code() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let complete = client_request(
+            "client-session",
+            "is_complete_request",
+            json!({ "code": "value = 1" }),
+        );
+        send_client_message(&shell, &signer, &complete);
+        let complete_reply = recv_message(&shell, &signer);
+        assert_eq!(complete_reply.header.msg_type, "is_complete_reply");
+        assert_eq!(
+            complete_reply.content.get("status"),
+            Some(&json!("complete"))
+        );
+        assert_eq!(complete_reply.content.get("indent"), Some(&json!("")));
+        let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &complete.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        let incomplete = client_request(
+            "client-session",
+            "is_complete_request",
+            json!({ "code": "for i in range(3):" }),
+        );
+        send_client_message(&shell, &signer, &incomplete);
+        let incomplete_reply = recv_message(&shell, &signer);
+        assert_eq!(
+            incomplete_reply.content.get("status"),
+            Some(&json!("incomplete"))
+        );
+        assert_eq!(incomplete_reply.content.get("indent"), Some(&json!("    ")));
+        let statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &incomplete.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        let invalid = client_request(
+            "client-session",
+            "is_complete_request",
+            json!({ "code": "1+" }),
+        );
+        send_client_message(&shell, &signer, &invalid);
+        let invalid_reply = recv_message(&shell, &signer);
+        assert_eq!(invalid_reply.content.get("status"), Some(&json!("invalid")));
+        assert_eq!(invalid_reply.content.get("indent"), Some(&json!("")));
+        let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &invalid.header.msg_id, 2);
         assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
 
         runtime.stop().unwrap();

@@ -40,9 +40,11 @@ Implemented today:
 - `execute_request` with persistent Python state across cells
 - `complete_request`
 - `inspect_request`
-- `is_complete_request` (currently simple placeholder behavior)
+- completion metadata via `_jupyter_types_experimental`
+- `is_complete_request` with syntax-aware complete / incomplete / invalid replies
 - `history_request` and `comm_info_request` placeholder replies
 - `interrupt_request` on the control channel
+- explicit `display_data` / `update_display_data` publishing for `IPython.display`-style rich output updates
 - `shutdown_request` on shell/control
 - `input_reply` accepted on the stdin channel
 
@@ -50,8 +52,12 @@ Current execution behavior:
 
 - Python code runs in a long-lived worker process
 - stdout/stderr are captured and published as Jupyter `stream` messages
-- expression results are published as `execute_result`
+- expression results are published as `execute_result`, including rich MIME bundles when objects expose notebook repr hooks
+- `from IPython.display import display, update_display` works for rich display messages with `display_id` updates
 - exceptions are published as `error`
+- completions strip callable parentheses and include basic completion kind metadata
+- completions are now backed by Jedi when available, including callable signatures in `_jupyter_types_experimental`
+- inspection returns richer `text/plain` / `text/markdown` / `text/html` bundles plus summary metadata
 - `interrupt_request` / restart-style `shutdown_request` reset worker state
 
 If you want an explicit rebuild without waiting for `uv` to resync the project,
@@ -87,8 +93,6 @@ LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_confi
 
 ## Next steps
 
-- Make `is_complete_request` syntax-aware instead of always returning `complete`
 - Implement richer `inspect_request` / `complete_request` behavior closer to notebook clients
-- Add `display_data` / `display_id` support beyond plain `text/plain` results
 - Add real stdin request plumbing from kernel to frontend instead of only accepting `input_reply`
 - Improve protocol coverage for more frontend-driven requests as compatibility needs become clearer
