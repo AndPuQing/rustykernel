@@ -129,10 +129,10 @@
 
 目标：缩小与 `ipykernel` 在 IO 可靠性上的差距。
 
-- [ ] 评估从 `redirect_stdout/redirect_stderr` 升级到 fd 级别捕获。
-- [ ] 处理 C 扩展、子进程、`faulthandler` 等绕过 Python `sys.stdout` 的输出场景。
-- [ ] 评估日志、stderr、异常输出在前端中的显示一致性。
-- [ ] 补 IO 回归测试。
+- [x] 从 `redirect_stdout/redirect_stderr` 升级到 fd 级别捕获。
+- [x] 覆盖 `os.write`、子进程、`faulthandler` 等绕过 Python `sys.stdout` 的输出场景。
+- [x] 统一 stdout/stderr/fault output 通过 Jupyter `stream` 消息发布，收敛前端显示路径。
+- [x] 补 IO 回归测试。
 
 完成标准：
 
