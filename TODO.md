@@ -123,8 +123,15 @@
   - [x] `delete_subshell_request`
   - [x] `list_subshell_request`
   - 当前已支持基础 subshell 控制面与 `header.subshell_id` 执行路由：Python worker 现为单进程共享命名空间，主 shell 继续跑在 worker 主线程，额外 subshell 则跑在各自执行线程，并通过 Rust worker IPC 做 request/response correlation。
+  - 当前已补 worker shutdown / stdin 稳定性修复，避免 subshell 重构后把 Rust runtime 停机清理和主线程 `input()` 路径打坏。
 - [x] 在 `kernel_info_reply.supported_features` 中准确暴露已支持能力。
   - 当前 `debugger: true`，`supported_features: ["debugger", "kernel subshells"]`。
+  - 当前本地已验证 `cargo test --lib -- --test-threads=1`、`tests/test_protocol_smoke.py`、`tests/test_kernelspec.py`、以及 Python API 的 stdin 回归均通过。
+
+当前剩余的 M3 后续项已从“功能缺口”收敛为“稳定性硬化”：
+
+- [ ] 继续补 subshell 生命周期 / 并发 / debugger 组合场景的回归测试。
+- [ ] 评估是否支持 debugger `pause` 与更完整的 live debug 生命周期。
 
 完成标准：
 
