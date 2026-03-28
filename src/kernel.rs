@@ -25,8 +25,9 @@ use crate::worker::{
     WorkerDebugListen, WorkerInterruptHandle, WorkerKernelInfo,
 };
 
-const CHANNEL_POLL_INTERVAL_MS: i64 = 100;
-const HEARTBEAT_POLL_INTERVAL_MS: i32 = 100;
+const CHANNEL_POLL_INTERVAL_IDLE_MS: i64 = 10;
+const CHANNEL_POLL_INTERVAL_EXECUTING_MS: i64 = 1;
+const HEARTBEAT_POLL_INTERVAL_MS: i32 = 10;
 
 #[derive(Deserialize)]
 struct ConnectionConfig {
@@ -1620,12 +1621,17 @@ fn spawn_message_loop_thread(
             }
             flush_execute_stream_batches(&iopub_socket, &state, stream_batches)?;
 
-            let mut poll_items = vec![
+            let mut poll_items = [
                 shell_socket.as_poll_item(zmq::POLLIN),
                 control_socket.as_poll_item(zmq::POLLIN),
                 stdin_socket.as_poll_item(zmq::POLLIN),
             ];
-            match zmq::poll(&mut poll_items, CHANNEL_POLL_INTERVAL_MS) {
+            let poll_timeout_ms = if state.is_executing() {
+                CHANNEL_POLL_INTERVAL_EXECUTING_MS
+            } else {
+                CHANNEL_POLL_INTERVAL_IDLE_MS
+            };
+            match zmq::poll(&mut poll_items, poll_timeout_ms) {
                 Ok(_) => {}
                 Err(zmq::Error::ETERM) if shutdown.is_stopped() => return Ok(()),
                 Err(error) => return Err(KernelError::Zmq(error)),
@@ -5207,7 +5213,10 @@ mod tests {
             .to_owned();
         let create_statuses =
             recv_iopub_messages_for_parent(&iopub, &signer, &create_subshell.header.msg_id, 2);
-        assert_eq!(status_message_states(&create_statuses), vec!["busy", "idle"]);
+        assert_eq!(
+            status_message_states(&create_statuses),
+            vec!["busy", "idle"]
+        );
 
         let code = concat!(
             "def runner():\n",
@@ -5221,8 +5230,14 @@ mod tests {
             "runner()\n",
         );
 
-        let dump_cell_reply =
-            send_debug_request_and_drain_iopub(&control, &iopub, &signer, 1, "dumpCell", json!({ "code": code }));
+        let dump_cell_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            1,
+            "dumpCell",
+            json!({ "code": code }),
+        );
         assert_eq!(dump_cell_reply.content.get("success"), Some(&json!(true)));
 
         initialize_live_debug_session(&control, &iopub, &signer, 2);

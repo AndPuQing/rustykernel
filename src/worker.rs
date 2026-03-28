@@ -248,6 +248,13 @@ struct WorkerEnvelope<T> {
 }
 
 #[derive(Debug, Deserialize)]
+struct WorkerMessageMeta {
+    id: u64,
+    #[serde(default)]
+    event: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WorkerStatusReply {
     #[serde(default)]
     status: String,
@@ -302,7 +309,7 @@ impl WorkerExecutionHandle {
 
 enum PendingRequest {
     Execute(mpsc::Sender<WorkerExecutionMessage>),
-    Response(mpsc::Sender<Value>),
+    Response(mpsc::Sender<String>),
 }
 
 #[derive(Clone)]
@@ -746,7 +753,7 @@ impl PythonWorker {
                 "worker response channel closed unexpectedly for request {request_id}: {error}"
             ))
         })?;
-        let response: WorkerEnvelope<T> = serde_json::from_value(raw).map_err(|error| {
+        let response: WorkerEnvelope<T> = serde_json::from_str(&raw).map_err(|error| {
             KernelError::Worker(format!("failed to decode worker response: {error}"))
         })?;
         Ok(response)
@@ -802,8 +809,8 @@ fn spawn_protocol_reader(
                 return;
             }
 
-            let raw: Value = match serde_json::from_str(&line) {
-                Ok(raw) => raw,
+            let meta: WorkerMessageMeta = match serde_json::from_str(&line) {
+                Ok(meta) => meta,
                 Err(error) => {
                     fail_all_pending(
                         &pending,
@@ -813,11 +820,8 @@ fn spawn_protocol_reader(
                 }
             };
 
-            let Some(request_id) = raw.get("id").and_then(Value::as_u64) else {
-                continue;
-            };
-            let is_event = raw.get("event").is_some();
-            let pending_request = if is_event {
+            let request_id = meta.id;
+            let pending_request = if meta.event.is_some() {
                 pending
                     .lock()
                     .ok()
@@ -840,11 +844,10 @@ fn spawn_protocol_reader(
 
             match pending_request {
                 PendingRequest::Execute(sender) => {
-                    let message = if let Some(event_name) = raw.get("event").and_then(Value::as_str)
-                    {
+                    let message = if let Some(event_name) = meta.event.as_deref() {
                         match event_name {
                             "input_request" => {
-                                match serde_json::from_value::<WorkerInputRequest>(raw) {
+                                match serde_json::from_str::<WorkerInputRequest>(&line) {
                                     Ok(event) => WorkerExecutionMessage::InputRequest {
                                         prompt: event.prompt,
                                         password: event.password,
@@ -854,7 +857,7 @@ fn spawn_protocol_reader(
                                     )),
                                 }
                             }
-                            "stream" => match serde_json::from_value::<WorkerStreamEvent>(raw) {
+                            "stream" => match serde_json::from_str::<WorkerStreamEvent>(&line) {
                                 Ok(event) => WorkerExecutionMessage::Stream {
                                     name: event.name,
                                     text: event.text,
@@ -864,7 +867,7 @@ fn spawn_protocol_reader(
                                 )),
                             },
                             "debug_event" => {
-                                match serde_json::from_value::<WorkerDebugProtocolEvent>(raw) {
+                                match serde_json::from_str::<WorkerDebugProtocolEvent>(&line) {
                                     Ok(event) => {
                                         WorkerExecutionMessage::DebugEvent(WorkerDebugEvent {
                                             msg_type: event.msg_type,
@@ -881,7 +884,7 @@ fn spawn_protocol_reader(
                             )),
                         }
                     } else {
-                        match serde_json::from_value::<WorkerEnvelope<ExecutionOutcome>>(raw) {
+                        match serde_json::from_str::<WorkerEnvelope<ExecutionOutcome>>(&line) {
                             Ok(response) => WorkerExecutionMessage::Completion(response.payload),
                             Err(error) => WorkerExecutionMessage::Failure(format!(
                                 "failed to decode worker execution response: {error}"
@@ -891,7 +894,7 @@ fn spawn_protocol_reader(
                     let _ = sender.send(message);
                 }
                 PendingRequest::Response(sender) => {
-                    let _ = sender.send(raw);
+                    let _ = sender.send(line);
                 }
             }
         }
@@ -909,11 +912,14 @@ fn fail_all_pending(pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>, message:
                 let _ = sender.send(WorkerExecutionMessage::Failure(message.clone()));
             }
             PendingRequest::Response(sender) => {
-                let _ = sender.send(serde_json::json!({
-                    "id": 0,
-                    "status": "error",
-                    "evalue": message,
-                }));
+                let _ = sender.send(
+                    serde_json::json!({
+                        "id": 0,
+                        "status": "error",
+                        "evalue": message,
+                    })
+                    .to_string(),
+                );
             }
         }
     }
