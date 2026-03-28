@@ -124,6 +124,68 @@ def test_matplotlib_inline_magic_is_accepted(
     assert ast.literal_eval(published[2]["content"]["data"]["text/plain"]) == "ok"
 
 
+def test_matplotlib_defaults_to_inline_backend_on_import(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    pytest.importorskip("matplotlib")
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        reply, published = client.request(
+            "shell",
+            "execute_request",
+            execute_request(
+                """
+import matplotlib
+matplotlib.get_backend()
+"""
+            ),
+        )
+
+    assert reply["content"]["status"] == "ok"
+    assert [message["header"]["msg_type"] for message in published] == [
+        "status",
+        "execute_input",
+        "execute_result",
+        "status",
+    ]
+    assert "backend_inline" in published[2]["content"]["data"]["text/plain"]
+
+
+def test_matplotlib_inline_plot_publishes_display_data(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    pytest.importorskip("matplotlib")
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        reply, published = client.request(
+            "shell",
+            "execute_request",
+            execute_request(
+                """
+%matplotlib inline
+import matplotlib.pyplot as plt
+plt.plot([1, 2, 3])
+plt.title("demo")
+"""
+            ),
+        )
+
+    assert reply["content"]["status"] == "ok"
+    assert published[0]["header"]["msg_type"] == "status"
+    assert published[1]["header"]["msg_type"] == "execute_input"
+    assert published[-1]["header"]["msg_type"] == "status"
+
+    display_messages = [
+        message
+        for message in published[2:-1]
+        if message["header"]["msg_type"] == "display_data"
+    ]
+    assert display_messages
+    assert any(
+        "image/png" in message["content"]["data"] for message in display_messages
+    )
+
+
 def test_cell_magic_time_executes_cell_and_emits_timing(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:

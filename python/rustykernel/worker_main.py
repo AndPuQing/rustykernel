@@ -53,6 +53,7 @@ AUTOAWAIT_ENABLED = True
 AUTOAWAIT_RUNNER = "asyncio"
 _PROTOCOL_STREAM: io.TextIOBase | None = None
 _PROTOCOL_LOCK = threading.Lock()
+_FD_CAPTURE_LOCK = threading.Lock()
 _REQUEST_CONTEXT = threading.local()
 _INPUT_WAITERS_LOCK = threading.Lock()
 _INPUT_WAITERS: dict[int, queue.Queue[dict[str, object]]] = {}
@@ -888,6 +889,23 @@ def build_interactive_shell() -> InteractiveShell:
     shell.showtraceback = lambda *args, **kwargs: None  # type: ignore[method-assign]
     shell.showsyntaxerror = lambda *args, **kwargs: None  # type: ignore[method-assign]
 
+    # Match ipykernel's notebook default: when users import matplotlib without
+    # explicitly selecting a backend, prefer the inline backend.
+    if not os.environ.get("MPLBACKEND"):
+        os.environ["MPLBACKEND"] = "module://matplotlib_inline.backend_inline"
+
+    def rustykernel_enable_gui(self: InteractiveShell, gui: object = None) -> None:
+        normalized = "inline" if gui in (None, "") else str(gui).lower()
+        if normalized != "inline":
+            raise UsageError("rustykernel only supports the inline matplotlib backend")
+        self.active_eventloop = "inline"
+        self.user_ns["_rustykernel_matplotlib_backend"] = "inline"
+        return None
+
+    shell.enable_gui = types.MethodType(  # type: ignore[method-assign]
+        rustykernel_enable_gui, shell
+    )
+
     def rustykernel_set_next_input(text: str, replace: bool = False) -> None:
         shell.rl_next_input = text
         shell.payload_manager.write_payload(
@@ -904,11 +922,14 @@ def build_interactive_shell() -> InteractiveShell:
     if callable(matplotlib_magic):
 
         def rustykernel_matplotlib(line: str):
+            backend = line.strip().lower()
+            if backend not in {"", "inline"}:
+                raise UsageError("rustykernel only supports %matplotlib inline")
             try:
-                return matplotlib_magic(line)
+                return matplotlib_magic("inline")
             except ModuleNotFoundError as exc:
-                backend = line.strip().lower()
                 if exc.name == "matplotlib" and backend in {"", "inline"}:
+                    shell.active_eventloop = "inline"
                     shell.user_ns["_rustykernel_matplotlib_backend"] = "inline"
                     return None
                 raise
@@ -1575,33 +1596,38 @@ def execute(
 
     try:
         with bind_request_context(context):
-            with FdCapture(request_id=request_id):
-                if interrupt_requested(subshell_id):
-                    raise KeyboardInterrupt()
+            # fd-level stdout/stderr capture redirects process-global file
+            # descriptors, so overlapping captures across subshell lanes are not
+            # safe. Serialize the capture window to avoid deadlocks/cross-talk
+            # while preserving per-subshell routing at the control plane.
+            with _FD_CAPTURE_LOCK:
+                with FdCapture(request_id=request_id):
+                    if interrupt_requested(subshell_id):
+                        raise KeyboardInterrupt()
 
-                result = execute_with_ipython(
-                    code,
-                    execution_count=execution_count,
-                    silent=silent,
-                    store_history=store_history,
-                )
-
-                error = (
-                    result.error_before_exec
-                    if result.error_before_exec is not None
-                    else result.error_in_exec
-                )
-                if error is None:
-                    payload["user_expressions"] = evaluate_user_expressions(
-                        user_expressions
+                    result = execute_with_ipython(
+                        code,
+                        execution_count=execution_count,
+                        silent=silent,
+                        store_history=store_history,
                     )
-                else:
-                    payload["status"] = "error"
-                    (
-                        payload["ename"],
-                        payload["evalue"],
-                        payload["traceback"],
-                    ) = format_execution_error(error)
+
+                    error = (
+                        result.error_before_exec
+                        if result.error_before_exec is not None
+                        else result.error_in_exec
+                    )
+                    if error is None:
+                        payload["user_expressions"] = evaluate_user_expressions(
+                            user_expressions
+                        )
+                    else:
+                        payload["status"] = "error"
+                        (
+                            payload["ename"],
+                            payload["evalue"],
+                            payload["traceback"],
+                        ) = format_execution_error(error)
     except BaseException as exc:
         payload["status"] = "error"
         payload["ename"] = exc.__class__.__name__
@@ -1615,8 +1641,8 @@ def execute(
     payload["displays"] = list(context.display_events)
     payload["comm_events"] = list(context.comm_events)
     payload["debug_events"] = DEBUG_STATE.capture_breakpoint_stop(code)
-    payload["payload"] = list(INTERACTIVE_SHELL.payload_manager.read_payload())
-    INTERACTIVE_SHELL.payload_manager.clear_payload()
+    payload["payload"] = list(context.payloads)
+    context.payloads.clear()
     if payload["status"] == "ok" and context.execute_result is not None and not silent:
         payload["result"] = context.execute_result
     return payload
@@ -2269,7 +2295,7 @@ while True:
     try:
         raw_line = stdin.readline()
     except KeyboardInterrupt:
-        request_interrupt(None)
+        SUBSHELL_MANAGER.interrupt_all()
         continue
 
     if raw_line == "":

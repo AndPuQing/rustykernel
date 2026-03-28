@@ -223,6 +223,7 @@ struct MessageLoopState {
 struct PendingExecute {
     parent_header: Value,
     silent: bool,
+    subshell_id: Option<String>,
 }
 
 struct ExecuteCompletion {
@@ -496,7 +497,7 @@ impl MessageLoopState {
             "disconnect" => self.handle_debug_disconnect(request_seq, arguments.clone()),
             "setBreakpoints" => self.handle_debug_set_breakpoints(request_seq, request, arguments),
             "threads" | "stackTrace" | "scopes" | "variables" | "continue" | "next" | "stepIn"
-            | "stepOut" => self.handle_debug_passthrough(command, request_seq, arguments),
+            | "stepOut" | "pause" => self.handle_debug_passthrough(command, request_seq, arguments),
             "debugInfo" => {
                 let reply = self.lock_worker()?.debug_request(request)?;
                 self.overlay_debug_info(reply)
@@ -969,8 +970,24 @@ impl MessageLoopState {
         Ok(())
     }
 
-    fn interrupt(&self) -> Result<(), KernelError> {
-        self.worker_interrupt.interrupt()
+    fn interrupt(&mut self) -> Result<(), KernelError> {
+        let has_main_execute = self
+            .pending_executes
+            .values()
+            .any(|pending| pending.subshell_id.is_none());
+        let has_subshell_execute = self
+            .pending_executes
+            .values()
+            .any(|pending| pending.subshell_id.is_some());
+
+        if has_subshell_execute {
+            self.lock_worker()?.interrupt_subshells()?;
+        }
+        if has_main_execute {
+            self.worker_interrupt.interrupt()?;
+        }
+
+        Ok(())
     }
 
     fn is_executing(&self) -> bool {
@@ -2055,6 +2072,7 @@ fn handle_shell_request(
                     PendingExecute {
                         parent_header: request.header_value.clone(),
                         silent,
+                        subshell_id: subshell_id.clone(),
                     },
                 );
                 spawn_execute_request_from_handle(
@@ -4898,6 +4916,211 @@ mod tests {
     }
 
     #[test]
+    fn live_debugpy_pause_request_stops_and_resumes_running_code() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let code = concat!(
+            "def runner():\n",
+            "    import time\n",
+            "    total = 0\n",
+            "    for _ in range(200):\n",
+            "        total += 1\n",
+            "        time.sleep(0.01)\n",
+            "    return total\n",
+            "\n",
+            "result = runner()\n",
+            "result\n",
+        );
+
+        let dump_cell_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            1,
+            "dumpCell",
+            json!({ "code": code }),
+        );
+        let source_path = dump_cell_reply
+            .content
+            .pointer("/body/sourcePath")
+            .and_then(Value::as_str)
+            .expect("dumpCell sourcePath missing")
+            .to_owned();
+
+        for (seq, command, arguments) in [
+            (
+                2,
+                "initialize",
+                json!({
+                    "clientID": "rustykernel-test",
+                    "clientName": "rustykernel-test",
+                    "adapterID": "python",
+                }),
+            ),
+            (3, "attach", json!({})),
+            (
+                4,
+                "setBreakpoints",
+                json!({
+                    "source": {"path": source_path},
+                    "breakpoints": [{"line": 2}],
+                    "sourceModified": false,
+                }),
+            ),
+            (5, "configurationDone", json!({})),
+        ] {
+            let reply = send_debug_request_and_drain_iopub(
+                &control, &iopub, &signer, seq, command, arguments,
+            );
+            assert_eq!(
+                reply.content.get("success"),
+                Some(&json!(true)),
+                "unexpected {command} reply: {:?}",
+                reply.content
+            );
+        }
+
+        let execute = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": code,
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &execute);
+        let breakpoint_stop = recv_iopub_messages_until_parent_predicate(
+            &iopub,
+            &signer,
+            &execute.header.msg_id,
+            |message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            },
+        );
+        let thread_id = debug_event_thread_id(&breakpoint_stop, "stopped");
+        assert_stack_line(&control, &iopub, &signer, 6, thread_id, &source_path, 2);
+
+        let continue_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            7,
+            "continue",
+            json!({ "threadId": thread_id }),
+        );
+        assert_eq!(continue_reply.content.get("success"), Some(&json!(true)));
+
+        std::thread::sleep(Duration::from_millis(150));
+
+        let pause_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            8,
+            "pause",
+            json!({ "threadId": thread_id }),
+        );
+        assert_eq!(pause_reply.content.get("success"), Some(&json!(true)));
+        let pause_stop = recv_iopub_messages_until_parent_predicate(
+            &iopub,
+            &signer,
+            &execute.header.msg_id,
+            |message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+                    && message.content.pointer("/body/reason") == Some(&json!("pause"))
+            },
+        );
+        let paused_thread_id = debug_event_thread_id(&pause_stop, "stopped");
+        assert_eq!(paused_thread_id, thread_id);
+        let pause_stack_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            9,
+            "stackTrace",
+            json!({ "threadId": paused_thread_id }),
+        );
+        assert_eq!(pause_stack_reply.content.get("success"), Some(&json!(true)));
+        assert_eq!(
+            pause_stack_reply
+                .content
+                .pointer("/body/stackFrames/0/source/path"),
+            Some(&json!(source_path))
+        );
+        assert!(
+            pause_stack_reply
+                .content
+                .pointer("/body/stackFrames/0/line")
+                .and_then(Value::as_i64)
+                .is_some_and(|line| (4..=6).contains(&line)),
+            "unexpected pause stack: {:?}",
+            pause_stack_reply.content
+        );
+
+        let resume_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            10,
+            "continue",
+            json!({ "threadId": paused_thread_id }),
+        );
+        assert_eq!(resume_reply.content.get("success"), Some(&json!(true)));
+        let execute_reply = recv_message(&shell, &signer);
+        assert_eq!(execute_reply.header.msg_type, "execute_reply");
+        assert_eq!(execute_reply.content.get("status"), Some(&json!("ok")));
+        let execute_tail =
+            recv_iopub_messages_until_idle_for_parent(&iopub, &signer, &execute.header.msg_id);
+        assert!(
+            execute_tail
+                .iter()
+                .any(|message| message.header.msg_type == "execute_result"),
+            "expected execute_result after pause/resume, got {:?}",
+            execute_tail
+                .iter()
+                .map(|message| (message.header.msg_type.clone(), message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        let disconnect_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            11,
+            "disconnect",
+            json!({
+                "restart": false,
+                "terminateDebuggee": true,
+            }),
+        );
+        assert_eq!(disconnect_reply.content.get("success"), Some(&json!(true)));
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn continue_request_without_live_debug_session_returns_error_instead_of_fallback_success() {
         let _guard = test_lock();
         let connection = test_connection_info();
@@ -4929,6 +5152,39 @@ mod tests {
             Some(&json!("continue"))
         );
         assert_eq!(continue_reply.content.get("success"), Some(&json!(false)));
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn pause_request_without_live_debug_session_returns_error_instead_of_fallback_success() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+
+        let pause_request = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "pause",
+                "arguments": {"threadId": 1},
+            }),
+        );
+        send_client_message(&control, &signer, &pause_request);
+        let pause_reply = recv_message(&control, &signer);
+        assert_eq!(pause_reply.header.msg_type, "debug_reply");
+        assert_eq!(pause_reply.content.get("command"), Some(&json!("pause")));
+        assert_eq!(pause_reply.content.get("success"), Some(&json!(false)));
 
         runtime.stop().unwrap();
     }

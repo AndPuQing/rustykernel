@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import time
 from pathlib import Path
 
@@ -21,6 +22,32 @@ def zmq_context() -> zmq.Context:
     context = zmq.Context()
     yield context
     context.term()
+
+
+def recv_iopub_messages_for_parents(
+    socket: zmq.Socket,
+    key: str,
+    parent_msg_ids: list[str],
+    timeout_s: float = 5.0,
+) -> dict[str, list[dict[str, object]]]:
+    pending = set(parent_msg_ids)
+    messages = {parent_msg_id: [] for parent_msg_id in parent_msg_ids}
+    deadline = time.monotonic() + timeout_s
+
+    while pending and time.monotonic() < deadline:
+        message = recv_message(socket, key)
+        parent_msg_id = message["parent_header"].get("msg_id")
+        if parent_msg_id not in messages:
+            continue
+        messages[parent_msg_id].append(message)
+        if (
+            message["header"]["msg_type"] == "status"
+            and message["content"].get("execution_state") == "idle"
+        ):
+            pending.discard(parent_msg_id)
+
+    assert not pending, f"timed out waiting for parent idle status: {sorted(pending)!r}"
+    return messages
 
 
 def test_kernel_info_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None:
@@ -162,6 +189,399 @@ def test_subshell_execute_request_shares_namespace_and_uses_distinct_thread(
     lines = [line for line in stream_text.splitlines() if line]
     assert lines[0] == "6"
     assert int(lines[1]) != main_thread_id
+
+
+def test_subshell_execute_requests_complete_without_cross_talk(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        first_create_reply, _ = client.request("control", "create_subshell_request", {})
+        second_create_reply, _ = client.request(
+            "control", "create_subshell_request", {}
+        )
+        first_subshell_id = first_create_reply["content"]["subshell_id"]
+        second_subshell_id = second_create_reply["content"]["subshell_id"]
+
+        second_shell = zmq_context.socket(zmq.DEALER)
+        second_shell.connect(client.kernel.endpoints.shell)
+        second_shell.setsockopt(zmq.RCVTIMEO, 10000)
+        time.sleep(0.1)
+
+        first_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": """
+import threading
+import time
+
+start = time.monotonic()
+time.sleep(0.4)
+end = time.monotonic()
+(threading.get_ident(), start, end)
+""",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": first_subshell_id},
+        )
+        second_header = send_client_message(
+            second_shell,
+            str(client.payload["key"]),
+            "smoke-session-2",
+            "execute_request",
+            {
+                "code": """
+import threading
+import time
+
+start = time.monotonic()
+time.sleep(0.4)
+end = time.monotonic()
+(threading.get_ident(), start, end)
+""",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": second_subshell_id},
+        )
+
+        first_reply = recv_message(client.shell, str(client.payload["key"]))
+        second_reply = recv_message(second_shell, str(client.payload["key"]))
+        published_by_parent = recv_iopub_messages_for_parents(
+            client.iopub,
+            str(client.payload["key"]),
+            [str(first_header["msg_id"]), str(second_header["msg_id"])],
+        )
+        first_published = published_by_parent[str(first_header["msg_id"])]
+        second_published = published_by_parent[str(second_header["msg_id"])]
+
+        second_shell.close(0)
+
+    assert first_reply["content"]["status"] == "ok"
+    assert second_reply["content"]["status"] == "ok"
+    assert first_reply["parent_header"]["subshell_id"] == first_subshell_id
+    assert second_reply["parent_header"]["subshell_id"] == second_subshell_id
+
+    first_result = ast.literal_eval(
+        next(
+            message["content"]["data"]["text/plain"]
+            for message in first_published
+            if message["header"]["msg_type"] == "execute_result"
+        )
+    )
+    second_result = ast.literal_eval(
+        next(
+            message["content"]["data"]["text/plain"]
+            for message in second_published
+            if message["header"]["msg_type"] == "execute_result"
+        )
+    )
+    assert first_result[0] != second_result[0]
+    assert first_result[2] > first_result[1]
+    assert second_result[2] > second_result[1]
+
+
+def test_subshell_execute_error_remains_isolated_from_concurrent_subshell(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        first_create_reply, _ = client.request("control", "create_subshell_request", {})
+        second_create_reply, _ = client.request(
+            "control", "create_subshell_request", {}
+        )
+        first_subshell_id = first_create_reply["content"]["subshell_id"]
+        second_subshell_id = second_create_reply["content"]["subshell_id"]
+
+        second_shell = zmq_context.socket(zmq.DEALER)
+        second_shell.connect(client.kernel.endpoints.shell)
+        second_shell.setsockopt(zmq.RCVTIMEO, 10000)
+        time.sleep(0.1)
+
+        first_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": """
+import threading
+import time
+
+time.sleep(0.2)
+raise RuntimeError("first boom")
+""",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": first_subshell_id},
+        )
+        second_header = send_client_message(
+            second_shell,
+            str(client.payload["key"]),
+            "smoke-session-2",
+            "execute_request",
+            {
+                "code": """
+import threading
+import time
+
+time.sleep(0.2)
+threading.get_ident()
+""",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": second_subshell_id},
+        )
+
+        first_reply = recv_message(client.shell, str(client.payload["key"]))
+        second_reply = recv_message(second_shell, str(client.payload["key"]))
+        published_by_parent = recv_iopub_messages_for_parents(
+            client.iopub,
+            str(client.payload["key"]),
+            [str(first_header["msg_id"]), str(second_header["msg_id"])],
+        )
+        first_published = published_by_parent[str(first_header["msg_id"])]
+        second_published = published_by_parent[str(second_header["msg_id"])]
+
+        second_shell.close(0)
+
+    assert first_reply["content"]["status"] == "error"
+    assert second_reply["content"]["status"] == "ok"
+    assert first_reply["parent_header"]["subshell_id"] == first_subshell_id
+    assert second_reply["parent_header"]["subshell_id"] == second_subshell_id
+    assert first_reply["content"]["ename"] == "RuntimeError"
+    assert first_reply["content"]["evalue"] == "first boom"
+    second_result = ast.literal_eval(
+        next(
+            message["content"]["data"]["text/plain"]
+            for message in second_published
+            if message["header"]["msg_type"] == "execute_result"
+        )
+    )
+
+    assert [message["header"]["msg_type"] for message in first_published] == [
+        "status",
+        "execute_input",
+        "error",
+        "status",
+    ]
+    assert [message["header"]["msg_type"] for message in second_published] == [
+        "status",
+        "execute_input",
+        "execute_result",
+        "status",
+    ]
+    assert first_published[2]["content"]["ename"] == "RuntimeError"
+    assert first_published[2]["content"]["evalue"] == "first boom"
+    assert isinstance(second_result, int)
+
+
+def test_subshells_are_cleared_after_restart(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, _ = client.request("control", "create_subshell_request", {})
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        restart_reply, restart_published = client.request(
+            "control",
+            "shutdown_request",
+            {"restart": True},
+        )
+        list_reply, list_published = client.request(
+            "control", "list_subshell_request", {}
+        )
+        probe_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": "41 + 1",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        probe_reply = recv_message(client.shell, str(client.payload["key"]))
+        probe_published = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(probe_header["msg_id"]),
+        )
+
+    assert restart_reply["content"] == {"status": "ok", "restart": True}
+    assert [message["header"]["msg_type"] for message in restart_published] == [
+        "status",
+        "shutdown_reply",
+        "status",
+    ]
+
+    assert list_reply["content"] == {"status": "ok", "subshell_id": []}
+    assert [message["content"]["execution_state"] for message in list_published] == [
+        "busy",
+        "idle",
+    ]
+
+    assert probe_reply["content"]["status"] == "error"
+    assert "unknown subshell_id" in probe_reply["content"]["evalue"]
+    assert subshell_id in probe_reply["content"]["evalue"]
+    assert [message["header"]["msg_type"] for message in probe_published] == [
+        "status",
+        "execute_input",
+        "error",
+        "status",
+    ]
+
+
+def test_delete_subshell_while_execute_is_running_waits_for_completion(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, _ = client.request("control", "create_subshell_request", {})
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        delete_control = zmq_context.socket(zmq.DEALER)
+        delete_control.connect(client.kernel.endpoints.control)
+        delete_control.setsockopt(zmq.RCVTIMEO, 10000)
+        delete_iopub = zmq_context.socket(zmq.SUB)
+        delete_iopub.setsockopt(zmq.SUBSCRIBE, b"")
+        delete_iopub.connect(client.kernel.endpoints.iopub)
+        delete_iopub.setsockopt(zmq.RCVTIMEO, 10000)
+        time.sleep(0.1)
+
+        execute_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": """
+import time
+print("started")
+time.sleep(0.4)
+print("finished")
+"done"
+""",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        execute_started = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(execute_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "stream"
+                and "started" in message["content"].get("text", "")
+            ),
+        )
+
+        delete_header = send_client_message(
+            delete_control,
+            str(client.payload["key"]),
+            "delete-subshell-session",
+            "delete_subshell_request",
+            {"subshell_id": subshell_id},
+        )
+        delete_reply = recv_message(delete_control, str(client.payload["key"]))
+        delete_published = recv_iopub_messages_for_parent(
+            delete_iopub,
+            str(client.payload["key"]),
+            str(delete_header["msg_id"]),
+        )
+
+        execute_reply = recv_message(client.shell, str(client.payload["key"]))
+        execute_tail = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(execute_header["msg_id"]),
+        )
+        probe_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": "40 + 2",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        probe_reply = recv_message(client.shell, str(client.payload["key"]))
+        probe_published = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(probe_header["msg_id"]),
+        )
+
+        delete_control.close(0)
+        delete_iopub.close(0)
+
+    execute_messages = execute_started + execute_tail
+    execute_stream_text = "".join(
+        message["content"]["text"]
+        for message in execute_messages
+        if message["header"]["msg_type"] == "stream"
+    )
+
+    assert execute_reply["content"]["status"] == "ok"
+    assert execute_reply["parent_header"]["subshell_id"] == subshell_id
+    assert "started" in execute_stream_text
+    assert "finished" in execute_stream_text
+    assert (
+        ast.literal_eval(
+            next(
+                message["content"]["data"]["text/plain"]
+                for message in execute_messages
+                if message["header"]["msg_type"] == "execute_result"
+            )
+        )
+        == "done"
+    )
+
+    assert delete_reply["content"] == {"status": "ok"}
+    assert [message["content"]["execution_state"] for message in delete_published] == [
+        "busy",
+        "idle",
+    ]
+
+    assert probe_reply["content"]["status"] == "error"
+    assert "unknown subshell_id" in probe_reply["content"]["evalue"]
+    assert subshell_id in probe_reply["content"]["evalue"]
+    assert [message["header"]["msg_type"] for message in probe_published] == [
+        "status",
+        "execute_input",
+        "error",
+        "status",
+    ]
 
 
 def test_debug_request_debug_info_smoke(
@@ -659,6 +1079,268 @@ def test_live_debugpy_continue_next_stepin_stepout_smoke(
             {"restart": False, "terminateDebuggee": True},
         )
         assert disconnect_reply["content"]["success"] is True
+
+
+def test_live_debugpy_pause_in_subshell_smoke(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    code = (
+        "def runner():\n"
+        "    import time\n"
+        "    total = 0\n"
+        "    for _ in range(200):\n"
+        "        total += 1\n"
+        "        time.sleep(0.01)\n"
+        "    return total\n"
+        "\n"
+        "result = runner()\n"
+        "result\n"
+    )
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, _ = client.request("control", "create_subshell_request", {})
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        dump_reply = client.debug_request_and_drain(1, "dumpCell", {"code": code})
+        source_path = dump_reply["content"]["body"]["sourcePath"]
+
+        init_reply = client.debug_request_and_drain(
+            2,
+            "initialize",
+            {
+                "clientID": "test-client",
+                "clientName": "test-client",
+                "adapterID": "python",
+            },
+        )
+        attach_reply = client.debug_request_and_drain(3, "attach", {})
+        set_reply = client.debug_request_and_drain(
+            4,
+            "setBreakpoints",
+            {
+                "source": {"path": source_path},
+                "breakpoints": [{"line": 2}],
+                "sourceModified": False,
+            },
+        )
+        config_reply = client.debug_request_and_drain(5, "configurationDone", {})
+
+        assert init_reply["content"]["success"] is True
+        assert attach_reply["content"]["success"] is True
+        assert set_reply["content"]["success"] is True
+        assert config_reply["content"]["success"] is True
+
+        shell_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        first_stop_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            ),
+        )
+        first_stopped = next(
+            message
+            for message in first_stop_messages
+            if message["header"]["msg_type"] == "debug_event"
+            and message["content"]["event"] == "stopped"
+        )
+        assert first_stopped["parent_header"]["subshell_id"] == subshell_id
+        thread_id = int(first_stopped["content"]["body"].get("threadId", 1))
+        frame, _ = client.top_frame_and_locals(6, thread_id)
+        assert frame["source"]["path"] == source_path
+        assert frame["line"] == 2
+
+        continue_reply = client.debug_request_and_drain(
+            10, "continue", {"threadId": thread_id}
+        )
+        assert continue_reply["content"]["success"] is True
+
+        time.sleep(0.15)
+
+        pause_reply = client.debug_request_and_drain(
+            11, "pause", {"threadId": thread_id}
+        )
+        assert pause_reply["content"]["success"] is True
+        pause_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+                and message["content"]["body"].get("reason") == "pause"
+            ),
+        )
+        pause_stopped = next(
+            message
+            for message in pause_messages
+            if message["header"]["msg_type"] == "debug_event"
+            and message["content"]["event"] == "stopped"
+            and message["content"]["body"].get("reason") == "pause"
+        )
+        assert pause_stopped["parent_header"]["subshell_id"] == subshell_id
+        paused_thread_id = int(pause_stopped["content"]["body"].get("threadId", 1))
+        assert paused_thread_id == thread_id
+
+        frame, _ = client.top_frame_and_locals(20, paused_thread_id)
+        assert frame["source"]["path"] == source_path
+        assert frame["line"] in {4, 5, 6}
+
+        resume_reply = client.debug_request_and_drain(
+            24, "continue", {"threadId": paused_thread_id}
+        )
+        assert resume_reply["content"]["success"] is True
+        execute_reply = recv_message(client.shell, str(client.payload["key"]))
+        execute_tail = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+        )
+        assert execute_reply["content"]["status"] == "ok"
+        assert execute_reply["parent_header"]["subshell_id"] == subshell_id
+        assert any(
+            message["header"]["msg_type"] == "execute_result"
+            for message in execute_tail
+        )
+
+        disconnect_reply = client.debug_request_and_drain(
+            28,
+            "disconnect",
+            {"restart": False, "terminateDebuggee": True},
+        )
+        assert disconnect_reply["content"]["success"] is True
+
+
+def test_interrupt_request_stops_running_debug_session_in_subshell(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    code = (
+        "def runner():\n"
+        "    import time\n"
+        "    total = 0\n"
+        "    for _ in range(300):\n"
+        "        total += 1\n"
+        "        time.sleep(0.01)\n"
+        "    return total\n"
+        "\n"
+        "runner()\n"
+    )
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, _ = client.request("control", "create_subshell_request", {})
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        dump_reply = client.debug_request_and_drain(1, "dumpCell", {"code": code})
+        assert dump_reply["content"]["success"] is True
+
+        init_reply = client.debug_request_and_drain(
+            2,
+            "initialize",
+            {
+                "clientID": "test-client",
+                "clientName": "test-client",
+                "adapterID": "python",
+            },
+        )
+        attach_reply = client.debug_request_and_drain(3, "attach", {})
+        config_reply = client.debug_request_and_drain(4, "configurationDone", {})
+
+        assert init_reply["content"]["success"] is True
+        assert attach_reply["content"]["success"] is True
+        assert config_reply["content"]["success"] is True
+
+        execute_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        time.sleep(0.2)
+
+        interrupt_reply, interrupt_published = client.request(
+            "control", "interrupt_request", {}
+        )
+        execute_reply = recv_message(client.shell, str(client.payload["key"]))
+        execute_published = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(execute_header["msg_id"]),
+        )
+        probe_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": "40 + 2",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        probe_reply = recv_message(client.shell, str(client.payload["key"]))
+        probe_published = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(probe_header["msg_id"]),
+        )
+
+    assert interrupt_reply["header"]["msg_type"] == "interrupt_reply"
+    assert interrupt_reply["content"]["status"] == "ok"
+    assert [
+        message["content"]["execution_state"] for message in interrupt_published
+    ] == [
+        "busy",
+        "idle",
+    ]
+
+    assert execute_reply["content"]["status"] == "error"
+    assert execute_reply["content"]["ename"] == "KeyboardInterrupt"
+    assert execute_reply["parent_header"]["subshell_id"] == subshell_id
+    assert any(
+        message["header"]["msg_type"] == "error"
+        and message["content"]["ename"] == "KeyboardInterrupt"
+        for message in execute_published
+    )
+    assert execute_published[-1]["header"]["msg_type"] == "status"
+    assert execute_published[-1]["content"]["execution_state"] == "idle"
+
+    assert probe_reply["content"]["status"] == "ok"
+    assert probe_reply["parent_header"]["subshell_id"] == subshell_id
+    assert [message["header"]["msg_type"] for message in probe_published] == [
+        "status",
+        "execute_input",
+        "execute_result",
+        "status",
+    ]
 
 
 def test_execute_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None:
@@ -1212,6 +1894,139 @@ def test_shutdown_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> Non
         "status",
     ]
     assert published[1]["content"] == {"status": "ok", "restart": False}
+
+
+def test_shutdown_request_stops_kernel_with_running_subshell_execution(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, _ = client.request("control", "create_subshell_request", {})
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        execute_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": """
+import time
+print("started")
+time.sleep(30)
+""",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        started_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(execute_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "stream"
+                and "started" in message["content"].get("text", "")
+            ),
+        )
+        assert any(
+            message["header"]["msg_type"] == "stream"
+            and "started" in message["content"].get("text", "")
+            for message in started_messages
+        )
+
+        shutdown_reply, shutdown_published = client.request(
+            "control",
+            "shutdown_request",
+            {"restart": False},
+        )
+        wait_for_kernel_stop(client.kernel)
+
+    assert shutdown_reply["header"]["msg_type"] == "shutdown_reply"
+    assert shutdown_reply["content"] == {"status": "ok", "restart": False}
+    assert [message["header"]["msg_type"] for message in shutdown_published] == [
+        "status",
+        "shutdown_reply",
+        "status",
+    ]
+    assert shutdown_published[1]["content"] == {"status": "ok", "restart": False}
+
+
+def test_shutdown_request_stops_kernel_with_active_debug_session_in_subshell(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    code = 'import time\nprint("started")\ntime.sleep(30)\n'
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, _ = client.request("control", "create_subshell_request", {})
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        dump_reply = client.debug_request_and_drain(1, "dumpCell", {"code": code})
+        assert dump_reply["content"]["success"] is True
+
+        init_reply = client.debug_request_and_drain(
+            2,
+            "initialize",
+            {
+                "clientID": "test-client",
+                "clientName": "test-client",
+                "adapterID": "python",
+            },
+        )
+        attach_reply = client.debug_request_and_drain(3, "attach", {})
+        config_reply = client.debug_request_and_drain(4, "configurationDone", {})
+
+        assert init_reply["content"]["success"] is True
+        assert attach_reply["content"]["success"] is True
+        assert config_reply["content"]["success"] is True
+
+        execute_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        started_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(execute_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "stream"
+                and "started" in message["content"].get("text", "")
+            ),
+        )
+        assert any(
+            message["header"]["msg_type"] == "stream"
+            and "started" in message["content"].get("text", "")
+            for message in started_messages
+        )
+
+        shutdown_reply, shutdown_published = client.request(
+            "control",
+            "shutdown_request",
+            {"restart": False},
+        )
+        wait_for_kernel_stop(client.kernel)
+
+    assert shutdown_reply["header"]["msg_type"] == "shutdown_reply"
+    assert shutdown_reply["content"] == {"status": "ok", "restart": False}
+    assert [message["header"]["msg_type"] for message in shutdown_published] == [
+        "status",
+        "shutdown_reply",
+        "status",
+    ]
+    assert shutdown_published[1]["content"] == {"status": "ok", "restart": False}
 
 
 def test_interrupt_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None:

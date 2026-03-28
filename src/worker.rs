@@ -212,6 +212,8 @@ enum WorkerRequest<'a> {
     DebugListen { id: u64 },
     #[serde(rename = "debug")]
     Debug { id: u64, message: &'a Value },
+    #[serde(rename = "interrupt")]
+    Interrupt { id: u64 },
     #[serde(rename = "create_subshell")]
     CreateSubshell { id: u64 },
     #[serde(rename = "delete_subshell")]
@@ -583,6 +585,19 @@ impl PythonWorker {
         };
         let response: WorkerEnvelope<Value> = self.send_request(&request, request_id)?;
         Ok(response.payload)
+    }
+
+    pub fn interrupt_subshells(&mut self) -> Result<(), KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::Interrupt { id: request_id };
+        let response: WorkerEnvelope<WorkerStatusReply> =
+            self.send_request(&request, request_id)?;
+        if response.payload.status == "ok" {
+            Ok(())
+        } else {
+            Err(KernelError::Worker(response.payload.evalue))
+        }
     }
 
     pub fn comm_open(
