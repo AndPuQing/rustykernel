@@ -81,10 +81,31 @@ Current `rustykernel` behavior:
 
 - `implementation`, `implementation_version`, and `banner` are
   `rustykernel`-specific
-- `supported_features` is currently `[]`
-- `debugger` is currently `false`
-- those fields are intentionally conservative because the runtime does not yet
-  implement debugger, usage, or subshell protocol extensions
+- `supported_features` currently advertises `["debugger"]`
+- `debugger` is currently `true`
+- `kernel_info_reply` and kernelspec metadata now advertise debugger support,
+  but not subshell support
+
+`rustykernel` now accepts a broader control-channel `debug_request` surface for
+`debugInfo`, `initialize`, `attach`, `disconnect`, `dumpCell`,
+`setBreakpoints`, `configurationDone`, `evaluate`, `source`, `threads`,
+`stackTrace`, `scopes`, `variables`, `continue`, `next`, `stepIn`, and
+`stepOut`. When the in-process `debugpy` path is available, those live
+stop/step/stack/variables commands are now owned by Rust's `DebugSession`
+instead of being proxied by the local worker shim.
+
+When the in-process `debugpy` path is active, DAP events are now forwarded as
+Jupyter `debug_event` messages in real time, and kernel-side debug state is
+updated from `initialized`, `stopped`, `continued`, `terminated`, and `exited`
+events. Real live `continue` / `next` / `stepIn` / `stepOut` end-to-end
+coverage is now present in both Rust runtime tests and Python black-box smoke
+tests. In particular, the current Python worker still serializes requests
+through one stdin/protocol loop, so commands that require stronger
+mid-execution re-entrancy beyond the currently covered stop/step flows (for
+example a future real `pause`) still need a more re-entrant worker IPC design.
+For execute-boundary synthetic breakpoint stops, the worker now only emits a
+compact snapshot payload and Rust answers
+`stackTrace`/`scopes`/`variables` from its own cache.
 
 The current `ipykernel` comparison test deliberately normalizes
 `kernel_info_reply` and does not require raw field-for-field equality.

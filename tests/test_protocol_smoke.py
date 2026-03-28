@@ -9,6 +9,7 @@ import zmq
 from tests.support import (
     recv_message,
     recv_iopub_messages_for_parent,
+    recv_iopub_messages_until_parent_predicate,
     running_kernel_client,
     send_client_message,
     wait_for_kernel_stop,
@@ -30,8 +31,8 @@ def test_kernel_info_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> 
     assert reply["content"]["status"] == "ok"
     assert reply["content"]["protocol_version"] == "5.3"
     assert reply["content"]["language"] == "python"
-    assert reply["content"]["debugger"] is False
-    assert reply["content"]["supported_features"] == []
+    assert reply["content"]["debugger"] is True
+    assert reply["content"]["supported_features"] == ["debugger"]
     assert [message["content"]["execution_state"] for message in published] == [
         "busy",
         "idle",
@@ -66,6 +67,503 @@ def test_usage_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None:
         "busy",
         "idle",
     ]
+
+
+def test_debug_request_debug_info_smoke(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        reply, published = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 1,
+                "type": "request",
+                "command": "debugInfo",
+            },
+        )
+
+    assert reply["header"]["msg_type"] == "debug_reply"
+    assert reply["content"]["type"] == "response"
+    assert reply["content"]["request_seq"] == 1
+    assert reply["content"]["success"] is True
+    assert reply["content"]["command"] == "debugInfo"
+    assert reply["content"]["body"]["isStarted"] is False
+    assert reply["content"]["body"]["breakpoints"] == []
+    assert reply["content"]["body"]["stoppedThreads"] == []
+    assert reply["content"]["body"]["tmpFileSuffix"] == ".py"
+    assert [message["content"]["execution_state"] for message in published] == [
+        "busy",
+        "idle",
+    ]
+
+
+def test_debug_request_initialize_and_breakpoint_bookkeeping_smoke(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        init_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 1,
+                "type": "request",
+                "command": "initialize",
+                "arguments": {
+                    "clientID": "test-client",
+                    "clientName": "test-client",
+                    "adapterID": "",
+                },
+            },
+        )
+        attach_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 2,
+                "type": "request",
+                "command": "attach",
+                "arguments": {},
+            },
+        )
+        dump_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 3,
+                "type": "request",
+                "command": "dumpCell",
+                "arguments": {"code": "def f():\n    return 42\nf()\n"},
+            },
+        )
+        source_path = dump_reply["content"]["body"]["sourcePath"]
+        set_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 4,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {"path": source_path},
+                    "breakpoints": [{"line": 2}],
+                    "sourceModified": False,
+                },
+            },
+        )
+        info_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 5,
+                "type": "request",
+                "command": "debugInfo",
+            },
+        )
+        disconnect_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 6,
+                "type": "request",
+                "command": "disconnect",
+                "arguments": {"restart": False, "terminateDebuggee": True},
+            },
+        )
+
+    assert init_reply["header"]["msg_type"] == "debug_reply"
+    assert init_reply["content"]["success"] is True
+    assert init_reply["content"]["command"] == "initialize"
+    assert attach_reply["content"]["success"] is True
+    assert dump_reply["content"]["success"] is True
+    assert source_path.endswith(".py")
+    assert set_reply["content"]["success"] is True
+    assert set_reply["content"]["body"]["breakpoints"][0]["verified"] is True
+    assert info_reply["content"]["body"]["isStarted"] is True, (
+        "attach should mark debugger session started"
+    )
+    assert source_path in {
+        item["source"] for item in info_reply["content"]["body"]["breakpoints"]
+    }
+    assert disconnect_reply["content"]["success"] is True
+
+
+def test_debug_breakpoint_event_and_variable_queries_smoke(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    code = "x = 1\ny = x + 1\nz = y + 1\n"
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        dump_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 1,
+                "type": "request",
+                "command": "dumpCell",
+                "arguments": {"code": code},
+            },
+        )
+        source_path = dump_reply["content"]["body"]["sourcePath"]
+        client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 2,
+                "type": "request",
+                "command": "initialize",
+                "arguments": {},
+            },
+        )
+        client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 3,
+                "type": "request",
+                "command": "attach",
+                "arguments": {},
+            },
+        )
+        client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 4,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {"path": source_path},
+                    "breakpoints": [{"line": 2}],
+                    "sourceModified": False,
+                },
+            },
+        )
+        client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 5,
+                "type": "request",
+                "command": "configurationDone",
+                "arguments": {},
+            },
+        )
+
+        execute_reply, published = client.request(
+            "shell",
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+
+        stopped_event = next(
+            (
+                message
+                for message in published
+                if message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            ),
+            None,
+        )
+        stack_reply, _ = client.request(
+            "control",
+            "debug_request",
+            {
+                "seq": 6,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {"threadId": 1},
+            },
+        )
+        frame_id = None
+        stack_frames = stack_reply["content"]["body"].get("stackFrames", [])
+        scopes_reply = None
+        variables_reply = None
+        if stack_frames:
+            frame_id = stack_frames[0]["id"]
+            scopes_reply, _ = client.request(
+                "control",
+                "debug_request",
+                {
+                    "seq": 7,
+                    "type": "request",
+                    "command": "scopes",
+                    "arguments": {"frameId": frame_id},
+                },
+            )
+            locals_ref = scopes_reply["content"]["body"]["scopes"][0][
+                "variablesReference"
+            ]
+            variables_reply, _ = client.request(
+                "control",
+                "debug_request",
+                {
+                    "seq": 8,
+                    "type": "request",
+                    "command": "variables",
+                    "arguments": {"variablesReference": locals_ref},
+                },
+            )
+
+    assert execute_reply["content"]["status"] == "ok"
+    if stopped_event is not None:
+        assert stopped_event["content"]["body"]["reason"] == "breakpoint"
+        assert (
+            stack_reply["content"]["body"]["stackFrames"][0]["source"]["path"]
+            == source_path
+        )
+        assert stack_reply["content"]["body"]["stackFrames"][0]["line"] == 2
+        variables = {
+            item["name"]: item["value"]
+            for item in variables_reply["content"]["body"]["variables"]  # type: ignore[index]
+        }
+        assert variables["x"] == "1"
+        assert variables["y"] == "2"
+    else:
+        # Keep this smoke tolerant: this test exercises the shallow breakpoint
+        # path, while stronger live stepping coverage now lives in the dedicated
+        # live debugpy smoke below.
+        assert stack_reply["content"]["success"] is True
+        assert (
+            any(message["header"]["msg_type"] == "debug_event" for message in published)
+            or stack_reply["content"]["body"].get("stackFrames", []) == []
+        )
+
+
+def test_live_debugpy_continue_next_stepin_stepout_smoke(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    code = (
+        "def inner():\n"
+        "    value = 1\n"
+        "    value += 1\n"
+        "    return value\n"
+        "\n"
+        "result = inner()\n"
+        "result += 10\n"
+        "result\n"
+    )
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        dump_reply = client.debug_request_and_drain(1, "dumpCell", {"code": code})
+        source_path = dump_reply["content"]["body"]["sourcePath"]
+
+        init_reply = client.debug_request_and_drain(
+            2,
+            "initialize",
+            {
+                "clientID": "test-client",
+                "clientName": "test-client",
+                "adapterID": "python",
+            },
+        )
+        attach_reply = client.debug_request_and_drain(3, "attach", {})
+        set_reply = client.debug_request_and_drain(
+            4,
+            "setBreakpoints",
+            {
+                "source": {"path": source_path},
+                "breakpoints": [{"line": 6}],
+                "sourceModified": False,
+            },
+        )
+        config_reply = client.debug_request_and_drain(5, "configurationDone", {})
+
+        assert init_reply["content"]["success"] is True
+        assert attach_reply["content"]["success"] is True
+        assert set_reply["content"]["success"] is True
+        assert config_reply["content"]["success"] is True
+
+        shell_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        first_stop_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            ),
+        )
+        first_stopped = next(
+            message
+            for message in first_stop_messages
+            if message["header"]["msg_type"] == "debug_event"
+            and message["content"]["event"] == "stopped"
+        )
+        stopped_thread_id = first_stopped["content"]["body"].get("threadId", 1)
+        frame, variables = client.top_frame_and_locals(6, int(stopped_thread_id))
+        assert frame["source"]["path"] == source_path
+        assert frame["line"] == 6
+        assert isinstance(variables, list)
+
+        continue_reply = client.debug_request_and_drain(
+            10, "continue", {"threadId": int(stopped_thread_id)}
+        )
+        assert continue_reply["content"]["success"] is True
+        execute_reply = recv_message(client.shell, str(client.payload["key"]))
+        execute_tail = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+        )
+        assert execute_reply["content"]["status"] == "ok"
+        assert any(
+            message["header"]["msg_type"] == "execute_result"
+            for message in execute_tail
+        )
+
+        shell_header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        second_stop_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            ),
+        )
+        second_stopped = next(
+            message
+            for message in second_stop_messages
+            if message["header"]["msg_type"] == "debug_event"
+            and message["content"]["event"] == "stopped"
+        )
+        thread_id = int(second_stopped["content"]["body"].get("threadId", 1))
+
+        frame, variables = client.top_frame_and_locals(20, thread_id)
+        assert frame["source"]["path"] == source_path
+        assert frame["line"] == 6
+        assert isinstance(variables, list)
+
+        step_in_reply = client.debug_request_and_drain(
+            24, "stepIn", {"threadId": thread_id}
+        )
+        assert step_in_reply["content"]["success"] is True
+        step_in_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            ),
+        )
+        thread_id = int(
+            next(
+                message["content"]["body"].get("threadId", 1)
+                for message in step_in_messages
+                if message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            )
+        )
+        frame, _ = client.top_frame_and_locals(25, thread_id)
+        assert frame["source"]["path"] == source_path
+        assert frame["line"] == 2
+
+        next_reply = client.debug_request_and_drain(29, "next", {"threadId": thread_id})
+        assert next_reply["content"]["success"] is True
+        next_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            ),
+        )
+        thread_id = int(
+            next(
+                message["content"]["body"].get("threadId", 1)
+                for message in next_messages
+                if message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            )
+        )
+        frame, variables = client.top_frame_and_locals(30, thread_id)
+        assert frame["source"]["path"] == source_path
+        assert frame["line"] == 3
+        assert {item["name"]: item["value"] for item in variables}["value"] == "1"
+
+        step_out_reply = client.debug_request_and_drain(
+            34, "stepOut", {"threadId": thread_id}
+        )
+        assert step_out_reply["content"]["success"] is True
+        step_out_messages = recv_iopub_messages_until_parent_predicate(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            ),
+        )
+        thread_id = int(
+            next(
+                message["content"]["body"].get("threadId", 1)
+                for message in step_out_messages
+                if message["header"]["msg_type"] == "debug_event"
+                and message["content"]["event"] == "stopped"
+            )
+        )
+        frame, _ = client.top_frame_and_locals(35, thread_id)
+        assert frame["source"]["path"] == source_path
+        assert frame["line"] == 6
+
+        continue_reply = client.debug_request_and_drain(
+            39, "continue", {"threadId": thread_id}
+        )
+        assert continue_reply["content"]["success"] is True
+        execute_reply = recv_message(client.shell, str(client.payload["key"]))
+        execute_tail = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(shell_header["msg_id"]),
+        )
+        assert execute_reply["content"]["status"] == "ok"
+        assert any(
+            message["header"]["msg_type"] == "execute_result"
+            for message in execute_tail
+        )
+
+        disconnect_reply = client.debug_request_and_drain(
+            43,
+            "disconnect",
+            {"restart": False, "terminateDebuggee": True},
+        )
+        assert disconnect_reply["content"]["success"] is True
 
 
 def test_execute_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None:

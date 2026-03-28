@@ -129,7 +129,7 @@ def test_get_kernel_dict() -> None:
     assert kernel_dict["argv"] == rustykernel.make_rustykernel_cmd()
     assert kernel_dict["display_name"] == "Python (rustykernel)"
     assert kernel_dict["language"] == "python"
-    assert kernel_dict["metadata"] == {"debugger": False}
+    assert kernel_dict["metadata"] == {"debugger": True}
     assert (
         kernel_dict["kernel_protocol_version"]
         == rustykernel.runtime_info().protocol_version
@@ -293,8 +293,8 @@ def test_kernelspec_argv_starts_a_real_kernel(
         assert content["language_info"]["nbconvert_exporter"] == "python"
         assert content["language_info"]["codemirror_mode"]["name"] == "ipython"
         assert content["help_links"][0]["text"] == "Python Reference"
-        assert content["debugger"] is False
-        assert content["supported_features"] == []
+        assert content["debugger"] is True
+        assert content["supported_features"] == ["debugger"]
 
         execute_header = send_client_message(
             shell,

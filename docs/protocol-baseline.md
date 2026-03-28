@@ -36,6 +36,7 @@ The current `ipykernel` comparison status is tracked separately in
 - `kernel_info_request` -> `kernel_info_reply`
 - `connect_request` -> `connect_reply`
 - `interrupt_request` -> `interrupt_reply`
+- `debug_request` -> `debug_reply`
 - `usage_request` -> `usage_reply`
 - `shutdown_request` -> `shutdown_reply`
 
@@ -84,6 +85,29 @@ The current `ipykernel` comparison status is tracked separately in
 - `usage_request` returns a control-plane resource snapshot for the running
   kernel process tree, including hostname, pid, kernel CPU/memory totals, host
   CPU count, and host virtual-memory totals.
+- `debug_request` now supports the current debugger control-plane surface for
+  `debugInfo`, `initialize`, `attach`, `disconnect`, `dumpCell`,
+  `setBreakpoints`, `configurationDone`, `evaluate`, `source`, `threads`,
+  `stackTrace`, `scopes`, `variables`, `continue`, `next`, `stepIn`, and
+  `stepOut`.
+- when `debugpy` is available, `initialize`, `attach`, `configurationDone`,
+  `setBreakpoints`, `threads`, `stackTrace`, `scopes`, `variables`,
+  `continue`, `next`, `stepIn`, and `stepOut` are now handled by Rust's
+  `DebugSession` against the in-process debugpy DAP endpoint; the worker no
+  longer proxies those live debug commands.
+- real in-process debugpy DAP events are now forwarded to Jupyter as
+  `debug_event` IOPub messages in real time during execution rather than being
+  delayed until the next execution boundary.
+- `stopped`, `continued`, `terminated`, `exited`, and `initialized` events now
+  drive the kernel-side debug state machine, and `debugInfo.stoppedThreads` is
+  emitted from Rust-owned state.
+- synthetic execute-boundary `stopped` events now carry a small
+  rustykernel-specific snapshot for stack/scopes/variables, which Rust caches
+  and can use to answer `stackTrace`, `scopes`, and `variables` without a
+  worker fallback path.
+- when a previously dumped cell is executed, its temporary file path is now
+  injected into IPython's compilation cache so real debugpy breakpoints, stack
+  frames, and source paths can line up with the dumped file.
 
 ## Current Placeholders And Known Limits In Surface Area
 
@@ -99,10 +123,12 @@ The current `ipykernel` comparison status is tracked separately in
 
 ## Requests Not Implemented Yet
 
-The current runtime does not implement handlers for common protocol extensions
-such as:
+The current runtime does not implement full handlers for common protocol
+extensions such as:
 
-- `debug_request`
+- debugger features still outside the currently covered baseline, such as a
+  real `pause` flow and broader lifecycle hardening beyond the now-tested live
+  `continue` / `next` / `stepIn` / `stepOut` paths
 - subshell requests
 
 ## Test Coverage That Anchors This Baseline
@@ -116,7 +142,7 @@ such as:
 - `tests/test_protocol_smoke.py` provides a shallow protocol smoke suite for
   `kernel_info_request`, `execute_request`, `complete_request`,
   `inspect_request`, `history_request`, `is_complete_request`,
-  `shutdown_request`, `interrupt_request`, and `usage_request`.
+  `shutdown_request`, `interrupt_request`, `usage_request`, and `debug_request`.
 - `tests/test_ipykernel_compat.py` currently compares `kernel_info_request`,
   `execute_request`, `comm_info_request`, `complete_request`,
   `inspect_request`, and `is_complete_request` against `ipykernel`. The current

@@ -129,6 +129,26 @@ def recv_iopub_messages_for_parent(
     return messages
 
 
+def recv_iopub_messages_until_parent_predicate(
+    socket: zmq.Socket,
+    key: str,
+    parent_msg_id: str,
+    predicate,
+    timeout_s: float = 10.0,
+) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout_s
+    messages = []
+    while time.monotonic() < deadline:
+        message = recv_message(socket, key)
+        if message["parent_header"].get("msg_id") != parent_msg_id:
+            continue
+        messages.append(message)
+        if predicate(message):
+            return messages
+
+    raise AssertionError("timed out waiting for matching parent iopub message")
+
+
 def wait_for_kernel_stop(
     kernel: object, timeout_s: float = 3.0, poll_interval_s: float = 0.05
 ) -> None:
@@ -171,6 +191,58 @@ class KernelClient:
         )
         return reply, published
 
+    def debug_request(
+        self,
+        seq: int,
+        command: str,
+        arguments: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        content: dict[str, object] = {
+            "seq": seq,
+            "type": "request",
+            "command": command,
+        }
+        if arguments is not None:
+            content["arguments"] = arguments
+        return self.request("control", "debug_request", content)
+
+    def debug_request_and_drain(
+        self,
+        seq: int,
+        command: str,
+        arguments: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        reply, _ = self.debug_request(seq, command, arguments)
+        return reply
+
+    def top_frame_and_locals(
+        self, seq: int, thread_id: int
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        threads_reply = self.debug_request_and_drain(seq, "threads", {})
+        assert threads_reply["content"]["success"] is True
+        assert any(
+            thread["id"] == thread_id
+            for thread in threads_reply["content"]["body"].get("threads", [])
+        )
+
+        stack_reply = self.debug_request_and_drain(
+            seq + 1, "stackTrace", {"threadId": thread_id}
+        )
+        assert stack_reply["content"]["success"] is True
+        frame = stack_reply["content"]["body"]["stackFrames"][0]
+
+        scopes_reply = self.debug_request_and_drain(
+            seq + 2, "scopes", {"frameId": frame["id"]}
+        )
+        assert scopes_reply["content"]["success"] is True
+        locals_ref = scopes_reply["content"]["body"]["scopes"][0]["variablesReference"]
+
+        variables_reply = self.debug_request_and_drain(
+            seq + 3, "variables", {"variablesReference": locals_ref}
+        )
+        assert variables_reply["content"]["success"] is True
+        return frame, variables_reply["content"]["body"]["variables"]
+
 
 @contextmanager
 def running_kernel_client(
@@ -188,9 +260,9 @@ def running_kernel_client(
     iopub.setsockopt(zmq.SUBSCRIBE, b"")
     iopub.connect(kernel.endpoints.iopub)
 
-    shell.setsockopt(zmq.RCVTIMEO, 3000)
-    control.setsockopt(zmq.RCVTIMEO, 3000)
-    iopub.setsockopt(zmq.RCVTIMEO, 3000)
+    shell.setsockopt(zmq.RCVTIMEO, 10000)
+    control.setsockopt(zmq.RCVTIMEO, 10000)
+    iopub.setsockopt(zmq.RCVTIMEO, 10000)
     time.sleep(0.1)
 
     client = KernelClient(

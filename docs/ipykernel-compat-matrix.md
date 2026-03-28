@@ -28,7 +28,7 @@ compare a normalized subset or a narrow happy-path scenario.
 
 | Surface | Evidence | Why it is only partial |
 | --- | --- | --- |
-| `kernel_info_request` | `test_kernel_info_reply_matches_ipykernel` | The test normalizes the reply before comparison. It ignores fields such as `banner`, `implementation`, `implementation_version`, `debugger`, `supported_features`, and the full `help_links` list. |
+| `kernel_info_request` | `test_kernel_info_reply_matches_ipykernel` | The test normalizes the reply before comparison. It ignores fields such as `banner`, `implementation`, `implementation_version`, and the full `help_links` list. It also still ignores raw `debugger` / `supported_features` differences because `ipykernel` advertises `supported_features` differently and does not expose the same `implementation` surface. |
 | `connect_request` | `test_connect_reply_matches_ipykernel_semantics` | The test compares whether each kernel correctly echoes the ports from its own connection payload. It validates the reply semantics, but not raw cross-kernel equality because the bound ports differ by instance. |
 | `execute_request` success path | `test_execute_result_flow_matches_ipykernel` | The test covers one successful expression-result flow and normalizes the reply and IOPub sequence. It does not compare stream output, silent execution, rich display updates, or stdin-driven execution. |
 | `execute_request` runtime error path | `test_execute_error_flow_matches_ipykernel` | The test compares one runtime error flow after normalizing away `ipykernel`'s extra `engine_info`. It covers `ename`, `evalue`, `traceback`, `user_expressions`, `payload`, and the `error` IOPub message, but not broader exception classes or stream side effects around failures. |

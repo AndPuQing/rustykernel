@@ -1,22 +1,25 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
 import importlib.util
-import json
 import re
-import socket
-import subprocess
 import sys
 import time
-import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import zmq
+
+from tests.compat_harness import (
+    KernelCommand,
+    RunningKernel,
+    client_request,
+    recv_iopub_messages_for_parent,
+    recv_message,
+    run_stdin_flow,
+    running_kernel,
+    sign_message,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -25,157 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-@dataclass(frozen=True)
-class KernelCommand:
-    name: str
-    argv: list[str]
-
-
-@dataclass
-class RunningKernel:
-    name: str
-    payload: dict[str, object]
-    process: subprocess.Popen[bytes]
-    shell: zmq.Socket
-    control: zmq.Socket
-    iopub: zmq.Socket
-
-    def request(self, msg_type: str, content: dict[str, object]) -> dict[str, object]:
-        header, frames = client_request("compat-session", msg_type, content)
-        signature = sign_message(str(self.payload["key"]), frames)
-        self.shell.send_multipart([b"<IDS|MSG>", signature, *frames])
-        reply = recv_message(self.shell, str(self.payload["key"]))
-        self.drain_iopub()
-        reply["request_header"] = header
-        return reply
-
-    def execute(self, code: str) -> tuple[dict[str, object], list[dict[str, object]]]:
-        header, frames = client_request(
-            "compat-session",
-            "execute_request",
-            {
-                "code": code,
-                "silent": False,
-                "store_history": True,
-                "allow_stdin": False,
-                "user_expressions": {},
-                "stop_on_error": True,
-            },
-        )
-        signature = sign_message(str(self.payload["key"]), frames)
-        self.shell.send_multipart([b"<IDS|MSG>", signature, *frames])
-        reply = recv_message(self.shell, str(self.payload["key"]))
-        published = recv_iopub_messages_for_parent(
-            self.iopub, str(self.payload["key"]), header["msg_id"]
-        )
-        return reply, published
-
-    def drain_iopub(self) -> None:
-        while True:
-            try:
-                recv_message(self.iopub, str(self.payload["key"]))
-            except zmq.error.Again:
-                return
-
-
-def reserve_tcp_ports(count: int) -> list[int]:
-    listeners = []
-    try:
-        for _ in range(count):
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.bind(("127.0.0.1", 0))
-            listeners.append(listener)
-        return [listener.getsockname()[1] for listener in listeners]
-    finally:
-        for listener in listeners:
-            listener.close()
-
-
-def connection_payload() -> dict[str, object]:
-    shell_port, iopub_port, stdin_port, control_port, hb_port = reserve_tcp_ports(5)
-    return {
-        "transport": "tcp",
-        "ip": "127.0.0.1",
-        "shell_port": shell_port,
-        "iopub_port": iopub_port,
-        "stdin_port": stdin_port,
-        "control_port": control_port,
-        "hb_port": hb_port,
-        "signature_scheme": "hmac-sha256",
-        "key": "secret",
-        "kernel_name": "python-test",
-    }
-
-
-def write_connection_file(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def sign_message(key: str, parts: list[bytes]) -> bytes:
-    if not key:
-        return b""
-
-    digest = hmac.new(key.encode("utf-8"), digestmod=hashlib.sha256)
-    for part in parts:
-        digest.update(part)
-    return digest.hexdigest().encode("ascii")
-
-
-def client_request(
-    session: str, msg_type: str, content: dict[str, object]
-) -> tuple[dict[str, object], list[bytes]]:
-    header = {
-        "msg_id": str(uuid.uuid4()),
-        "session": session,
-        "username": "compat-client",
-        "date": "2026-03-26T00:00:00.000Z",
-        "msg_type": msg_type,
-        "version": "5.3",
-    }
-    header_frame = json.dumps(header).encode("utf-8")
-    parent_frame = b"{}"
-    metadata_frame = b"{}"
-    content_frame = json.dumps(content).encode("utf-8")
-    return header, [header_frame, parent_frame, metadata_frame, content_frame]
-
-
-def recv_message(socket: zmq.Socket, key: str) -> dict[str, object]:
-    frames = socket.recv_multipart()
-    delimiter = frames.index(b"<IDS|MSG>")
-    message_frames = frames[delimiter + 1 :]
-    signature = message_frames[0]
-    payload_frames = message_frames[1:5]
-    assert sign_message(key, payload_frames) == signature
-    return {
-        "header": json.loads(payload_frames[0]),
-        "parent_header": json.loads(payload_frames[1]),
-        "metadata": json.loads(payload_frames[2]),
-        "content": json.loads(payload_frames[3]),
-    }
-
-
-def recv_iopub_messages_for_parent(
-    socket: zmq.Socket, key: str, parent_msg_id: str, timeout_s: float = 3.0
-) -> list[dict[str, object]]:
-    deadline = time.monotonic() + timeout_s
-    messages = []
-    idle_seen = False
-    while time.monotonic() < deadline and not idle_seen:
-        try:
-            message = recv_message(socket, key)
-        except zmq.error.Again:
-            continue
-        if message["parent_header"].get("msg_id") != parent_msg_id:
-            continue
-        messages.append(message)
-        idle_seen = (
-            message["header"]["msg_type"] == "status"
-            and message["content"].get("execution_state") == "idle"
-        )
-    assert idle_seen, "timed out waiting for parent idle status"
-    return messages
+CELL_IN_RE = re.compile(r"Cell In\[(\d+)\]")
 
 
 @pytest.fixture()
@@ -183,70 +36,6 @@ def zmq_context() -> Iterator[zmq.Context]:
     context = zmq.Context()
     yield context
     context.term()
-
-
-@contextmanager
-def running_kernel(
-    command: KernelCommand,
-    connection_file: Path,
-    zmq_context: zmq.Context,
-) -> Iterator[RunningKernel]:
-    payload = connection_payload()
-    write_connection_file(connection_file, payload)
-    process = subprocess.Popen(
-        [*command.argv, str(connection_file)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    shell = zmq_context.socket(zmq.DEALER)
-    shell.connect(f"tcp://127.0.0.1:{payload['shell_port']}")
-    shell.setsockopt(zmq.RCVTIMEO, 3000)
-
-    control = zmq_context.socket(zmq.DEALER)
-    control.connect(f"tcp://127.0.0.1:{payload['control_port']}")
-    control.setsockopt(zmq.RCVTIMEO, 3000)
-
-    iopub = zmq_context.socket(zmq.SUB)
-    iopub.setsockopt(zmq.SUBSCRIBE, b"")
-    iopub.connect(f"tcp://127.0.0.1:{payload['iopub_port']}")
-    iopub.setsockopt(zmq.RCVTIMEO, 250)
-
-    kernel = RunningKernel(
-        name=command.name,
-        payload=payload,
-        process=process,
-        shell=shell,
-        control=control,
-        iopub=iopub,
-    )
-
-    try:
-        wait_for_ready(kernel)
-        yield kernel
-    finally:
-        shell.close(0)
-        control.close(0)
-        iopub.close(0)
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-
-
-def wait_for_ready(kernel: RunningKernel) -> None:
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        try:
-            reply = kernel.request("kernel_info_request", {})
-        except zmq.error.Again:
-            time.sleep(0.1)
-            continue
-        if reply["header"]["msg_type"] == "kernel_info_reply":
-            return
-    raise AssertionError(f"{kernel.name} did not answer kernel_info_request")
 
 
 def collect_kernel_info(kernel: RunningKernel) -> dict[str, object]:
@@ -339,10 +128,70 @@ def collect_execute_error(
     return kernel.execute("1 / 0")
 
 
+def collect_execute_exception(
+    kernel: RunningKernel, code: str
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    return kernel.execute(code)
+
+
 def collect_execute_syntax_error(
     kernel: RunningKernel,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     return kernel.execute("for i in range(2) print(i)")
+
+
+def collect_execute_user_expressions(
+    kernel: RunningKernel,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    header, frames = client_request(
+        "compat-session",
+        "execute_request",
+        {
+            "code": "value = 21",
+            "silent": False,
+            "store_history": True,
+            "allow_stdin": False,
+            "user_expressions": {
+                "double": "value * 2",
+                "missing": "missing_name",
+                "syntax": "1 +",
+            },
+            "stop_on_error": True,
+        },
+    )
+    signature = sign_message(str(kernel.payload["key"]), frames)
+    kernel.shell.send_multipart([b"<IDS|MSG>", signature, *frames])
+    reply = recv_message(kernel.shell, str(kernel.payload["key"]))
+    published = recv_iopub_messages_for_parent(
+        kernel.iopub, str(kernel.payload["key"]), header["msg_id"]
+    )
+    return reply, published
+
+
+def collect_rich_display_flow(
+    kernel: RunningKernel,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    return kernel.execute(
+        """
+from IPython.display import HTML, JSON, display
+
+display(HTML("<b>hi</b>"))
+display(JSON({"a": 1}))
+"done"
+"""
+    )
+
+
+def collect_stream_flow(
+    kernel: RunningKernel,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    return kernel.execute(
+        """
+import sys
+print("out")
+print("err", file=sys.stderr)
+"""
+    )
 
 
 def collect_interrupt_flow(
@@ -401,6 +250,51 @@ def collect_interrupt_flow(
     )
 
 
+def extract_traceback_cell_block(traceback: list[str]) -> list[str]:
+    cleaned = [strip_ansi(line) for line in traceback]
+    for entry in reversed(cleaned):
+        lines = entry.splitlines()
+        if any("Cell In[" in line for line in lines):
+            return lines
+    raise AssertionError(f"missing Cell In[...] block in traceback: {cleaned!r}")
+
+
+def extract_execution_count_from_cell_line(cell_line: str) -> int:
+    match = CELL_IN_RE.search(cell_line)
+    if match is None:
+        raise AssertionError(f"missing Cell In[...] execution count: {cell_line!r}")
+    return int(match.group(1))
+
+
+def normalize_runtime_traceback_structure(traceback: list[str]) -> dict[str, object]:
+    cleaned = [strip_ansi(line) for line in traceback]
+    assert len(cleaned) >= 4
+    cell_block = extract_traceback_cell_block(traceback)
+    assert len(cell_block) >= 2
+    highlighted_code_line = re.sub(r"^---->\s*\d+\s*", "", cell_block[1]).rstrip()
+    return {
+        "line_count": len(cleaned),
+        "separator": cleaned[0],
+        "headline": cleaned[1],
+        "cell_prefix": cell_block[0],
+        "highlighted_code_line": highlighted_code_line,
+        "in_execution_count": extract_execution_count_from_cell_line(cell_block[0]),
+        "tail": cleaned[-1],
+    }
+
+
+def normalize_syntax_traceback_structure(traceback: list[str]) -> dict[str, object]:
+    cell_block = extract_traceback_cell_block(traceback)
+    assert len(cell_block) >= 4
+    return {
+        "cell_line": cell_block[0],
+        "source_line": cell_block[1].strip(),
+        "caret_line": cell_block[2],
+        "in_execution_count": extract_execution_count_from_cell_line(cell_block[0]),
+        "tail": cell_block[-1],
+    }
+
+
 def normalize_kernel_info(content: dict[str, object]) -> dict[str, object]:
     language_info = dict(content["language_info"])
     help_links = {link["text"]: link["url"] for link in content["help_links"]}
@@ -443,6 +337,30 @@ def normalize_execute_reply(content: dict[str, object]) -> dict[str, object]:
     }
 
 
+def normalize_user_expression_reply(content: dict[str, object]) -> dict[str, object]:
+    user_expressions = {}
+    for name, value in content["user_expressions"].items():
+        entry = {"status": value["status"]}
+        if "data" in value:
+            entry["data"] = value["data"]
+        if "metadata" in value:
+            entry["metadata"] = value["metadata"]
+        if "ename" in value:
+            entry["ename"] = value["ename"]
+        if "evalue" in value:
+            entry["evalue"] = value["evalue"]
+        if "traceback" in value:
+            entry["traceback"] = value["traceback"]
+        user_expressions[name] = entry
+
+    return {
+        "status": content["status"],
+        "execution_count": content["execution_count"],
+        "user_expressions": user_expressions,
+        "payload": content["payload"],
+    }
+
+
 def normalize_execute_error_reply(content: dict[str, object]) -> dict[str, object]:
     return {
         "status": content["status"],
@@ -452,6 +370,18 @@ def normalize_execute_error_reply(content: dict[str, object]) -> dict[str, objec
         "user_expressions": content["user_expressions"],
         "payload": content["payload"],
         "traceback": content["traceback"],
+    }
+
+
+def normalize_exception_reply(content: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": content["status"],
+        "execution_count": content["execution_count"],
+        "ename": content["ename"],
+        "evalue": content["evalue"],
+        "user_expressions": content["user_expressions"],
+        "payload": content["payload"],
+        "traceback_tail": strip_ansi(content["traceback"][-1]),
     }
 
 
@@ -471,6 +401,14 @@ def normalize_syntax_error_content(content: dict[str, object]) -> dict[str, obje
     return {
         "ename": content["ename"],
         "evalue_message": content["evalue"].split(" (", 1)[0],
+        "traceback_tail": strip_ansi(content["traceback"][-1]),
+    }
+
+
+def normalize_exception_content(content: dict[str, object]) -> dict[str, object]:
+    return {
+        "ename": content["ename"],
+        "evalue": content["evalue"],
         "traceback_tail": strip_ansi(content["traceback"][-1]),
     }
 
@@ -504,6 +442,19 @@ def normalize_iopub_messages(
                     },
                 )
             )
+        elif msg_type == "display_data":
+            normalized.append(
+                (
+                    msg_type,
+                    {
+                        "data": dict(content["data"]),
+                        "metadata": dict(content.get("metadata", {})),
+                        "transient": dict(content.get("transient", {})),
+                    },
+                )
+            )
+        elif msg_type == "error":
+            normalized.append((msg_type, normalize_exception_content(content)))
         else:
             normalized.append((msg_type, content))
     return normalized
@@ -533,6 +484,32 @@ def normalize_syntax_error_iopub_messages(
         else:
             normalized.append((msg_type, content))
     return normalized
+
+
+def normalize_stream_iopub_messages(
+    messages: list[dict[str, object]],
+) -> dict[str, object]:
+    stream_text: dict[str, str] = {"stdout": "", "stderr": ""}
+    prefix: list[tuple[str, object]] = []
+    suffix: list[tuple[str, object]] = []
+
+    for message in messages:
+        msg_type = message["header"]["msg_type"]
+        content = message["content"]
+        if msg_type == "stream":
+            stream_text[str(content["name"])] += str(content["text"])
+            continue
+        normalized = normalize_iopub_messages([message])[0]
+        if normalized == ("status", "idle"):
+            suffix.append(normalized)
+        else:
+            prefix.append(normalized)
+
+    return {
+        "prefix": prefix,
+        "streams": stream_text,
+        "suffix": suffix,
+    }
 
 
 def normalize_completion_reply(content: dict[str, object]) -> dict[str, object]:
@@ -681,9 +658,9 @@ def test_execute_result_flow_matches_ipykernel(
     assert normalize_execute_reply(
         rustykernel_reply["content"]
     ) == normalize_execute_reply(ipykernel_reply["content"])
-    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
-        ipykernel_messages
-    )
+    assert normalize_stream_iopub_messages(
+        rustykernel_messages
+    ) == normalize_stream_iopub_messages(ipykernel_messages)
 
 
 def test_history_reply_matches_ipykernel_for_range_query(
@@ -716,9 +693,9 @@ def test_shutdown_request_matches_ipykernel(
         ipykernel_reply, ipykernel_messages = collect_shutdown_flow(ipykernel)
 
     assert rustykernel_reply == ipykernel_reply
-    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
-        ipykernel_messages
-    )
+    assert normalize_stream_iopub_messages(
+        rustykernel_messages
+    ) == normalize_stream_iopub_messages(ipykernel_messages)
 
 
 def test_execute_error_flow_matches_ipykernel(
@@ -737,6 +714,67 @@ def test_execute_error_flow_matches_ipykernel(
     assert normalize_execute_error_reply(
         rustykernel_reply["content"]
     ) == normalize_execute_error_reply(ipykernel_reply["content"])
+    assert rustykernel_reply["content"]["execution_count"] == 1
+    assert ipykernel_reply["content"]["execution_count"] == 1
+    assert normalize_runtime_traceback_structure(
+        rustykernel_reply["content"]["traceback"]
+    ) == normalize_runtime_traceback_structure(ipykernel_reply["content"]["traceback"])
+    assert (
+        normalize_runtime_traceback_structure(
+            rustykernel_reply["content"]["traceback"]
+        )["in_execution_count"]
+        == rustykernel_reply["content"]["execution_count"]
+    )
+    assert (
+        normalize_runtime_traceback_structure(ipykernel_reply["content"]["traceback"])[
+            "in_execution_count"
+        ]
+        == ipykernel_reply["content"]["execution_count"]
+    )
+    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
+        ipykernel_messages
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_ename"),
+    [
+        ("import definitely_missing_module_xyz", "ModuleNotFoundError"),
+        ("assert 1 == 2", "AssertionError"),
+        ("{}[1]", "KeyError"),
+        ("missing_name", "NameError"),
+        ("len(1)", "TypeError"),
+        ('int("abc")', "ValueError"),
+        ("(1).missing_attr", "AttributeError"),
+        ("from math import definitely_missing_name", "ImportError"),
+    ],
+)
+def test_execute_additional_exception_flows_match_ipykernel(
+    tmp_path: Path,
+    zmq_context: zmq.Context,
+    code: str,
+    expected_ename: str,
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_execute_exception(
+            rustykernel, code
+        )
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_execute_exception(ipykernel, code)
+
+    assert rustykernel_reply["content"]["ename"] == expected_ename
+    assert ipykernel_reply["content"]["ename"] == expected_ename
+    assert normalize_exception_reply(
+        rustykernel_reply["content"]
+    ) == normalize_exception_reply(ipykernel_reply["content"])
+    assert normalize_runtime_traceback_structure(
+        rustykernel_reply["content"]["traceback"]
+    ) == normalize_runtime_traceback_structure(ipykernel_reply["content"]["traceback"])
     assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
         ipykernel_messages
     )
@@ -760,9 +798,117 @@ def test_execute_syntax_error_flow_matches_ipykernel_semantics(
     assert normalize_syntax_error_reply(
         rustykernel_reply["content"]
     ) == normalize_syntax_error_reply(ipykernel_reply["content"])
+    assert rustykernel_reply["content"]["execution_count"] == 1
+    assert ipykernel_reply["content"]["execution_count"] == 1
+    assert normalize_syntax_traceback_structure(
+        rustykernel_reply["content"]["traceback"]
+    ) == normalize_syntax_traceback_structure(ipykernel_reply["content"]["traceback"])
+    assert (
+        normalize_syntax_traceback_structure(rustykernel_reply["content"]["traceback"])[
+            "in_execution_count"
+        ]
+        == rustykernel_reply["content"]["execution_count"]
+    )
+    assert (
+        normalize_syntax_traceback_structure(ipykernel_reply["content"]["traceback"])[
+            "in_execution_count"
+        ]
+        == ipykernel_reply["content"]["execution_count"]
+    )
     assert normalize_syntax_error_iopub_messages(
         rustykernel_messages
     ) == normalize_syntax_error_iopub_messages(ipykernel_messages)
+
+
+def test_execute_user_expressions_match_ipykernel(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_execute_user_expressions(
+            rustykernel
+        )
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_execute_user_expressions(
+            ipykernel
+        )
+
+    assert normalize_user_expression_reply(
+        rustykernel_reply["content"]
+    ) == normalize_user_expression_reply(ipykernel_reply["content"])
+    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
+        ipykernel_messages
+    )
+
+
+def test_rich_display_flow_matches_ipykernel(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_rich_display_flow(rustykernel)
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_rich_display_flow(ipykernel)
+
+    assert normalize_execute_reply(
+        rustykernel_reply["content"]
+    ) == normalize_execute_reply(ipykernel_reply["content"])
+    assert normalize_stream_iopub_messages(
+        rustykernel_messages
+    ) == normalize_stream_iopub_messages(ipykernel_messages)
+
+
+def test_stream_flow_matches_ipykernel(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_stream_flow(rustykernel)
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_stream_flow(ipykernel)
+
+    assert normalize_execute_reply(
+        rustykernel_reply["content"]
+    ) == normalize_execute_reply(ipykernel_reply["content"])
+    assert normalize_stream_iopub_messages(
+        rustykernel_messages
+    ) == normalize_stream_iopub_messages(ipykernel_messages)
+
+
+def test_stdin_flow_matches_ipykernel() -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    rustykernel_input_request, rustykernel_reply, rustykernel_messages = run_stdin_flow(
+        rustykernel_command
+    )
+    ipykernel_input_request, ipykernel_reply, ipykernel_messages = run_stdin_flow(
+        ipykernel_command
+    )
+
+    assert {
+        "prompt": rustykernel_input_request["content"]["prompt"],
+        "password": rustykernel_input_request["content"]["password"],
+    } == {
+        "prompt": ipykernel_input_request["content"]["prompt"],
+        "password": ipykernel_input_request["content"]["password"],
+    }
+    assert normalize_execute_reply(
+        rustykernel_reply["content"]
+    ) == normalize_execute_reply(ipykernel_reply["content"])
+    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
+        ipykernel_messages
+    )
 
 
 def test_interrupt_request_matches_ipykernel_semantics(

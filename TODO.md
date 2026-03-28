@@ -74,6 +74,9 @@
   - 当前执行、`user_expressions`、payload、display formatter 已直接走真实 `IPython` shell。
   - `execute_reply` 错误分支已补齐 `user_expressions` / `payload` 基础结构，并新增一条 `ipykernel` runtime error 对照测试。
   - 已新增 `SyntaxError` 与 interrupt 后 `KeyboardInterrupt` 的 `ipykernel` 对照测试。
+  - 已新增 `user_expressions` 与 rich display formatter 的 `ipykernel` 对照测试。
+  - 已新增 `ModuleNotFoundError`、`AssertionError`、`KeyError`、`NameError`、`TypeError`、`ValueError`、`AttributeError`、`ImportError` 的 `ipykernel` 对照测试，并开始细化 traceback 尾行对齐。
+  - 已开始对齐 traceback 结构级特征：runtime error 的分隔线 / 标题行 / `Cell In[...]` 首行 / 高亮代码行，以及 syntax error 的 `Cell In[...]` / 源码行 / caret 对齐行 / 尾行，并补充 `In[n]` 与 `execution_count` 的对照。
   - 异常展示细节、更多异常类型、traceback 格式、与 `ipykernel` 的更细粒度对齐仍未完成。
 - [x] 清理当前 `IPython.display` 伪模块实现，决定是继续 shim 还是替换为真实能力接入。
   - 结论：已切换到真实 `IPython.display` 与真实 shell，对外只保留 `rustykernel` 侧消息桥接和少量兼容补丁。
@@ -87,11 +90,32 @@
 
 目标：补足 `ipykernel` 控制面中高价值但尚未实现的能力。
 
-- [ ] 评估 `debug_request` 接入路径。
-- [ ] 若决定支持调试：
-  - [ ] 引入 `debugpy` 集成方案
-  - [ ] 支持 `debug_request` / `debug_reply`
-  - [ ] 支持 `debug_event`
+设计决策更新：
+
+- [x] 调试架构正式切到 **方案 B**：由 Rust 主进程直接持有并编排 real debugpy DAP 会话。
+- [x] 已新增设计文档：`docs/debugger-redesign-plan.md`
+
+- [x] 评估 `debug_request` 接入路径。
+- [x] 先补最小 `debug_request -> debug_reply` 探测路径。
+  - 当前已支持 control channel 上的调试控制面基础路径：`debugInfo`、`initialize`、`attach`、`disconnect`、`dumpCell`、`setBreakpoints`、`configurationDone`、`evaluate`、`source`、`threads`、`stackTrace`、`scopes`、`variables`、`continue`、`next`、`stepIn`、`stepOut`。
+  - `initialize` / `attach` / `configurationDone` / `setBreakpoints` / `threads` / `stackTrace` / `scopes` / `variables` / `continue` / `next` / `stepIn` / `stepOut` 现已由 Rust `DebugSession` 主导；worker 不再承担这些 live debug 命令的 fallback 代理。
+  - in-process `debugpy` event 现已支持真正实时地转发成 Jupyter `debug_event` IOPub 消息，不再只在“下一个执行边界”批量 drain。
+  - `stopped` / `continued` / `terminated` / `exited` / `initialized` 现已对齐到内核内的调试状态机，`debugInfo.stoppedThreads` 由 Rust 真值输出。
+  - 已执行 `dumpCell` 的代码现在会以对应临时文件路径进入 IPython 编译缓存，使真实 `debugpy` 的 breakpoint / stack / source path 可以对齐。
+  - execute 边界上的 synthetic `stopped` 事件现在会携带最小 stack/scopes/variables snapshot，并由 Rust 缓存后回答 `stackTrace` / `scopes` / `variables`。
+- [x] 若决定支持调试：
+  - [x] 引入 `debugpy` 集成方案
+  - [x] 支持 `debug_request` / `debug_reply`
+  - [x] 支持 `debug_event`
+  - [ ] 实施方案 B / Phase 1：在 Rust 侧引入 `DebugSession`，接管 DAP socket、response correlation 与 event pump。
+    - 当前已完成第一批基础设施：`src/debug_session.rs` 已落地，具备 state cache、pending response slot、event queue、TCP 连接、DAP framing、后台 recv loop，以及通过 worker 暴露的 debugpy endpoint 直接发送 `initialize` / `attach` / `configurationDone` 的能力。
+  - [x] 实施方案 B / Phase 2：让 Python worker 只暴露 debugpy listener endpoint，不再代发 real DAP request。
+    - 当前 worker 的 live debug request 代理已移除，仅保留 `debug_listen`、`dumpCell`、breakpoint bookkeeping 与 synthetic stopped 载荷生成。
+  - [x] 实施方案 B / Phase 3：把 `initialize` / `attach` / `configurationDone` / `setBreakpoints` / `threads` / `stackTrace` / `scopes` / `variables` / `continue` / `next` / `stepIn` / `stepOut` 切到 Rust 直连 DAP 主路径。
+    - 当前这些命令均已由 `kernel.rs`/`DebugSession` 主导；`stackTrace` / `scopes` / `variables` 在 real DAP 不可用时改由 Rust 读取 synthetic snapshot，而非回退到 worker shim。
+  - [x] 实施方案 B / Phase 4：清理 Python 侧 `DebugpyDAPClient` 与重复状态机，只保留 worker-local helper/fallback。
+  - [x] 实施方案 B / Phase 5：补稳定的 real debugpy live stop / continue / step 端到端测试。
+    - 当前已补 Rust runtime e2e 与 Python black-box smoke，覆盖真实 live `continue`、`next`、`stepIn`、`stepOut`，并验证 `threads` / `stackTrace` / `scopes` / `variables` 的基本联动。
 - [x] 评估是否实现 `usage_request`。
   - 当前已在 control channel 实现 `usage_request -> usage_reply`，返回内核进程树和宿主机的基础资源快照，并补了本地 smoke/runtime 测试。
 - [ ] 评估是否支持 subshell：
@@ -99,6 +123,7 @@
   - [ ] `delete_subshell_request`
   - [ ] `list_subshell_request`
 - [ ] 在 `kernel_info_reply.supported_features` 中准确暴露已支持能力。
+  - 当前仍保持 `debugger: false` 与 `supported_features: []`，因为尚未实现真实 debugger / subshell 能力，只补了部分调试控制面壳。
 
 完成标准：
 
@@ -144,8 +169,8 @@
 目标：在能力逐步补齐后，收敛为可维护、可发布、可回归验证的工程状态。
 
 - [ ] 扩大 `ipykernel` 对照测试矩阵。
-  - 当前已新增并分类的对照面包括：`kernel_info_request`、`connect_request`、`execute_request`（success / runtime error / syntax error / interrupt 后 `KeyboardInterrupt`）、`comm_info_request`、`complete_request`、`inspect_request`、`history_request`、`is_complete_request`、`shutdown_request`（`restart: false`）。
-  - 当前仍未补进对照矩阵的高价值面主要是 stdin flow、rich display、`user_expressions` 专项场景，以及更广的 stream / 异常类型覆盖。
+  - 当前已新增并分类的对照面包括：`kernel_info_request`、`connect_request`、`execute_request`（success / `ZeroDivisionError` / `ModuleNotFoundError` / `AssertionError` / `KeyError` / `NameError` / `TypeError` / `ValueError` / `AttributeError` / `ImportError` / syntax error / interrupt 后 `KeyboardInterrupt` / `user_expressions` / rich display / stdout+stderr stream / stdin flow）、`comm_info_request`、`complete_request`、`inspect_request`、`history_request`、`is_complete_request`、`shutdown_request`（`restart: false`）。
+  - 当前仍未补进对照矩阵的高价值面主要是更广的 stream 覆盖，以及更多异常类型 / traceback 细节覆盖。
 - [ ] 统计并跟踪：
   - [x] 已对齐能力
   - [x] 明确不支持能力

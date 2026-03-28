@@ -50,6 +50,18 @@ pub struct WorkerCommEvent {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct WorkerDebugEvent {
+    #[serde(default = "debug_event_msg_type")]
+    pub msg_type: String,
+    #[serde(default)]
+    pub content: Value,
+}
+
+fn debug_event_msg_type() -> String {
+    "debug_event".to_owned()
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ExecutionOutcome {
     pub status: String,
     #[serde(default)]
@@ -60,6 +72,8 @@ pub struct ExecutionOutcome {
     pub displays: Vec<ExecutionDisplayEvent>,
     #[serde(default)]
     pub comm_events: Vec<WorkerCommEvent>,
+    #[serde(default)]
+    pub debug_events: Vec<WorkerDebugEvent>,
     #[serde(default)]
     pub payload: Vec<Value>,
     #[serde(default)]
@@ -122,6 +136,15 @@ pub struct CommOutcome {
     pub registered: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct WorkerDebugListen {
+    pub available: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub port: u16,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind")]
 enum WorkerRequest<'a> {
@@ -180,6 +203,10 @@ enum WorkerRequest<'a> {
     },
     #[serde(rename = "kernel_info")]
     KernelInfo { id: u64 },
+    #[serde(rename = "debug_listen")]
+    DebugListen { id: u64 },
+    #[serde(rename = "debug")]
+    Debug { id: u64, message: &'a Value },
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +226,16 @@ struct WorkerStreamEvent {
     name: String,
     #[serde(default)]
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerDebugProtocolEvent {
+    id: u64,
+    event: String,
+    #[serde(default = "debug_event_msg_type")]
+    msg_type: String,
+    #[serde(default)]
+    content: Value,
 }
 
 #[derive(Deserialize)]
@@ -324,7 +361,7 @@ impl PythonWorker {
         self.interrupt_handle.clone()
     }
 
-    pub fn execute<F, G>(
+    pub fn execute<F, G, H>(
         &mut self,
         code: &str,
         user_expressions: &Value,
@@ -333,10 +370,12 @@ impl PythonWorker {
         store_history: bool,
         mut on_input: F,
         mut on_stream: G,
+        mut on_debug_event: H,
     ) -> Result<ExecutionOutcome, KernelError>
     where
         F: FnMut(&str, bool) -> Result<String, String>,
         G: FnMut(&str, &str) -> Result<(), KernelError>,
+        H: FnMut(&WorkerDebugEvent) -> Result<(), KernelError>,
     {
         let request_id = self.next_id;
         self.next_id += 1;
@@ -426,6 +465,24 @@ impl PythonWorker {
                         }
                         on_stream(&event.name, &event.text)?;
                     }
+                    "debug_event" => {
+                        let event: WorkerDebugProtocolEvent =
+                            serde_json::from_value(raw).map_err(|error| {
+                                KernelError::Worker(format!(
+                                    "failed to decode worker debug event: {error}"
+                                ))
+                            })?;
+                        if event.id != request_id || event.event != "debug_event" {
+                            return Err(KernelError::Worker(format!(
+                                "unexpected worker debug event for request {}",
+                                request_id
+                            )));
+                        }
+                        on_debug_event(&WorkerDebugEvent {
+                            msg_type: event.msg_type,
+                            content: event.content,
+                        })?;
+                    }
                     event_name => {
                         return Err(KernelError::Worker(format!(
                             "unexpected worker event kind {event_name:?} for request {}",
@@ -505,6 +562,26 @@ impl PythonWorker {
         self.next_id += 1;
         let request = WorkerRequest::KernelInfo { id: request_id };
         let response: WorkerEnvelope<WorkerKernelInfo> = self.send_request(&request, request_id)?;
+        Ok(response.payload)
+    }
+
+    pub fn debug_listen(&mut self) -> Result<WorkerDebugListen, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::DebugListen { id: request_id };
+        let response: WorkerEnvelope<WorkerDebugListen> =
+            self.send_request(&request, request_id)?;
+        Ok(response.payload)
+    }
+
+    pub fn debug_request(&mut self, message: &Value) -> Result<Value, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::Debug {
+            id: request_id,
+            message,
+        };
+        let response: WorkerEnvelope<Value> = self.send_request(&request, request_id)?;
         Ok(response.payload)
     }
 
@@ -680,13 +757,31 @@ fn set_cloexec(fd: libc::c_int) -> Result<(), KernelError> {
 
 #[cfg(unix)]
 unsafe fn install_worker_protocol_fd(protocol_write_fd: libc::c_int) -> std::io::Result<()> {
-    if libc::dup2(protocol_write_fd, WORKER_PROTOCOL_FD) == -1 {
+    if unsafe { libc::dup2(protocol_write_fd, WORKER_PROTOCOL_FD) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
 
-    if protocol_write_fd != WORKER_PROTOCOL_FD && libc::close(protocol_write_fd) == -1 {
+    if protocol_write_fd != WORKER_PROTOCOL_FD && unsafe { libc::close(protocol_write_fd) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PythonWorker;
+
+    #[test]
+    fn python_worker_can_report_debug_listener_endpoint() {
+        let mut worker = PythonWorker::start().expect("worker should start");
+        let listen = worker.debug_listen().expect("debug_listen should succeed");
+        if listen.available {
+            assert_eq!(listen.host, "127.0.0.1");
+            assert!(listen.port > 0);
+        } else {
+            assert_eq!(listen.host, "");
+            assert_eq!(listen.port, 0);
+        }
+    }
 }

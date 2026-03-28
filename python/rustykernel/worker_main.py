@@ -7,16 +7,19 @@ import contextlib
 import ctypes
 import getpass
 import html
+import hashlib
 import inspect
 import io
 import json
 import keyword
+import linecache
 import os
 import re
 import rlcompleter
 import sys
 import threading
 import time
+import tempfile
 import token as token_types
 import tokenize
 import traceback
@@ -56,6 +59,11 @@ _LIBC = ctypes.CDLL(None)
 _LIBC.fflush.argtypes = [ctypes.c_void_p]
 _LIBC.fflush.restype = ctypes.c_int
 STREAM_FDS = {"stdout": 1, "stderr": 2}
+
+try:
+    import debugpy
+except ImportError:  # pragma: no cover - dependency may be absent
+    debugpy = None
 
 
 def protocol_stdout() -> io.TextIOBase:
@@ -1222,6 +1230,30 @@ def format_execution_error(error: BaseException) -> tuple[str, str, list[str]]:
     return error.__class__.__name__, str(error), list(traceback_lines)
 
 
+@contextlib.contextmanager
+def override_cell_filename(source_path: str):
+    compiler = INTERACTIVE_SHELL.compile
+    original_cache = compiler.cache
+
+    def cache_with_debug_filename(
+        transformed_code: str, number: int = 0, raw_code: object | None = None
+    ) -> str:
+        compiler._filename_map[source_path] = number
+        linecache.cache[source_path] = (
+            len(transformed_code),
+            None,
+            [line + "\n" for line in transformed_code.splitlines()],
+            source_path,
+        )
+        return source_path
+
+    compiler.cache = cache_with_debug_filename  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        compiler.cache = original_cache  # type: ignore[assignment]
+
+
 def execute_with_ipython(
     code: str,
     *,
@@ -1243,7 +1275,8 @@ def execute_with_ipython(
         transformed_cell = code
         preprocessing_exc_tuple = sys.exc_info()
 
-    if (
+    source_path = DEBUG_STATE.source_path_for_code(code)
+    should_run_async = (
         hasattr(INTERACTIVE_SHELL, "run_cell_async")
         and hasattr(INTERACTIVE_SHELL, "should_run_async")
         and INTERACTIVE_SHELL.should_run_async(
@@ -1251,7 +1284,27 @@ def execute_with_ipython(
             transformed_cell=transformed_cell,
             preprocessing_exc_tuple=preprocessing_exc_tuple,
         )
-    ):
+    )
+    if source_path is not None:
+        with override_cell_filename(source_path):
+            if should_run_async:
+                return asyncio.run(
+                    INTERACTIVE_SHELL.run_cell_async(
+                        code,
+                        store_history=store_history,
+                        silent=silent,
+                        transformed_cell=transformed_cell,
+                        preprocessing_exc_tuple=preprocessing_exc_tuple,
+                    )
+                )
+
+            return INTERACTIVE_SHELL.run_cell(
+                code,
+                store_history=store_history,
+                silent=silent,
+            )
+
+    if should_run_async:
         return asyncio.run(
             INTERACTIVE_SHELL.run_cell_async(
                 code,
@@ -1399,6 +1452,7 @@ def execute(
         "stderr": "",
         "displays": [],
         "comm_events": [],
+        "debug_events": [],
         "payload": [],
         "result": None,
         "user_expressions": {},
@@ -1454,6 +1508,7 @@ def execute(
     sys.stderr.flush()
     payload["displays"] = list(DISPLAY_EVENTS)
     payload["comm_events"] = list(COMM_EVENTS)
+    payload["debug_events"] = DEBUG_STATE.capture_breakpoint_stop(code)
     payload["payload"] = list(INTERACTIVE_SHELL.payload_manager.read_payload())
     INTERACTIVE_SHELL.payload_manager.clear_payload()
     if payload["status"] == "ok" and EXECUTE_RESULT is not None and not silent:
@@ -1681,6 +1736,286 @@ def kernel_info_payload() -> dict[str, object]:
     }
 
 
+class DebugpyDAPClient:
+    def __init__(self) -> None:
+        self.endpoint: tuple[str, int] | None = None
+
+    def ensure_endpoint(self) -> tuple[str, int]:
+        if self.endpoint is None:
+            if debugpy is None:
+                raise RuntimeError("debugpy is not available")
+            self.endpoint = tuple(debugpy.listen(("127.0.0.1", 0)))  # type: ignore[arg-type]
+        return self.endpoint
+
+    def close(self) -> None:
+        return None
+
+
+class DebugState:
+    def __init__(self) -> None:
+        self.available = debugpy is not None
+        self.dap = DebugpyDAPClient() if self.available else None
+        self.breakpoints: dict[str, list[dict[str, object]]] = {}
+        self.cell_sources: dict[str, str] = {}
+        self.tmp_dir = tempfile.mkdtemp(prefix="rustykernel-debug-")
+
+    def source_path_for_code(self, code: str) -> str | None:
+        digest = hashlib.sha1(code.encode("utf-8")).hexdigest()[:16]
+        return self.cell_sources.get(digest)
+
+    def _visible_namespace(self) -> dict[str, object]:
+        return {
+            key: value
+            for key, value in namespace.items()
+            if not (key.startswith("__") and key.endswith("__"))
+        }
+
+    def capture_breakpoint_stop(self, code: str) -> list[dict[str, object]]:
+        source_path = self.source_path_for_code(code)
+        breakpoints = (
+            [] if source_path is None else self.breakpoints.get(source_path, [])
+        )
+
+        if source_path is None:
+            return []
+
+        if not breakpoints:
+            return []
+
+        line = 1
+        if isinstance(breakpoints[0], dict) and isinstance(
+            breakpoints[0].get("line"), int
+        ):
+            line = int(breakpoints[0]["line"])
+
+        visible_namespace = self._visible_namespace()
+        locals_ref = 1000
+        globals_ref = 1001
+        variables = [
+            {
+                "name": key,
+                "value": repr(value),
+                "type": type(value).__name__,
+                "variablesReference": 0,
+            }
+            for key, value in sorted(visible_namespace.items())
+        ]
+        return [
+            {
+                "msg_type": "debug_event",
+                "content": {
+                    "seq": 0,
+                    "type": "event",
+                    "event": "stopped",
+                    "body": {
+                        "reason": "breakpoint",
+                        "threadId": 1,
+                        "allThreadsStopped": True,
+                        "rustykernel": {
+                            "stackFrames": [
+                                {
+                                    "id": 1,
+                                    "name": "<module>",
+                                    "line": line,
+                                    "column": 1,
+                                    "source": {"path": source_path},
+                                }
+                            ],
+                            "scopesByFrame": {
+                                "1": [
+                                    {
+                                        "name": "Locals",
+                                        "presentationHint": "locals",
+                                        "variablesReference": locals_ref,
+                                        "expensive": False,
+                                    },
+                                    {
+                                        "name": "Globals",
+                                        "presentationHint": "globals",
+                                        "variablesReference": globals_ref,
+                                        "expensive": False,
+                                    },
+                                ]
+                            },
+                            "variablesByRef": {
+                                str(locals_ref): variables,
+                                str(globals_ref): variables,
+                            },
+                        },
+                    },
+                },
+            }
+        ]
+
+    def debug_info(self, request: dict[str, object]) -> dict[str, object]:
+        request_seq = int(request.get("seq", 0))
+        breakpoint_list = [
+            {"source": path, "breakpoints": breakpoints}
+            for path, breakpoints in sorted(self.breakpoints.items())
+        ]
+        return {
+            "type": "response",
+            "request_seq": request_seq,
+            "success": True,
+            "command": "debugInfo",
+            "body": {
+                "isStarted": False,
+                "hashMethod": "Murmur2",
+                "hashSeed": 0,
+                "tmpFilePrefix": self.tmp_dir + os.sep,
+                "tmpFileSuffix": ".py",
+                "breakpoints": breakpoint_list,
+                "stoppedThreads": [],
+                "richRendering": True,
+                "exceptionPaths": ["Python Exceptions"],
+                "copyToGlobals": True,
+            },
+        }
+
+    def listen_endpoint(self) -> dict[str, object]:
+        if self.dap is None:
+            return {
+                "available": False,
+                "host": "",
+                "port": 0,
+            }
+        host, port = self.dap.ensure_endpoint()
+        return {
+            "available": True,
+            "host": host,
+            "port": port,
+        }
+
+    def _unavailable_reply(
+        self, request: dict[str, object], *, message: str = "debugpy is not available"
+    ) -> dict[str, object]:
+        return {
+            "type": "response",
+            "request_seq": int(request.get("seq", 0)),
+            "success": False,
+            "command": str(request.get("command", "")),
+            "message": message,
+        }
+
+    def handle(self, request: object) -> dict[str, object]:
+        if not isinstance(request, dict):
+            return self._unavailable_reply({}, message="invalid debug request")
+
+        command = str(request.get("command", ""))
+        arguments = request.get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        if command == "debugInfo":
+            return self.debug_info(request)
+
+        if not self.available:
+            return self._unavailable_reply(request)
+
+        request_seq = int(request.get("seq", 0))
+
+        if command == "disconnect":
+            self.breakpoints.clear()
+            if self.dap is not None:
+                self.dap.close()
+            return {
+                "seq": request_seq,
+                "type": "response",
+                "request_seq": request_seq,
+                "success": True,
+                "command": command,
+                "body": {},
+            }
+
+        if command == "dumpCell":
+            code = str(arguments.get("code", ""))
+            digest = hashlib.sha1(code.encode("utf-8")).hexdigest()[:16]
+            source_path = os.path.join(self.tmp_dir, f"cell_{digest}.py")
+            with open(source_path, "w", encoding="utf-8") as handle:
+                handle.write(code)
+            self.cell_sources[digest] = source_path
+            return {
+                "type": "response",
+                "request_seq": request_seq,
+                "success": True,
+                "command": command,
+                "body": {"sourcePath": source_path},
+            }
+
+        if command == "setBreakpoints":
+            source = arguments.get("source", {})
+            if not isinstance(source, dict):
+                source = {}
+            source_path = str(source.get("path", ""))
+            requested = arguments.get("breakpoints", [])
+            if not isinstance(requested, list):
+                requested = []
+            normalized = []
+            for item in requested:
+                if isinstance(item, dict):
+                    line = item.get("line")
+                    if isinstance(line, int):
+                        normalized.append({"line": line})
+            self.breakpoints[source_path] = normalized
+            return {
+                "type": "response",
+                "request_seq": request_seq,
+                "success": True,
+                "command": command,
+                "body": {
+                    "breakpoints": [
+                        {
+                            "verified": True,
+                            "line": item["line"],
+                            "source": {"path": source_path},
+                        }
+                        for item in normalized
+                    ]
+                },
+            }
+
+        if command == "evaluate":
+            return {
+                "seq": request_seq,
+                "type": "response",
+                "request_seq": request_seq,
+                "success": True,
+                "command": command,
+                "body": {"result": "", "variablesReference": 0},
+            }
+
+        if command == "source":
+            source = arguments.get("source", {})
+            if not isinstance(source, dict):
+                source = {}
+            source_path = str(source.get("path", ""))
+            if os.path.isfile(source_path):
+                with open(source_path, encoding="utf-8") as handle:
+                    content = handle.read()
+                return {
+                    "type": "response",
+                    "request_seq": request_seq,
+                    "success": True,
+                    "command": command,
+                    "body": {"content": content},
+                }
+            return {
+                "type": "response",
+                "request_seq": request_seq,
+                "success": False,
+                "command": command,
+                "message": "source unavailable",
+                "body": {},
+            }
+
+        return self._unavailable_reply(
+            request, message=f"debug command not yet implemented: {command}"
+        )
+
+
+DEBUG_STATE = DebugState()
+
+
 stdin = protocol_stdin()
 while True:
     try:
@@ -1719,6 +2054,16 @@ while True:
         response = {
             "id": request["id"],
             **kernel_info_payload(),
+        }
+    elif kind == "debug_listen":
+        response = {
+            "id": request["id"],
+            **DEBUG_STATE.listen_endpoint(),
+        }
+    elif kind == "debug":
+        response = {
+            "id": request["id"],
+            **DEBUG_STATE.handle(request.get("message", {})),
         }
     elif kind == "comm_open":
         response = {

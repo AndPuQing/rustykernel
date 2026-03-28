@@ -1,3 +1,4 @@
+mod debug_session;
 mod kernel;
 mod protocol;
 mod worker;

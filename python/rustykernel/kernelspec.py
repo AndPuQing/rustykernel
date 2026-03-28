@@ -51,7 +51,7 @@ def get_kernel_dict(
         ),
         "display_name": "Python (rustykernel)",
         "language": "python",
-        "metadata": {"debugger": False},
+        "metadata": {"debugger": True},
         "kernel_protocol_version": info.protocol_version,
     }
 

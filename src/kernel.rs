@@ -7,18 +7,22 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sysinfo::{Pid, System};
 
+use crate::debug_session::{
+    DebugEventEnvelope, DebugListenEndpoint, DebugSession, DebugStateCache,
+};
 use crate::protocol::{
     IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, JupyterMessage, LANGUAGE, MessageHeader,
     MessageSigner, ProtocolError,
 };
 use crate::worker::{
-    CommOutcome, ExecutionOutcome, PythonWorker, WorkerCommEvent, WorkerInterruptHandle,
-    WorkerKernelInfo,
+    CommOutcome, ExecutionOutcome, PythonWorker, WorkerCommEvent, WorkerDebugEvent,
+    WorkerDebugListen, WorkerInterruptHandle, WorkerKernelInfo,
 };
 
 const CHANNEL_POLL_INTERVAL_MS: i64 = 100;
@@ -211,6 +215,8 @@ struct MessageLoopState {
     worker: Arc<Mutex<PythonWorker>>,
     worker_interrupt: WorkerInterruptHandle,
     worker_kernel_info: WorkerKernelInfo,
+    #[allow(dead_code)]
+    debug_session: DebugSession,
     pending_execute: Option<PendingExecute>,
 }
 
@@ -230,6 +236,7 @@ struct ExecuteCompletion {
 
 enum ExecuteUpdate {
     Stream { name: String, text: String },
+    DebugEvent(WorkerDebugEvent),
     Completion(ExecuteCompletion),
 }
 
@@ -281,6 +288,7 @@ impl MessageLoopState {
             worker: Arc::new(Mutex::new(worker)),
             worker_interrupt,
             worker_kernel_info,
+            debug_session: DebugSession::new(),
             pending_execute: None,
         })
     }
@@ -408,12 +416,12 @@ impl MessageLoopState {
             // language_info, so keep them in sync to reduce frontend branching.
             "language": LANGUAGE,
             "language_version": language_version,
-            "debugger": false,
+            "debugger": true,
             "help_links": [{
                 "text": "Python Reference",
                 "url": format!("https://docs.python.org/{language_version_major}.{language_version_minor}"),
             }],
-            "supported_features": [],
+            "supported_features": ["debugger"],
             "language_info": {
                 "name": LANGUAGE,
                 "version": language_version,
@@ -429,6 +437,484 @@ impl MessageLoopState {
         })
     }
 
+    fn debug_reply_content(&mut self, request: &Value) -> Result<Value, KernelError> {
+        let command = request
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments = request
+            .get("arguments")
+            .and_then(Value::as_object)
+            .cloned()
+            .map(Value::Object)
+            .unwrap_or_else(|| json!({}));
+        let request_seq = request.get("seq").and_then(Value::as_i64).unwrap_or(0);
+
+        match command {
+            "initialize" => self.handle_debug_initialize(request_seq, arguments.clone()),
+            "attach" => self.handle_debug_attach(request_seq, arguments.clone()),
+            "configurationDone" => self.handle_debug_configuration_done(request_seq, arguments),
+            "disconnect" => self.handle_debug_disconnect(request_seq, arguments.clone()),
+            "setBreakpoints" => self.handle_debug_set_breakpoints(request_seq, request, arguments),
+            "threads" | "stackTrace" | "scopes" | "variables" | "continue" | "next" | "stepIn"
+            | "stepOut" => self.handle_debug_passthrough(command, request_seq, arguments),
+            "debugInfo" => {
+                let reply = self.lock_worker()?.debug_request(request)?;
+                self.overlay_debug_info(reply)
+            }
+            _ => self.lock_worker()?.debug_request(request),
+        }
+    }
+
+    fn ensure_debug_session_endpoint(&mut self) -> Result<DebugListenEndpoint, KernelError> {
+        if let Some(endpoint) = self.debug_session.endpoint()? {
+            return Ok(endpoint);
+        }
+
+        let WorkerDebugListen {
+            available,
+            host,
+            port,
+        } = self.lock_worker()?.debug_listen()?;
+        if !available {
+            return Err(KernelError::Worker(
+                "debugpy listener is not available in python worker".to_owned(),
+            ));
+        }
+        let endpoint = DebugListenEndpoint { host, port };
+        self.debug_session.set_listening(endpoint.clone())?;
+        Ok(endpoint)
+    }
+
+    fn ensure_debug_session_connected(&mut self) -> Result<DebugListenEndpoint, KernelError> {
+        let endpoint = self.ensure_debug_session_endpoint()?;
+        if !matches!(
+            self.debug_session.transport()?,
+            crate::debug_session::DebugTransport::Connected(_)
+        ) {
+            self.debug_session.connect(endpoint.clone())?;
+        }
+        Ok(endpoint)
+    }
+
+    fn handle_debug_initialize(
+        &mut self,
+        request_seq: i64,
+        arguments: Value,
+    ) -> Result<Value, KernelError> {
+        self.ensure_debug_session_connected()?;
+        let reply =
+            match self
+                .debug_session
+                .send_request("initialize", arguments, Duration::from_secs(5))
+            {
+                Ok(reply) => reply,
+                Err(error) => {
+                    return Ok(self.debug_error_reply(
+                        "initialize",
+                        request_seq,
+                        error.to_string(),
+                    ));
+                }
+            };
+        if let Some(body) = reply.get("body").cloned() {
+            self.debug_session.record_capabilities(body)?;
+        }
+        Ok(self.rewrite_debug_command(reply, "initialize", request_seq))
+    }
+
+    fn handle_debug_attach(
+        &mut self,
+        request_seq: i64,
+        arguments: Value,
+    ) -> Result<Value, KernelError> {
+        let endpoint = self.ensure_debug_session_connected()?;
+        let mut arguments_obj = arguments.as_object().cloned().unwrap_or_default();
+        arguments_obj.insert(
+            "connect".to_owned(),
+            json!({
+                "host": endpoint.host,
+                "port": endpoint.port,
+            }),
+        );
+        arguments_obj
+            .entry("logToFile".to_owned())
+            .or_insert_with(|| json!(false));
+        let reply = match self
+            .debug_session
+            .send_attach_request(Value::Object(arguments_obj), Duration::from_secs(5))
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                return Ok(self.debug_error_reply("attach", request_seq, error.to_string()));
+            }
+        };
+        self.debug_session.update_from_response("attach", &reply)?;
+        Ok(self.rewrite_debug_command(reply, "attach", request_seq))
+    }
+
+    fn handle_debug_configuration_done(
+        &mut self,
+        request_seq: i64,
+        arguments: Value,
+    ) -> Result<Value, KernelError> {
+        self.ensure_debug_session_connected()?;
+        let reply = match self.debug_session.send_request(
+            "configurationDone",
+            arguments,
+            Duration::from_secs(5),
+        ) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return Ok(self.debug_error_reply(
+                    "configurationDone",
+                    request_seq,
+                    error.to_string(),
+                ));
+            }
+        };
+        self.debug_session
+            .update_from_response("configurationDone", &reply)?;
+        Ok(self.rewrite_debug_command(reply, "configurationDone", request_seq))
+    }
+
+    fn handle_debug_disconnect(
+        &mut self,
+        request_seq: i64,
+        arguments: Value,
+    ) -> Result<Value, KernelError> {
+        self.ensure_debug_session_connected()?;
+        let reply = self
+            .debug_session
+            .send_request("disconnect", arguments, Duration::from_secs(5))
+            .map(|reply| self.rewrite_debug_command(reply, "disconnect", request_seq))
+            .or_else(|error| {
+                Ok(self.debug_error_reply("disconnect", request_seq, error.to_string()))
+            });
+        self.debug_session.reset()?;
+        reply
+    }
+
+    fn handle_debug_set_breakpoints(
+        &mut self,
+        request_seq: i64,
+        request: &Value,
+        arguments: Value,
+    ) -> Result<Value, KernelError> {
+        let _ = self.lock_worker()?.debug_request(request)?;
+        let state = self.debug_session.state_snapshot()?;
+        if !state.initialized && !state.attached {
+            return Ok(self.synthesize_set_breakpoints_reply(request_seq, &arguments));
+        }
+        self.ensure_debug_session_connected()?;
+        let reply = match self.debug_session.send_request(
+            "setBreakpoints",
+            arguments,
+            Duration::from_secs(5),
+        ) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return Ok(self.debug_error_reply(
+                    "setBreakpoints",
+                    request_seq,
+                    error.to_string(),
+                ));
+            }
+        };
+        Ok(self.rewrite_debug_command(reply, "setBreakpoints", request_seq))
+    }
+
+    fn synthesize_set_breakpoints_reply(&self, request_seq: i64, arguments: &Value) -> Value {
+        let source_path = arguments
+            .pointer("/source/path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let breakpoints = arguments
+            .get("breakpoints")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                let line = item.get("line").and_then(Value::as_i64)?;
+                Some(json!({
+                    "verified": true,
+                    "line": line,
+                    "source": {"path": source_path},
+                }))
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "type": "response",
+            "request_seq": request_seq,
+            "success": true,
+            "command": "setBreakpoints",
+            "body": {
+                "breakpoints": breakpoints,
+            },
+        })
+    }
+
+    fn handle_debug_passthrough(
+        &mut self,
+        command: &str,
+        request_seq: i64,
+        arguments: Value,
+    ) -> Result<Value, KernelError> {
+        self.ensure_debug_session_connected()?;
+        let reply = match self.debug_session.send_request(
+            command,
+            arguments.clone(),
+            Duration::from_secs(5),
+        ) {
+            Ok(reply) => reply,
+            Err(error) => {
+                return self.synthesize_or_error_reply(
+                    command,
+                    request_seq,
+                    &arguments,
+                    error.to_string(),
+                );
+            }
+        };
+        self.debug_session.update_from_response(command, &reply)?;
+        let reply = self.rewrite_debug_command(reply, command, request_seq);
+        if !reply
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return self.synthesize_or_error_reply(
+                command,
+                request_seq,
+                &arguments,
+                format!("debug session command {command} was not successful"),
+            );
+        }
+        match command {
+            "threads"
+                if reply
+                    .pointer("/body/threads")
+                    .and_then(Value::as_array)
+                    .is_none_or(|threads| threads.is_empty()) =>
+            {
+                self.synthesize_or_error_reply(
+                    command,
+                    request_seq,
+                    &arguments,
+                    "debug session threads returned no threads".to_owned(),
+                )
+            }
+            "stackTrace"
+                if reply
+                    .pointer("/body/stackFrames")
+                    .and_then(Value::as_array)
+                    .is_none_or(|frames| frames.is_empty()) =>
+            {
+                self.synthesize_or_error_reply(
+                    command,
+                    request_seq,
+                    &arguments,
+                    "debug session stackTrace returned no frames".to_owned(),
+                )
+            }
+            "scopes"
+                if reply
+                    .pointer("/body/scopes")
+                    .and_then(Value::as_array)
+                    .is_none_or(|scopes| scopes.is_empty()) =>
+            {
+                self.synthesize_or_error_reply(
+                    command,
+                    request_seq,
+                    &arguments,
+                    "debug session scopes returned no scopes".to_owned(),
+                )
+            }
+            "variables"
+                if reply
+                    .pointer("/body/variables")
+                    .and_then(Value::as_array)
+                    .is_none_or(|variables| variables.is_empty()) =>
+            {
+                self.synthesize_or_error_reply(
+                    command,
+                    request_seq,
+                    &arguments,
+                    "debug session variables returned no values".to_owned(),
+                )
+            }
+            _ => Ok(reply),
+        }
+    }
+
+    fn synthesize_or_error_reply(
+        &self,
+        command: &str,
+        request_seq: i64,
+        arguments: &Value,
+        message: String,
+    ) -> Result<Value, KernelError> {
+        match command {
+            "threads" => self.synthesize_threads_reply(command, request_seq),
+            "stackTrace" => self.synthesize_stack_trace_reply(command, request_seq),
+            "scopes" => {
+                let frame_id = arguments
+                    .get("frameId")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                self.synthesize_scopes_reply(command, request_seq, frame_id)
+            }
+            "variables" => {
+                let variables_reference = arguments
+                    .get("variablesReference")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                self.synthesize_variables_reply(command, request_seq, variables_reference)
+            }
+            _ => Ok(self.debug_error_reply(command, request_seq, message)),
+        }
+    }
+
+    fn debug_error_reply(&self, command: &str, request_seq: i64, message: String) -> Value {
+        json!({
+            "type": "response",
+            "request_seq": request_seq,
+            "success": false,
+            "command": command,
+            "message": message,
+            "body": {},
+        })
+    }
+
+    fn rewrite_debug_command(&self, mut reply: Value, command: &str, request_seq: i64) -> Value {
+        if let Some(object) = reply.as_object_mut() {
+            object.insert("command".to_owned(), json!(command));
+            object.insert("request_seq".to_owned(), json!(request_seq));
+        }
+        reply
+    }
+
+    fn overlay_debug_info(&self, mut reply: Value) -> Result<Value, KernelError> {
+        let DebugStateCache {
+            attached,
+            stopped_threads,
+            ..
+        } = self.debug_session.state_snapshot()?;
+        let rust_is_authoritative = !matches!(
+            self.debug_session.transport()?,
+            crate::debug_session::DebugTransport::Inactive
+        );
+        if let Some(body) = reply.get_mut("body").and_then(Value::as_object_mut) {
+            if rust_is_authoritative {
+                body.insert("isStarted".to_owned(), json!(attached));
+            }
+            body.insert(
+                "stoppedThreads".to_owned(),
+                Value::Array(stopped_threads.into_iter().map(Value::from).collect()),
+            );
+        }
+        Ok(reply)
+    }
+
+    fn synthesize_threads_reply(
+        &self,
+        command: &str,
+        request_seq: i64,
+    ) -> Result<Value, KernelError> {
+        let state = self.debug_session.state_snapshot()?;
+        let mut threads = if !state.last_threads.is_empty() {
+            state.last_threads
+        } else {
+            state
+                .stopped_threads
+                .into_iter()
+                .map(|thread_id| {
+                    json!({
+                        "id": thread_id,
+                        "name": format!("Thread {thread_id}"),
+                    })
+                })
+                .collect()
+        };
+        threads.sort_by_key(|item| item.get("id").and_then(Value::as_i64).unwrap_or_default());
+        Ok(json!({
+            "type": "response",
+            "request_seq": request_seq,
+            "success": true,
+            "command": command,
+            "body": {
+                "threads": threads,
+            },
+        }))
+    }
+
+    fn synthesize_stack_trace_reply(
+        &self,
+        command: &str,
+        request_seq: i64,
+    ) -> Result<Value, KernelError> {
+        let state = self.debug_session.state_snapshot()?;
+        let stack_frames = state.synthetic_stack_frames;
+        Ok(json!({
+            "type": "response",
+            "request_seq": request_seq,
+            "success": true,
+            "command": command,
+            "body": {
+                "stackFrames": stack_frames.clone(),
+                "totalFrames": stack_frames.len(),
+            },
+        }))
+    }
+
+    fn synthesize_scopes_reply(
+        &self,
+        command: &str,
+        request_seq: i64,
+        frame_id: i64,
+    ) -> Result<Value, KernelError> {
+        let state = self.debug_session.state_snapshot()?;
+        let scopes = state
+            .synthetic_scopes
+            .get(&frame_id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({
+            "type": "response",
+            "request_seq": request_seq,
+            "success": true,
+            "command": command,
+            "body": {
+                "scopes": scopes,
+            },
+        }))
+    }
+
+    fn synthesize_variables_reply(
+        &self,
+        command: &str,
+        request_seq: i64,
+        variables_reference: i64,
+    ) -> Result<Value, KernelError> {
+        let state = self.debug_session.state_snapshot()?;
+        let variables = state
+            .synthetic_variables
+            .get(&variables_reference)
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({
+            "type": "response",
+            "request_seq": request_seq,
+            "success": true,
+            "command": command,
+            "body": {
+                "variables": variables,
+            },
+        }))
+    }
+
     fn restart(&mut self) -> Result<(), KernelError> {
         let worker_kernel_info = {
             let mut worker = self.lock_worker()?;
@@ -439,6 +925,7 @@ impl MessageLoopState {
         self.execution_count = 0;
         self.history.start_new_session();
         self.comms.clear();
+        self.debug_session.reset()?;
         Ok(())
     }
 
@@ -1014,10 +1501,15 @@ fn spawn_message_loop_thread(
                 return Ok(());
             }
 
+            drain_debug_session_events(&iopub_socket, &state)?;
+
             while let Ok(update) = execute_rx.try_recv() {
                 match update {
                     ExecuteUpdate::Stream { name, text } => {
                         publish_execute_stream(&iopub_socket, &state, &name, &text)?;
+                    }
+                    ExecuteUpdate::DebugEvent(event) => {
+                        publish_execute_debug_event(&iopub_socket, &state, &event)?;
                     }
                     ExecuteUpdate::Completion(completion) => {
                         finalize_execute_completion(
@@ -1172,6 +1664,18 @@ fn spawn_execute_request(
                                 ))
                             })
                     },
+                    |event| {
+                        execute_tx
+                            .send(ExecuteUpdate::DebugEvent(WorkerDebugEvent {
+                                msg_type: event.msg_type.clone(),
+                                content: event.content.clone(),
+                            }))
+                            .map_err(|error| {
+                                KernelError::Worker(format!(
+                                    "failed to send execute debug event update: {error}"
+                                ))
+                            })
+                    },
                 )
             });
         let _ = execute_tx.send(ExecuteUpdate::Completion(ExecuteCompletion {
@@ -1227,6 +1731,13 @@ fn finalize_execute_completion(
             state,
             request.header_value.clone(),
             &outcome.comm_events,
+        )?;
+        let debug_events = filter_worker_debug_events_for_publish(state, &outcome.debug_events)?;
+        publish_debug_events(
+            iopub_socket,
+            state,
+            request.header_value.clone(),
+            &debug_events,
         )?;
     }
 
@@ -1325,6 +1836,37 @@ fn finalize_execute_completion(
 
     publish_status(iopub_socket, state, request.header_value.clone(), "idle")?;
     Ok(())
+}
+
+fn filter_worker_debug_events_for_publish(
+    state: &MessageLoopState,
+    events: &[WorkerDebugEvent],
+) -> Result<Vec<WorkerDebugEvent>, KernelError> {
+    let rust_session_connected = matches!(
+        state.debug_session.transport()?,
+        crate::debug_session::DebugTransport::Connected(_)
+    );
+    if !rust_session_connected {
+        return Ok(events
+            .iter()
+            .map(|event| WorkerDebugEvent {
+                msg_type: event.msg_type.clone(),
+                content: event.content.clone(),
+            })
+            .collect());
+    }
+
+    Ok(events
+        .iter()
+        .filter(|event| {
+            event.content.get("event") == Some(&json!("stopped"))
+                && event.content.get("seq") == Some(&json!(0))
+        })
+        .map(|event| WorkerDebugEvent {
+            msg_type: event.msg_type.clone(),
+            content: event.content.clone(),
+        })
+        .collect())
 }
 
 fn handle_shell_request(
@@ -1432,6 +1974,7 @@ fn handle_shell_request(
                         }
                         Ok(())
                     },
+                    |_event| Ok(()),
                 )?;
 
                 finalize_execute_completion(
@@ -1674,6 +2217,11 @@ fn handle_control_request(
             )?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
+        "debug_request" => {
+            let content = state.debug_reply_content(&request.content)?;
+            send_reply(reply_socket, state, request, "debug_reply", content)?;
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
         _ => send_unsupported_reply(reply_socket, state, request),
     }
 }
@@ -1900,6 +2448,29 @@ fn publish_comm_events(
     Ok(())
 }
 
+fn publish_debug_events(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    parent_header: Value,
+    events: &[WorkerDebugEvent],
+) -> Result<(), KernelError> {
+    for event in events {
+        if event.content.get("event") == Some(&json!("stopped"))
+            && event.content.get("seq") == Some(&json!(0))
+        {
+            state.debug_session.apply_event_state(&event.content)?;
+        }
+        publish_iopub_message(
+            socket,
+            state,
+            parent_header.clone(),
+            &event.msg_type,
+            event.content.clone(),
+        )?;
+    }
+    Ok(())
+}
+
 fn publish_stream(
     socket: &zmq::Socket,
     state: &MessageLoopState,
@@ -1936,6 +2507,76 @@ fn publish_execute_stream(
     }
 
     publish_stream(socket, state, pending.parent_header.clone(), name, text)
+}
+
+fn publish_execute_debug_event(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    event: &WorkerDebugEvent,
+) -> Result<(), KernelError> {
+    let rust_session_connected = matches!(
+        state.debug_session.transport()?,
+        crate::debug_session::DebugTransport::Connected(_)
+    );
+    if rust_session_connected
+        && !(event.content.get("event") == Some(&json!("stopped"))
+            && event.content.get("seq") == Some(&json!(0)))
+    {
+        return Ok(());
+    }
+    if rust_session_connected
+        || (event.content.get("event") == Some(&json!("stopped"))
+            && event.content.get("seq") == Some(&json!(0)))
+    {
+        state.debug_session.apply_event_state(&event.content)?;
+    }
+
+    let Some(pending) = state.pending_execute.as_ref() else {
+        return Err(KernelError::Worker(
+            "received execute debug event update without a pending execute".to_owned(),
+        ));
+    };
+
+    if pending.silent {
+        return Ok(());
+    }
+
+    publish_iopub_message(
+        socket,
+        state,
+        pending.parent_header.clone(),
+        &event.msg_type,
+        event.content.clone(),
+    )
+}
+
+fn drain_debug_session_events(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+) -> Result<(), KernelError> {
+    while let Some(event) = state.debug_session.try_recv_event()? {
+        publish_debug_session_event(socket, state, event)?;
+    }
+    Ok(())
+}
+
+fn publish_debug_session_event(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    event: DebugEventEnvelope,
+) -> Result<(), KernelError> {
+    let parent_header = if let Some(parent_header) = event.parent_header {
+        parent_header
+    } else if let Some(pending) = state.pending_execute.as_ref() {
+        if pending.silent {
+            return Ok(());
+        }
+        pending.parent_header.clone()
+    } else {
+        return Ok(());
+    };
+
+    publish_iopub_message(socket, state, parent_header, "debug_event", event.event)
 }
 
 fn handle_comm_outcome(
@@ -2220,8 +2861,11 @@ mod tests {
             reply.content.pointer("/help_links/0/text"),
             Some(&json!("Python Reference"))
         );
-        assert_eq!(reply.content.get("debugger"), Some(&json!(false)));
-        assert_eq!(reply.content.get("supported_features"), Some(&json!([])));
+        assert_eq!(reply.content.get("debugger"), Some(&json!(true)));
+        assert_eq!(
+            reply.content.get("supported_features"),
+            Some(&json!(["debugger"]))
+        );
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
         assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
@@ -3316,6 +3960,7 @@ mod tests {
             &runtime.channel_endpoints().control,
             b"control-client",
         );
+        control.set_rcvtimeo(10_000).unwrap();
         let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
 
         let request = client_request("client-session", "usage_request", json!({}));
@@ -3362,6 +4007,761 @@ mod tests {
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
         assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn control_channel_debug_request_returns_minimal_debug_info_reply() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let request = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "debugInfo",
+            }),
+        );
+        send_client_message(&control, &signer, &request);
+
+        let reply = recv_message(&control, &signer);
+        assert_eq!(reply.header.msg_type, "debug_reply");
+        assert_eq!(reply.content.get("type"), Some(&json!("response")));
+        assert_eq!(reply.content.get("request_seq"), Some(&json!(1)));
+        assert_eq!(reply.content.get("success"), Some(&json!(true)));
+        assert_eq!(reply.content.get("command"), Some(&json!("debugInfo")));
+        assert_eq!(
+            reply.content.pointer("/body/isStarted"),
+            Some(&json!(false))
+        );
+        assert_eq!(reply.content.pointer("/body/breakpoints"), Some(&json!([])));
+        assert_eq!(
+            reply.content.pointer("/body/stoppedThreads"),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            reply.content.pointer("/body/tmpFileSuffix"),
+            Some(&json!(".py"))
+        );
+
+        let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn control_channel_debug_request_tracks_initialize_attach_and_breakpoints() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+
+        let initialize = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "initialize",
+                "arguments": {
+                    "clientID": "test-client",
+                    "clientName": "test-client",
+                    "adapterID": "",
+                },
+            }),
+        );
+        send_client_message(&control, &signer, &initialize);
+        let initialize_reply = recv_message(&control, &signer);
+        assert_eq!(initialize_reply.header.msg_type, "debug_reply");
+        assert_eq!(initialize_reply.content.get("success"), Some(&json!(true)));
+        assert_eq!(
+            initialize_reply.content.get("command"),
+            Some(&json!("initialize"))
+        );
+
+        let attach = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "attach",
+                "arguments": {},
+            }),
+        );
+        send_client_message(&control, &signer, &attach);
+        let attach_reply = recv_message(&control, &signer);
+        assert_eq!(attach_reply.content.get("success"), Some(&json!(true)));
+
+        let dump_cell = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 3,
+                "type": "request",
+                "command": "dumpCell",
+                "arguments": {
+                    "code": "def f():\n    return 42\nf()\n",
+                },
+            }),
+        );
+        send_client_message(&control, &signer, &dump_cell);
+        let dump_cell_reply = recv_message(&control, &signer);
+        let source_path = dump_cell_reply
+            .content
+            .pointer("/body/sourcePath")
+            .and_then(Value::as_str)
+            .expect("dumpCell sourcePath missing")
+            .to_owned();
+        assert!(source_path.ends_with(".py"));
+
+        let set_breakpoints = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 4,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {"path": source_path},
+                    "breakpoints": [{"line": 2}],
+                    "sourceModified": false,
+                },
+            }),
+        );
+        send_client_message(&control, &signer, &set_breakpoints);
+        let set_breakpoints_reply = recv_message(&control, &signer);
+        assert_eq!(
+            set_breakpoints_reply
+                .content
+                .pointer("/body/breakpoints/0/verified"),
+            Some(&json!(true))
+        );
+
+        let debug_info = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 5,
+                "type": "request",
+                "command": "debugInfo",
+            }),
+        );
+        send_client_message(&control, &signer, &debug_info);
+        let debug_info_reply = recv_message(&control, &signer);
+        assert_eq!(
+            debug_info_reply.content.pointer("/body/isStarted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            debug_info_reply
+                .content
+                .pointer("/body/breakpoints/0/source"),
+            Some(&json!(source_path))
+        );
+
+        let disconnect = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 6,
+                "type": "request",
+                "command": "disconnect",
+                "arguments": {
+                    "restart": false,
+                    "terminateDebuggee": true,
+                },
+            }),
+        );
+        send_client_message(&control, &signer, &disconnect);
+        let disconnect_reply = recv_message(&control, &signer);
+        assert_eq!(disconnect_reply.content.get("success"), Some(&json!(true)));
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn execute_request_publishes_debug_event_and_exposes_stacktrace_variables() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let code = "x = 1\ny = x + 1\nz = y + 1\n";
+
+        let dump_cell = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "dumpCell",
+                "arguments": {"code": code},
+            }),
+        );
+        send_client_message(&control, &signer, &dump_cell);
+        let dump_cell_reply = recv_message(&control, &signer);
+        let source_path = dump_cell_reply
+            .content
+            .pointer("/body/sourcePath")
+            .and_then(Value::as_str)
+            .expect("dumpCell sourcePath missing")
+            .to_owned();
+
+        for request in [client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 2,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": {
+                    "source": {"path": source_path},
+                    "breakpoints": [{"line": 2}],
+                    "sourceModified": false,
+                },
+            }),
+        )] {
+            send_client_message(&control, &signer, &request);
+            let reply = recv_message(&control, &signer);
+            assert_eq!(reply.header.msg_type, "debug_reply");
+            assert_eq!(
+                reply.content.get("success"),
+                Some(&json!(true)),
+                "unexpected debug reply: {:?}",
+                reply.content
+            );
+        }
+
+        let execute = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": code,
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &execute);
+        let execute_reply = recv_message(&shell, &signer);
+        assert_eq!(execute_reply.header.msg_type, "execute_reply");
+        assert_eq!(execute_reply.content.get("status"), Some(&json!("ok")));
+
+        let published =
+            recv_iopub_messages_until_idle_for_parent(&iopub, &signer, &execute.header.msg_id);
+        assert!(
+            published.iter().any(|message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            }),
+            "expected stopped debug_event, got {:?}",
+            published
+                .iter()
+                .map(|message| (
+                    message.header.msg_type.clone(),
+                    message.content.get("event").cloned(),
+                    message.content.get("execution_state").cloned(),
+                ))
+                .collect::<Vec<_>>()
+        );
+        let stopped_thread_id = published
+            .iter()
+            .find(|message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            })
+            .and_then(|message| message.content.pointer("/body/threadId"))
+            .and_then(Value::as_i64)
+            .expect("stopped debug_event threadId missing");
+
+        let debug_info = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 30,
+                "type": "request",
+                "command": "debugInfo",
+            }),
+        );
+        send_client_message(&control, &signer, &debug_info);
+        let debug_info_reply = recv_message(&control, &signer);
+        assert!(
+            debug_info_reply
+                .content
+                .pointer("/body/stoppedThreads")
+                .and_then(Value::as_array)
+                .is_some_and(|threads| threads
+                    .iter()
+                    .any(|thread| thread == &json!(stopped_thread_id))),
+            "debugInfo should reflect Rust-owned stoppedThreads: {:?}",
+            debug_info_reply.content
+        );
+
+        let stack_trace = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 3,
+                "type": "request",
+                "command": "stackTrace",
+                "arguments": {"threadId": 1},
+            }),
+        );
+        send_client_message(&control, &signer, &stack_trace);
+        let stack_trace_reply = recv_message(&control, &signer);
+        let maybe_frame_id = stack_trace_reply
+            .content
+            .pointer("/body/stackFrames/0/id")
+            .and_then(Value::as_i64);
+        let frame_id = maybe_frame_id.expect("stackTrace frame id missing");
+        assert_eq!(
+            stack_trace_reply
+                .content
+                .pointer("/body/stackFrames/0/source/path"),
+            Some(&json!(source_path))
+        );
+        assert_eq!(
+            stack_trace_reply
+                .content
+                .pointer("/body/stackFrames/0/line"),
+            Some(&json!(2))
+        );
+
+        let scopes = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 4,
+                "type": "request",
+                "command": "scopes",
+                "arguments": {"frameId": frame_id},
+            }),
+        );
+        send_client_message(&control, &signer, &scopes);
+        let scopes_reply = recv_message(&control, &signer);
+        let locals_ref = scopes_reply
+            .content
+            .pointer("/body/scopes/0/variablesReference")
+            .and_then(Value::as_i64)
+            .expect("locals variablesReference missing");
+
+        let variables = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 5,
+                "type": "request",
+                "command": "variables",
+                "arguments": {"variablesReference": locals_ref},
+            }),
+        );
+        send_client_message(&control, &signer, &variables);
+        let variables_reply = recv_message(&control, &signer);
+        assert!(
+            variables_reply
+                .content
+                .pointer("/body/variables")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| {
+                    item.get("name") == Some(&json!("x")) && item.get("value") == Some(&json!("1"))
+                }))
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn live_debugpy_continue_next_stepin_stepout_work_end_to_end() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let code = concat!(
+            "def inner():\n",
+            "    value = 1\n",
+            "    value += 1\n",
+            "    return value\n",
+            "\n",
+            "result = inner()\n",
+            "result += 10\n",
+            "result\n",
+        );
+
+        let dump_cell_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            1,
+            "dumpCell",
+            json!({ "code": code }),
+        );
+        let source_path = dump_cell_reply
+            .content
+            .pointer("/body/sourcePath")
+            .and_then(Value::as_str)
+            .expect("dumpCell sourcePath missing")
+            .to_owned();
+
+        for (seq, command, arguments) in [
+            (
+                2,
+                "initialize",
+                json!({
+                    "clientID": "rustykernel-test",
+                    "clientName": "rustykernel-test",
+                    "adapterID": "python",
+                }),
+            ),
+            (3, "attach", json!({})),
+            (
+                4,
+                "setBreakpoints",
+                json!({
+                    "source": {"path": source_path},
+                    "breakpoints": [{"line": 6}],
+                    "sourceModified": false,
+                }),
+            ),
+            (5, "configurationDone", json!({})),
+        ] {
+            let reply = send_debug_request_and_drain_iopub(
+                &control, &iopub, &signer, seq, command, arguments,
+            );
+            assert_eq!(
+                reply.content.get("success"),
+                Some(&json!(true)),
+                "unexpected {command} reply: {:?}",
+                reply.content
+            );
+        }
+
+        let first_execute = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": code,
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &first_execute);
+        let first_stop = recv_iopub_messages_until_parent_predicate(
+            &iopub,
+            &signer,
+            &first_execute.header.msg_id,
+            |message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            },
+        );
+        let stopped_thread_id = debug_event_thread_id(&first_stop, "stopped");
+        assert_stack_line(
+            &control,
+            &iopub,
+            &signer,
+            6,
+            stopped_thread_id,
+            &source_path,
+            6,
+        );
+
+        let continue_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            7,
+            "continue",
+            json!({ "threadId": stopped_thread_id }),
+        );
+        assert_eq!(continue_reply.content.get("success"), Some(&json!(true)));
+        let first_execute_reply = recv_message(&shell, &signer);
+        assert_eq!(first_execute_reply.header.msg_type, "execute_reply");
+        assert_eq!(
+            first_execute_reply.content.get("status"),
+            Some(&json!("ok"))
+        );
+        let first_execute_tail = recv_iopub_messages_until_idle_for_parent(
+            &iopub,
+            &signer,
+            &first_execute.header.msg_id,
+        );
+        assert!(
+            first_execute_tail
+                .iter()
+                .any(|message| { message.header.msg_type == "execute_result" }),
+            "expected execute_result after continue, got {:?}",
+            first_execute_tail
+                .iter()
+                .map(|message| (
+                    message.header.msg_type.clone(),
+                    message.content.get("event").cloned(),
+                    message.content.get("execution_state").cloned(),
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let second_execute = client_request(
+            "client-session",
+            "execute_request",
+            json!({
+                "code": code,
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &second_execute);
+        let second_breakpoint_stop = recv_iopub_messages_until_parent_predicate(
+            &iopub,
+            &signer,
+            &second_execute.header.msg_id,
+            |message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            },
+        );
+        let breakpoint_thread_id = debug_event_thread_id(&second_breakpoint_stop, "stopped");
+        assert_stack_line(
+            &control,
+            &iopub,
+            &signer,
+            8,
+            breakpoint_thread_id,
+            &source_path,
+            6,
+        );
+        assert_thread_visible(&control, &iopub, &signer, 9, breakpoint_thread_id);
+        let _breakpoint_locals =
+            top_frame_locals(&control, &iopub, &signer, 10, breakpoint_thread_id);
+
+        let step_in_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            11,
+            "stepIn",
+            json!({ "threadId": breakpoint_thread_id }),
+        );
+        assert_eq!(step_in_reply.content.get("success"), Some(&json!(true)));
+        let step_in_stop = recv_iopub_messages_until_parent_predicate(
+            &iopub,
+            &signer,
+            &second_execute.header.msg_id,
+            |message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            },
+        );
+        let step_in_thread_id = debug_event_thread_id(&step_in_stop, "stopped");
+        assert_stack_line(
+            &control,
+            &iopub,
+            &signer,
+            14,
+            step_in_thread_id,
+            &source_path,
+            2,
+        );
+        assert_thread_visible(&control, &iopub, &signer, 15, step_in_thread_id);
+
+        let next_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            16,
+            "next",
+            json!({ "threadId": step_in_thread_id }),
+        );
+        assert_eq!(next_reply.content.get("success"), Some(&json!(true)));
+        let next_stop = recv_iopub_messages_until_parent_predicate(
+            &iopub,
+            &signer,
+            &second_execute.header.msg_id,
+            |message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            },
+        );
+        let next_thread_id = debug_event_thread_id(&next_stop, "stopped");
+        assert_stack_line(
+            &control,
+            &iopub,
+            &signer,
+            17,
+            next_thread_id,
+            &source_path,
+            3,
+        );
+        let next_locals = top_frame_locals(&control, &iopub, &signer, 18, next_thread_id);
+        assert_eq!(next_locals.get("value"), Some(&json!("1")));
+
+        let step_out_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            19,
+            "stepOut",
+            json!({ "threadId": next_thread_id }),
+        );
+        assert_eq!(step_out_reply.content.get("success"), Some(&json!(true)));
+        let step_out_stop = recv_iopub_messages_until_parent_predicate(
+            &iopub,
+            &signer,
+            &second_execute.header.msg_id,
+            |message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!("stopped"))
+            },
+        );
+        let step_out_thread_id = debug_event_thread_id(&step_out_stop, "stopped");
+        assert_stack_line(
+            &control,
+            &iopub,
+            &signer,
+            20,
+            step_out_thread_id,
+            &source_path,
+            6,
+        );
+
+        let second_continue_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            21,
+            "continue",
+            json!({ "threadId": step_out_thread_id }),
+        );
+        assert_eq!(
+            second_continue_reply.content.get("success"),
+            Some(&json!(true))
+        );
+        let second_execute_reply = recv_message(&shell, &signer);
+        assert_eq!(second_execute_reply.header.msg_type, "execute_reply");
+        assert_eq!(
+            second_execute_reply.content.get("status"),
+            Some(&json!("ok"))
+        );
+        let second_execute_tail = recv_iopub_messages_until_idle_for_parent(
+            &iopub,
+            &signer,
+            &second_execute.header.msg_id,
+        );
+        assert!(
+            second_execute_tail
+                .iter()
+                .any(|message| { message.header.msg_type == "execute_result" }),
+            "expected final execute_result, got {:?}",
+            second_execute_tail
+                .iter()
+                .map(|message| (message.header.msg_type.clone(), message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        let disconnect_reply = send_debug_request_and_drain_iopub(
+            &control,
+            &iopub,
+            &signer,
+            22,
+            "disconnect",
+            json!({
+                "restart": false,
+                "terminateDebuggee": true,
+            }),
+        );
+        assert_eq!(disconnect_reply.content.get("success"), Some(&json!(true)));
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn continue_request_without_live_debug_session_returns_error_instead_of_fallback_success() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+
+        let continue_request = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": 1,
+                "type": "request",
+                "command": "continue",
+                "arguments": {"threadId": 1},
+            }),
+        );
+        send_client_message(&control, &signer, &continue_request);
+        let continue_reply = recv_message(&control, &signer);
+        assert_eq!(continue_reply.header.msg_type, "debug_reply");
+        assert_eq!(
+            continue_reply.content.get("command"),
+            Some(&json!("continue"))
+        );
+        assert_eq!(continue_reply.content.get("success"), Some(&json!(false)));
 
         runtime.stop().unwrap();
     }
@@ -3685,6 +5085,17 @@ mod tests {
         signer.decode(frames).unwrap()
     }
 
+    fn try_recv_message(
+        socket: &zmq::Socket,
+        signer: &MessageSigner,
+    ) -> Result<Option<JupyterMessage>, zmq::Error> {
+        match socket.recv_multipart(0) {
+            Ok(frames) => Ok(Some(signer.decode(frames).unwrap())),
+            Err(zmq::Error::EAGAIN) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn recv_iopub_messages_for_parent(
         socket: &zmq::Socket,
         signer: &MessageSigner,
@@ -3699,7 +5110,9 @@ mod tests {
                 Instant::now() < deadline,
                 "timed out waiting for iopub messages"
             );
-            let message = recv_message(socket, signer);
+            let Some(message) = try_recv_message(socket, signer).unwrap() else {
+                continue;
+            };
             let parent = message
                 .parent_header
                 .get("msg_id")
@@ -3711,6 +5124,224 @@ mod tests {
         }
 
         messages
+    }
+
+    fn recv_iopub_messages_until_idle_for_parent(
+        socket: &zmq::Socket,
+        signer: &MessageSigner,
+        parent_msg_id: &str,
+    ) -> Vec<JupyterMessage> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut messages = Vec::new();
+
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for idle iopub message"
+            );
+            let Some(message) = try_recv_message(socket, signer).unwrap() else {
+                continue;
+            };
+            let parent = message
+                .parent_header
+                .get("msg_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if parent != parent_msg_id {
+                continue;
+            }
+
+            let is_idle = message.header.msg_type == "status"
+                && message.content.get("execution_state") == Some(&json!("idle"));
+            messages.push(message);
+            if is_idle {
+                return messages;
+            }
+        }
+    }
+
+    fn recv_iopub_messages_until_parent_predicate(
+        socket: &zmq::Socket,
+        signer: &MessageSigner,
+        parent_msg_id: &str,
+        predicate: impl Fn(&JupyterMessage) -> bool,
+    ) -> Vec<JupyterMessage> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut messages = Vec::new();
+
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for matching iopub message"
+            );
+            let Some(message) = try_recv_message(socket, signer).unwrap() else {
+                continue;
+            };
+            let parent = message
+                .parent_header
+                .get("msg_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if parent != parent_msg_id {
+                continue;
+            }
+
+            let matched = predicate(&message);
+            messages.push(message);
+            if matched {
+                return messages;
+            }
+        }
+    }
+
+    fn send_debug_request_and_drain_iopub(
+        control: &zmq::Socket,
+        iopub: &zmq::Socket,
+        signer: &MessageSigner,
+        seq: i64,
+        command: &str,
+        arguments: Value,
+    ) -> JupyterMessage {
+        let request = client_request(
+            "client-session",
+            "debug_request",
+            json!({
+                "seq": seq,
+                "type": "request",
+                "command": command,
+                "arguments": arguments,
+            }),
+        );
+        send_client_message(control, signer, &request);
+        let reply = recv_message(control, signer);
+        let _ = recv_iopub_messages_until_idle_for_parent(iopub, signer, &request.header.msg_id);
+        reply
+    }
+
+    fn debug_event_thread_id(messages: &[JupyterMessage], event_name: &str) -> i64 {
+        messages
+            .iter()
+            .find(|message| {
+                message.header.msg_type == "debug_event"
+                    && message.content.get("event") == Some(&json!(event_name))
+            })
+            .and_then(|message| message.content.pointer("/body/threadId"))
+            .and_then(Value::as_i64)
+            .unwrap_or(1)
+    }
+
+    fn assert_stack_line(
+        control: &zmq::Socket,
+        iopub: &zmq::Socket,
+        signer: &MessageSigner,
+        seq: i64,
+        thread_id: i64,
+        source_path: &str,
+        expected_line: i64,
+    ) {
+        let stack_trace_reply = send_debug_request_and_drain_iopub(
+            control,
+            iopub,
+            signer,
+            seq,
+            "stackTrace",
+            json!({ "threadId": thread_id }),
+        );
+        assert_eq!(stack_trace_reply.content.get("success"), Some(&json!(true)));
+        assert_eq!(
+            stack_trace_reply
+                .content
+                .pointer("/body/stackFrames/0/source/path"),
+            Some(&json!(source_path))
+        );
+        assert_eq!(
+            stack_trace_reply
+                .content
+                .pointer("/body/stackFrames/0/line"),
+            Some(&json!(expected_line))
+        );
+    }
+
+    fn assert_thread_visible(
+        control: &zmq::Socket,
+        iopub: &zmq::Socket,
+        signer: &MessageSigner,
+        seq: i64,
+        thread_id: i64,
+    ) {
+        let threads_reply =
+            send_debug_request_and_drain_iopub(control, iopub, signer, seq, "threads", json!({}));
+        assert_eq!(threads_reply.content.get("success"), Some(&json!(true)));
+        assert!(
+            threads_reply
+                .content
+                .pointer("/body/threads")
+                .and_then(Value::as_array)
+                .is_some_and(|threads| threads
+                    .iter()
+                    .any(|thread| thread.get("id") == Some(&json!(thread_id)))),
+            "expected thread {thread_id} in threads reply: {:?}",
+            threads_reply.content
+        );
+    }
+
+    fn top_frame_locals(
+        control: &zmq::Socket,
+        iopub: &zmq::Socket,
+        signer: &MessageSigner,
+        seq: i64,
+        thread_id: i64,
+    ) -> serde_json::Map<String, Value> {
+        let stack_trace_reply = send_debug_request_and_drain_iopub(
+            control,
+            iopub,
+            signer,
+            seq,
+            "stackTrace",
+            json!({ "threadId": thread_id }),
+        );
+        let frame_id = stack_trace_reply
+            .content
+            .pointer("/body/stackFrames/0/id")
+            .and_then(Value::as_i64)
+            .expect("stackTrace frame id missing");
+
+        let scopes_reply = send_debug_request_and_drain_iopub(
+            control,
+            iopub,
+            signer,
+            seq + 1,
+            "scopes",
+            json!({ "frameId": frame_id }),
+        );
+        let locals_ref = scopes_reply
+            .content
+            .pointer("/body/scopes/0/variablesReference")
+            .and_then(Value::as_i64)
+            .expect("locals variablesReference missing");
+
+        let variables_reply = send_debug_request_and_drain_iopub(
+            control,
+            iopub,
+            signer,
+            seq + 2,
+            "variables",
+            json!({ "variablesReference": locals_ref }),
+        );
+        variables_reply
+            .content
+            .pointer("/body/variables")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| {
+                Some((
+                    item.get("name")?.as_str()?.to_owned(),
+                    item.get("value")?.clone(),
+                ))
+            })
+            .collect()
     }
 
     fn status_message_states(messages: &[JupyterMessage]) -> Vec<&str> {
