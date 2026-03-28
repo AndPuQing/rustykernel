@@ -5,6 +5,7 @@ import builtins
 import codecs
 import contextlib
 import ctypes
+import dataclasses
 import getpass
 import html
 import hashlib
@@ -14,8 +15,10 @@ import json
 import keyword
 import linecache
 import os
+import queue
 import re
 import rlcompleter
+import signal
 import sys
 import threading
 import time
@@ -33,6 +36,7 @@ from IPython.core.displayhook import DisplayHook as IPythonDisplayHook
 from IPython.core.displaypub import DisplayPublisher as IPythonDisplayPublisher
 from IPython.core.error import UsageError
 from IPython.core.interactiveshell import InteractiveShell
+from IPython.core.payload import PayloadManager as IPythonPayloadManager
 
 try:
     import jedi
@@ -43,27 +47,88 @@ except ImportError:  # pragma: no cover - fallback for minimal environments
 namespace: dict[str, object] = {"__name__": "__main__"}
 completer = rlcompleter.Completer(namespace)
 COMPLETION_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_\.]*)$")
-DISPLAY_EVENTS: list[dict[str, object]] = []
-COMM_EVENTS: list[dict[str, object]] = []
 COMM_TARGETS: dict[str, object] = {}
 COMMS: dict[str, "Comm"] = {}
-PAYLOADS: list[dict[str, object]] = []
-CURRENT_REQUEST_ID: int | None = None
-PENDING_INTERRUPT = False
 AUTOAWAIT_ENABLED = True
 AUTOAWAIT_RUNNER = "asyncio"
-EXECUTE_RESULT: dict[str, object] | None = None
 _PROTOCOL_STREAM: io.TextIOBase | None = None
 _PROTOCOL_LOCK = threading.Lock()
+_REQUEST_CONTEXT = threading.local()
+_INPUT_WAITERS_LOCK = threading.Lock()
+_INPUT_WAITERS: dict[int, queue.Queue[dict[str, object]]] = {}
+_INTERRUPT_FLAGS_LOCK = threading.Lock()
+_INTERRUPT_FLAGS: set[str | None] = set()
 _LIBC = ctypes.CDLL(None)
 _LIBC.fflush.argtypes = [ctypes.c_void_p]
 _LIBC.fflush.restype = ctypes.c_int
+_PY_ASYNC_EXC = ctypes.pythonapi.PyThreadState_SetAsyncExc
+_PY_ASYNC_EXC.argtypes = [ctypes.c_ulong, ctypes.py_object]
+_PY_ASYNC_EXC.restype = ctypes.c_int
 STREAM_FDS = {"stdout": 1, "stderr": 2}
 
 try:
     import debugpy
 except ImportError:  # pragma: no cover - dependency may be absent
     debugpy = None
+
+if hasattr(signal, "SIGUSR1"):
+    signal.signal(signal.SIGUSR1, lambda signum, frame: None)
+
+
+SubshellId = str | None
+
+
+@dataclasses.dataclass
+class RequestContext:
+    request_id: int
+    subshell_id: SubshellId
+    display_events: list[dict[str, object]] = dataclasses.field(default_factory=list)
+    comm_events: list[dict[str, object]] = dataclasses.field(default_factory=list)
+    payloads: list[dict[str, object]] = dataclasses.field(default_factory=list)
+    execute_result: dict[str, object] | None = None
+    input_queue: queue.Queue[dict[str, object]] = dataclasses.field(
+        default_factory=queue.Queue
+    )
+
+
+def current_request_context() -> RequestContext:
+    context = getattr(_REQUEST_CONTEXT, "current", None)
+    if context is None:
+        raise RuntimeError(
+            "request-local state is only available while handling a request"
+        )
+    return context
+
+
+@contextlib.contextmanager
+def bind_request_context(context: RequestContext):
+    previous = getattr(_REQUEST_CONTEXT, "current", None)
+    _REQUEST_CONTEXT.current = context
+    with _INPUT_WAITERS_LOCK:
+        _INPUT_WAITERS[context.request_id] = context.input_queue
+    try:
+        yield context
+    finally:
+        with _INPUT_WAITERS_LOCK:
+            _INPUT_WAITERS.pop(context.request_id, None)
+        if previous is None:
+            if hasattr(_REQUEST_CONTEXT, "current"):
+                delattr(_REQUEST_CONTEXT, "current")
+        else:
+            _REQUEST_CONTEXT.current = previous
+
+
+def interrupt_requested(subshell_id: SubshellId) -> bool:
+    with _INTERRUPT_FLAGS_LOCK:
+        if subshell_id not in _INTERRUPT_FLAGS:
+            return False
+        _INTERRUPT_FLAGS.discard(subshell_id)
+        return True
+
+
+def request_interrupt(subshell_id: SubshellId) -> None:
+    with _INTERRUPT_FLAGS_LOCK:
+        _INTERRUPT_FLAGS.add(subshell_id)
 
 
 def protocol_stdout() -> io.TextIOBase:
@@ -595,11 +660,12 @@ class RustyInteractiveShell:
             "text": str(text),
             "replace": bool(replace),
         }
+        context = current_request_context()
         self.user_ns["_rustykernel_next_input"] = payload
-        PAYLOADS[:] = [
-            item for item in PAYLOADS if item.get("source") != "set_next_input"
+        context.payloads[:] = [
+            item for item in context.payloads if item.get("source") != "set_next_input"
         ]
-        PAYLOADS.append(
+        context.payloads.append(
             {
                 "source": "set_next_input",
                 "text": payload["text"],
@@ -742,8 +808,7 @@ class RustyDisplayHook(IPythonDisplayHook):
         return None
 
     def write_format_data(self, format_dict, md_dict=None) -> None:
-        global EXECUTE_RESULT
-        EXECUTE_RESULT = {
+        current_request_context().execute_result = {
             "data": dict(format_dict),
             "metadata": dict(md_dict or {}),
         }
@@ -760,7 +825,7 @@ class RustyDisplayPublisher(IPythonDisplayPublisher):
         update=False,
         **kwargs,
     ) -> None:
-        DISPLAY_EVENTS.append(
+        current_request_context().display_events.append(
             {
                 "msg_type": "update_display_data" if update else "display_data",
                 "data": dict(data),
@@ -770,12 +835,37 @@ class RustyDisplayPublisher(IPythonDisplayPublisher):
         )
 
     def clear_output(self, wait: bool = False) -> None:
-        DISPLAY_EVENTS.append(
+        current_request_context().display_events.append(
             {
                 "msg_type": "clear_output",
                 "content": {"wait": bool(wait)},
             }
         )
+
+
+class RequestScopedPayloadManager(IPythonPayloadManager):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._fallback_payloads: list[dict[str, object]] = []
+
+    def _payloads(self) -> list[dict[str, object]]:
+        try:
+            return current_request_context().payloads
+        except RuntimeError:
+            return self._fallback_payloads
+
+    def write_payload(self, data: dict[str, object], single: bool = True) -> None:
+        payloads = self._payloads()
+        source = data.get("source")
+        if single and source is not None:
+            payloads[:] = [item for item in payloads if item.get("source") != source]
+        payloads.append(dict(data))
+
+    def read_payload(self) -> list[dict[str, object]]:
+        return list(self._payloads())
+
+    def clear_payload(self) -> None:
+        self._payloads().clear()
 
 
 def build_interactive_shell() -> InteractiveShell:
@@ -793,6 +883,7 @@ def build_interactive_shell() -> InteractiveShell:
     shell.displayhook = displayhook
     shell.display_trap.hook = displayhook
     shell.display_pub = RustyDisplayPublisher(shell=shell)
+    shell.payload_manager = RequestScopedPayloadManager(parent=shell)
     shell.showtraceback = lambda *args, **kwargs: None  # type: ignore[method-assign]
     shell.showsyntaxerror = lambda *args, **kwargs: None  # type: ignore[method-assign]
 
@@ -837,11 +928,13 @@ def publish_display_event(
     content: Optional[dict[str, object]] = None,
 ) -> None:
     if content is not None:
-        DISPLAY_EVENTS.append({"msg_type": msg_type, "content": content})
+        current_request_context().display_events.append(
+            {"msg_type": msg_type, "content": content}
+        )
         return
 
     data, metadata = rich_display_data(value)
-    DISPLAY_EVENTS.append(
+    current_request_context().display_events.append(
         {
             "msg_type": msg_type,
             "data": data,
@@ -866,7 +959,9 @@ def publish_comm_event(
     }
     if target_name is not None:
         content["target_name"] = target_name
-    COMM_EVENTS.append({"msg_type": msg_type, "content": content})
+    current_request_context().comm_events.append(
+        {"msg_type": msg_type, "content": content}
+    )
 
 
 class DisplayHandle:
@@ -970,7 +1065,7 @@ def _publish_display_bundle(
     msg_type: str,
     transient: Optional[dict[str, object]] = None,
 ) -> None:
-    DISPLAY_EVENTS.append(
+    current_request_context().display_events.append(
         {
             "msg_type": msg_type,
             "data": data,
@@ -1042,12 +1137,11 @@ def clear_output(wait: bool = False) -> None:
 
 
 def request_input(prompt: object = "", *, password: bool = False) -> str:
-    if CURRENT_REQUEST_ID is None:
-        raise RuntimeError("input() is only available while handling a request")
+    context = current_request_context()
 
     emit_protocol_message(
         {
-            "id": CURRENT_REQUEST_ID,
+            "id": context.request_id,
             "event": "input_request",
             "prompt": str(prompt),
             "password": password,
@@ -1055,17 +1149,7 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
     )
 
     while True:
-        raw_line = protocol_stdin().readline()
-        if not raw_line:
-            raise EOFError("stdin channel closed")
-        if not raw_line.strip():
-            continue
-
-        response = json.loads(raw_line)
-        if response.get("kind") != "input_reply":
-            continue
-        if int(response.get("id", -1)) != CURRENT_REQUEST_ID:
-            continue
+        response = context.input_queue.get()
 
         error = response.get("error")
         if error:
@@ -1261,9 +1345,9 @@ def execute_with_ipython(
     silent: bool,
     store_history: bool,
 ) -> object:
-    global EXECUTE_RESULT, AUTOAWAIT_ENABLED
+    global AUTOAWAIT_ENABLED
 
-    EXECUTE_RESULT = None
+    current_request_context().execute_result = None
     INTERACTIVE_SHELL.execution_count = max(1, execution_count)
     AUTOAWAIT_ENABLED = bool(getattr(INTERACTIVE_SHELL, "autoawait", True))
     INTERACTIVE_SHELL.payload_manager.clear_payload()
@@ -1358,33 +1442,34 @@ def handle_comm_open(
     data: object = None,
     metadata: object = None,
 ) -> dict[str, object]:
-    COMM_EVENTS.clear()
+    context = RequestContext(request_id=0, subshell_id=None)
 
-    with FdCapture() as capture:
-        callback = COMM_TARGETS.get(target_name)
-        if callback is None:
-            print(f"No such comm target registered: {target_name}", file=sys.stderr)
-            publish_comm_event("comm_close", comm_id=comm_id)
-        else:
-            comm = Comm(comm_id=comm_id, target_name=target_name, primary=False)
-            try:
-                callback(
-                    comm,
-                    comm_message(
-                        comm_id,
-                        target_name=target_name,
-                        data=data,
-                        metadata=metadata,
-                    ),
-                )
-            except BaseException:
-                traceback.print_exc()
-                comm.close()
+    with bind_request_context(context):
+        with FdCapture() as capture:
+            callback = COMM_TARGETS.get(target_name)
+            if callback is None:
+                print(f"No such comm target registered: {target_name}", file=sys.stderr)
+                publish_comm_event("comm_close", comm_id=comm_id)
+            else:
+                comm = Comm(comm_id=comm_id, target_name=target_name, primary=False)
+                try:
+                    callback(
+                        comm,
+                        comm_message(
+                            comm_id,
+                            target_name=target_name,
+                            data=data,
+                            metadata=metadata,
+                        ),
+                    )
+                except BaseException:
+                    traceback.print_exc()
+                    comm.close()
 
     return {
         "stdout": capture.stdout,
         "stderr": capture.stderr,
-        "events": list(COMM_EVENTS),
+        "events": list(context.comm_events),
         "registered": comm_id in COMMS,
     }
 
@@ -1392,22 +1477,23 @@ def handle_comm_open(
 def handle_comm_msg(
     comm_id: str, data: object = None, metadata: object = None
 ) -> dict[str, object]:
-    COMM_EVENTS.clear()
+    context = RequestContext(request_id=0, subshell_id=None)
 
-    with FdCapture() as capture:
-        comm = COMMS.get(comm_id)
-        if comm is None:
-            print(f"No such comm: {comm_id}", file=sys.stderr)
-        else:
-            try:
-                comm.handle_msg(comm_message(comm_id, data=data, metadata=metadata))
-            except BaseException:
-                traceback.print_exc()
+    with bind_request_context(context):
+        with FdCapture() as capture:
+            comm = COMMS.get(comm_id)
+            if comm is None:
+                print(f"No such comm: {comm_id}", file=sys.stderr)
+            else:
+                try:
+                    comm.handle_msg(comm_message(comm_id, data=data, metadata=metadata))
+                except BaseException:
+                    traceback.print_exc()
 
     return {
         "stdout": capture.stdout,
         "stderr": capture.stderr,
-        "events": list(COMM_EVENTS),
+        "events": list(context.comm_events),
         "registered": comm_id in COMMS,
     }
 
@@ -1415,24 +1501,27 @@ def handle_comm_msg(
 def handle_comm_close(
     comm_id: str, data: object = None, metadata: object = None
 ) -> dict[str, object]:
-    COMM_EVENTS.clear()
+    context = RequestContext(request_id=0, subshell_id=None)
 
-    with FdCapture() as capture:
-        comm = COMMS.get(comm_id)
-        if comm is None:
-            print(f"No such comm: {comm_id}", file=sys.stderr)
-        else:
-            comm._closed = True
-            del COMMS[comm_id]
-            try:
-                comm.handle_close(comm_message(comm_id, data=data, metadata=metadata))
-            except BaseException:
-                traceback.print_exc()
+    with bind_request_context(context):
+        with FdCapture() as capture:
+            comm = COMMS.get(comm_id)
+            if comm is None:
+                print(f"No such comm: {comm_id}", file=sys.stderr)
+            else:
+                comm._closed = True
+                del COMMS[comm_id]
+                try:
+                    comm.handle_close(
+                        comm_message(comm_id, data=data, metadata=metadata)
+                    )
+                except BaseException:
+                    traceback.print_exc()
 
     return {
         "stdout": capture.stdout,
         "stderr": capture.stderr,
-        "events": list(COMM_EVENTS),
+        "events": list(context.comm_events),
         "registered": comm_id in COMMS,
     }
 
@@ -1440,6 +1529,7 @@ def handle_comm_close(
 def execute(
     code: str,
     request_id: int,
+    subshell_id: SubshellId,
     user_expressions: object | None = None,
     *,
     execution_count: int,
@@ -1461,41 +1551,37 @@ def execute(
         "traceback": [],
     }
 
-    global CURRENT_REQUEST_ID, PENDING_INTERRUPT
-    DISPLAY_EVENTS.clear()
-    COMM_EVENTS.clear()
-    PAYLOADS.clear()
-    CURRENT_REQUEST_ID = request_id
+    context = RequestContext(request_id=request_id, subshell_id=subshell_id)
 
     try:
-        with FdCapture(request_id=request_id):
-            if PENDING_INTERRUPT:
-                PENDING_INTERRUPT = False
-                raise KeyboardInterrupt()
+        with bind_request_context(context):
+            with FdCapture(request_id=request_id):
+                if interrupt_requested(subshell_id):
+                    raise KeyboardInterrupt()
 
-            result = execute_with_ipython(
-                code,
-                execution_count=execution_count,
-                silent=silent,
-                store_history=store_history,
-            )
-
-            error = (
-                result.error_before_exec
-                if result.error_before_exec is not None
-                else result.error_in_exec
-            )
-            if error is None:
-                payload["user_expressions"] = evaluate_user_expressions(
-                    user_expressions
+                result = execute_with_ipython(
+                    code,
+                    execution_count=execution_count,
+                    silent=silent,
+                    store_history=store_history,
                 )
-            else:
-                payload["status"] = "error"
-                (
-                    payload["ename"],
-                    payload["evalue"],
-                    payload["traceback"],
-                ) = format_execution_error(error)
+
+                error = (
+                    result.error_before_exec
+                    if result.error_before_exec is not None
+                    else result.error_in_exec
+                )
+                if error is None:
+                    payload["user_expressions"] = evaluate_user_expressions(
+                        user_expressions
+                    )
+                else:
+                    payload["status"] = "error"
+                    (
+                        payload["ename"],
+                        payload["evalue"],
+                        payload["traceback"],
+                    ) = format_execution_error(error)
     except BaseException as exc:
         payload["status"] = "error"
         payload["ename"] = exc.__class__.__name__
@@ -1506,14 +1592,13 @@ def execute(
 
     sys.stdout.flush()
     sys.stderr.flush()
-    payload["displays"] = list(DISPLAY_EVENTS)
-    payload["comm_events"] = list(COMM_EVENTS)
+    payload["displays"] = list(context.display_events)
+    payload["comm_events"] = list(context.comm_events)
     payload["debug_events"] = DEBUG_STATE.capture_breakpoint_stop(code)
     payload["payload"] = list(INTERACTIVE_SHELL.payload_manager.read_payload())
     INTERACTIVE_SHELL.payload_manager.clear_payload()
-    if payload["status"] == "ok" and EXECUTE_RESULT is not None and not silent:
-        payload["result"] = EXECUTE_RESULT
-    CURRENT_REQUEST_ID = None
+    if payload["status"] == "ok" and context.execute_result is not None and not silent:
+        payload["result"] = context.execute_result
     return payload
 
 
@@ -1734,6 +1819,130 @@ def kernel_info_payload() -> dict[str, object]:
         "language_version_major": version_info.major,
         "language_version_minor": version_info.minor,
     }
+
+
+class ExecutionLane:
+    def __init__(self, subshell_id: SubshellId) -> None:
+        self.subshell_id = subshell_id
+        self.requests: queue.Queue[dict[str, object] | None] = queue.Queue()
+        self._active_lock = threading.Lock()
+        self._active_request_id: int | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name="main-shell" if subshell_id is None else f"subshell-{subshell_id}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def submit(self, request: dict[str, object]) -> None:
+        self.requests.put(request)
+
+    def stop(self) -> None:
+        self.requests.put(None)
+        self.thread.join()
+
+    def interrupt(self) -> None:
+        ident = self.thread.ident
+        if ident is None:
+            return
+        result = _PY_ASYNC_EXC(ident, KeyboardInterrupt)
+        if result > 1:
+            _PY_ASYNC_EXC(ident, None)
+            raise RuntimeError("failed to deliver KeyboardInterrupt to execution lane")
+        native_id = self.thread.native_id
+        if native_id is not None and hasattr(signal, "SIGUSR1"):
+            try:
+                signal.pthread_kill(native_id, signal.SIGUSR1)
+            except Exception:
+                pass
+
+    def _run(self) -> None:
+        while True:
+            request = self.requests.get()
+            if request is None:
+                return
+            request_id = int(request["id"])
+            with self._active_lock:
+                self._active_request_id = request_id
+            try:
+                response = {
+                    "id": request_id,
+                    **execute(
+                        str(request.get("code", "")),
+                        request_id,
+                        self.subshell_id,
+                        request.get("user_expressions", {}),
+                        execution_count=int(request.get("execution_count", 0)),
+                        silent=bool(request.get("silent", False)),
+                        store_history=bool(request.get("store_history", True)),
+                    ),
+                }
+            except BaseException as exc:
+                response = {
+                    "id": request_id,
+                    "status": "error",
+                    "stdout": "",
+                    "stderr": "",
+                    "displays": [],
+                    "comm_events": [],
+                    "debug_events": [],
+                    "payload": [],
+                    "result": None,
+                    "user_expressions": {},
+                    "ename": exc.__class__.__name__,
+                    "evalue": str(exc),
+                    "traceback": traceback.format_exception(
+                        type(exc), exc, exc.__traceback__
+                    ),
+                }
+            finally:
+                with self._active_lock:
+                    self._active_request_id = None
+            emit_protocol_message(response)
+
+
+class SubshellManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._lanes: dict[SubshellId, ExecutionLane] = {None: ExecutionLane(None)}
+
+    def create_subshell(self) -> str:
+        subshell_id = str(uuid.uuid4())
+        with self._lock:
+            self._lanes[subshell_id] = ExecutionLane(subshell_id)
+        return subshell_id
+
+    def delete_subshell(self, subshell_id: str) -> None:
+        with self._lock:
+            lane = self._lanes.pop(subshell_id)
+        lane.stop()
+
+    def list_subshells(self) -> list[str]:
+        with self._lock:
+            return sorted(
+                str(subshell_id)
+                for subshell_id in self._lanes
+                if subshell_id is not None
+            )
+
+    def submit_execute(
+        self, request: dict[str, object], subshell_id: SubshellId
+    ) -> bool:
+        with self._lock:
+            lane = self._lanes.get(subshell_id)
+        if lane is None:
+            return False
+        lane.submit(request)
+        return True
+
+    def interrupt_all(self) -> None:
+        with self._lock:
+            lanes = list(self._lanes.values())
+        for lane in lanes:
+            try:
+                lane.interrupt()
+            except BaseException:
+                continue
 
 
 class DebugpyDAPClient:
@@ -2014,6 +2223,25 @@ class DebugState:
 
 
 DEBUG_STATE = DebugState()
+SUBSHELL_MANAGER = SubshellManager()
+
+
+def invalid_subshell_reply(request_id: int, subshell_id: object) -> dict[str, object]:
+    return {
+        "id": request_id,
+        "status": "error",
+        "stdout": "",
+        "stderr": "",
+        "displays": [],
+        "comm_events": [],
+        "debug_events": [],
+        "payload": [],
+        "result": None,
+        "user_expressions": {},
+        "ename": "ValueError",
+        "evalue": f"unknown subshell_id: {subshell_id}",
+        "traceback": [],
+    }
 
 
 stdin = protocol_stdin()
@@ -2021,7 +2249,7 @@ while True:
     try:
         raw_line = stdin.readline()
     except KeyboardInterrupt:
-        PENDING_INTERRUPT = True
+        request_interrupt(None)
         continue
 
     if raw_line == "":
@@ -2094,17 +2322,72 @@ while True:
             ),
         }
     elif kind == "input_reply":
+        request_id = int(request.get("id", -1))
+        with _INPUT_WAITERS_LOCK:
+            waiter = _INPUT_WAITERS.get(request_id)
+        if waiter is not None:
+            waiter.put(
+                {
+                    "value": request.get("value", ""),
+                    "error": request.get("error"),
+                }
+            )
         continue
+    elif kind == "create_subshell":
+        response = {
+            "id": request["id"],
+            "status": "ok",
+            "subshell_id": SUBSHELL_MANAGER.create_subshell(),
+        }
+    elif kind == "delete_subshell":
+        subshell_id = str(request.get("subshell_id", ""))
+        try:
+            SUBSHELL_MANAGER.delete_subshell(subshell_id)
+            response = {
+                "id": request["id"],
+                "status": "ok",
+            }
+        except KeyError:
+            response = {
+                "id": request["id"],
+                "status": "error",
+                "evalue": f"unknown subshell_id: {subshell_id}",
+            }
+    elif kind == "list_subshell":
+        response = {
+            "id": request["id"],
+            "status": "ok",
+            "subshell_id": SUBSHELL_MANAGER.list_subshells(),
+        }
+    elif kind == "interrupt":
+        SUBSHELL_MANAGER.interrupt_all()
+        response = {"id": request["id"], "status": "ok"}
+    elif kind == "execute":
+        subshell_id = request.get("subshell_id")
+        normalized_subshell_id = None if subshell_id is None else str(subshell_id)
+        if normalized_subshell_id is None:
+            response = {
+                "id": request["id"],
+                **execute(
+                    request.get("code", ""),
+                    int(request["id"]),
+                    None,
+                    request.get("user_expressions", {}),
+                    execution_count=int(request.get("execution_count", 0)),
+                    silent=bool(request.get("silent", False)),
+                    store_history=bool(request.get("store_history", True)),
+                ),
+            }
+        elif not SUBSHELL_MANAGER.submit_execute(request, normalized_subshell_id):
+            response = invalid_subshell_reply(
+                int(request["id"]), normalized_subshell_id
+            )
+        else:
+            continue
     else:
         response = {
             "id": request["id"],
-            **execute(
-                request.get("code", ""),
-                int(request["id"]),
-                request.get("user_expressions", {}),
-                execution_count=int(request.get("execution_count", 0)),
-                silent=bool(request.get("silent", False)),
-                store_history=bool(request.get("store_history", True)),
-            ),
+            "status": "error",
+            "evalue": f"unknown worker request kind: {kind}",
         }
     emit_protocol_message(response)

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -6,9 +7,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU32, Ordering},
+    mpsc,
 };
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -152,6 +155,8 @@ enum WorkerRequest<'a> {
     Execute {
         id: u64,
         code: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subshell_id: Option<&'a str>,
         user_expressions: &'a Value,
         execution_count: u32,
         silent: bool,
@@ -207,12 +212,16 @@ enum WorkerRequest<'a> {
     DebugListen { id: u64 },
     #[serde(rename = "debug")]
     Debug { id: u64, message: &'a Value },
+    #[serde(rename = "create_subshell")]
+    CreateSubshell { id: u64 },
+    #[serde(rename = "delete_subshell")]
+    DeleteSubshell { id: u64, subshell_id: &'a str },
+    #[serde(rename = "list_subshell")]
+    ListSubshell { id: u64 },
 }
 
 #[derive(Debug, Deserialize)]
 struct WorkerInputRequest {
-    id: u64,
-    event: String,
     #[serde(default)]
     prompt: String,
     #[serde(default)]
@@ -221,8 +230,6 @@ struct WorkerInputRequest {
 
 #[derive(Debug, Deserialize)]
 struct WorkerStreamEvent {
-    id: u64,
-    event: String,
     name: String,
     #[serde(default)]
     text: String,
@@ -230,8 +237,6 @@ struct WorkerStreamEvent {
 
 #[derive(Debug, Deserialize)]
 struct WorkerDebugProtocolEvent {
-    id: u64,
-    event: String,
     #[serde(default = "debug_event_msg_type")]
     msg_type: String,
     #[serde(default)]
@@ -240,9 +245,66 @@ struct WorkerDebugProtocolEvent {
 
 #[derive(Deserialize)]
 struct WorkerEnvelope<T> {
-    id: u64,
     #[serde(flatten)]
     payload: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerStatusReply {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    evalue: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerCreateSubshellReply {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    subshell_id: String,
+    #[serde(default)]
+    evalue: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerListSubshellReply {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    subshell_id: Vec<String>,
+    #[serde(default)]
+    evalue: String,
+}
+
+#[derive(Debug)]
+pub enum WorkerExecutionMessage {
+    InputRequest { prompt: String, password: bool },
+    Stream { name: String, text: String },
+    DebugEvent(WorkerDebugEvent),
+    Completion(ExecutionOutcome),
+    Failure(String),
+}
+
+pub struct WorkerExecutionHandle {
+    pub request_id: u64,
+    rx: mpsc::Receiver<WorkerExecutionMessage>,
+}
+
+impl WorkerExecutionHandle {
+    pub fn recv(&self) -> Result<WorkerExecutionMessage, KernelError> {
+        self.rx.recv().map_err(|error| {
+            KernelError::Worker(format!(
+                "worker execution channel closed unexpectedly for request {}: {error}",
+                self.request_id
+            ))
+        })
+    }
+}
+
+enum PendingRequest {
+    Execute(mpsc::Sender<WorkerExecutionMessage>),
+    Response(mpsc::Sender<Value>),
 }
 
 #[derive(Clone)]
@@ -296,9 +358,10 @@ impl WorkerInterruptHandle {
 pub struct PythonWorker {
     child: Child,
     stdin: ChildStdin,
-    protocol: BufReader<File>,
     next_id: u64,
     interrupt_handle: WorkerInterruptHandle,
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
+    protocol_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl PythonWorker {
@@ -347,13 +410,16 @@ impl PythonWorker {
             KernelError::Worker("python worker stdin pipe was not available".to_owned())
         })?;
         let interrupt_handle = WorkerInterruptHandle::new(child.id());
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let protocol_thread = Some(spawn_protocol_reader(protocol_read, Arc::clone(&pending)));
 
         Ok(Self {
             child,
             stdin,
-            protocol: BufReader::new(File::from(protocol_read)),
             next_id: 1,
             interrupt_handle,
+            pending,
+            protocol_thread,
         })
     }
 
@@ -361,9 +427,47 @@ impl PythonWorker {
         self.interrupt_handle.clone()
     }
 
+    pub fn execute_async(
+        &mut self,
+        code: &str,
+        subshell_id: Option<&str>,
+        user_expressions: &Value,
+        execution_count: u32,
+        silent: bool,
+        store_history: bool,
+    ) -> Result<WorkerExecutionHandle, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let (tx, rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .map_err(|_| KernelError::Worker("worker pending map mutex poisoned".to_owned()))?
+            .insert(request_id, PendingRequest::Execute(tx));
+
+        let request = WorkerRequest::Execute {
+            id: request_id,
+            code,
+            subshell_id,
+            user_expressions,
+            execution_count,
+            silent,
+            store_history,
+        };
+        if let Err(error) = self.write_request(&request) {
+            let _ = self
+                .pending
+                .lock()
+                .map(|mut pending| pending.remove(&request_id));
+            return Err(error);
+        }
+
+        Ok(WorkerExecutionHandle { request_id, rx })
+    }
+
     pub fn execute<F, G, H>(
         &mut self,
         code: &str,
+        subshell_id: Option<&str>,
         user_expressions: &Value,
         execution_count: u32,
         silent: bool,
@@ -377,135 +481,31 @@ impl PythonWorker {
         G: FnMut(&str, &str) -> Result<(), KernelError>,
         H: FnMut(&WorkerDebugEvent) -> Result<(), KernelError>,
     {
-        let request_id = self.next_id;
-        self.next_id += 1;
-        let request = WorkerRequest::Execute {
-            id: request_id,
+        let handle = self.execute_async(
             code,
+            subshell_id,
             user_expressions,
             execution_count,
             silent,
             store_history,
-        };
-
-        let payload = serde_json::to_vec(&request).map_err(|error| {
-            KernelError::Worker(format!("failed to encode worker request: {error}"))
-        })?;
-        self.stdin.write_all(&payload).map_err(KernelError::Io)?;
-        self.stdin
-            .write_all(
-                b"
-",
-            )
-            .map_err(KernelError::Io)?;
-        self.stdin.flush().map_err(KernelError::Io)?;
-
+        )?;
         loop {
-            let mut line = String::new();
-            let bytes_read = self
-                .protocol
-                .read_line(&mut line)
-                .map_err(KernelError::Io)?;
-            if bytes_read == 0 {
-                return Err(KernelError::Worker(self.stderr_summary()));
-            }
-
-            let raw: Value = serde_json::from_str(&line).map_err(|error| {
-                KernelError::Worker(format!("failed to decode worker response: {error}"))
-            })?;
-
-            if raw.get("event").is_some() {
-                match raw.get("event").and_then(Value::as_str).unwrap_or_default() {
-                    "input_request" => {
-                        let event: WorkerInputRequest =
-                            serde_json::from_value(raw).map_err(|error| {
-                                KernelError::Worker(format!(
-                                    "failed to decode worker input request: {error}"
-                                ))
-                            })?;
-                        if event.id != request_id || event.event != "input_request" {
-                            return Err(KernelError::Worker(format!(
-                                "unexpected worker event for request {}",
-                                request_id
-                            )));
+            match handle.recv()? {
+                WorkerExecutionMessage::InputRequest { prompt, password } => {
+                    match on_input(&prompt, password) {
+                        Ok(value) => self.send_input_reply(handle.request_id, value, None)?,
+                        Err(error) => {
+                            self.send_input_reply(handle.request_id, String::new(), Some(error))?
                         }
-                        let response = match on_input(&event.prompt, event.password) {
-                            Ok(value) => WorkerRequest::InputReply {
-                                id: request_id,
-                                value,
-                                error: None,
-                            },
-                            Err(error) => WorkerRequest::InputReply {
-                                id: request_id,
-                                value: String::new(),
-                                error: Some(error),
-                            },
-                        };
-                        let payload = serde_json::to_vec(&response).map_err(|error| {
-                            KernelError::Worker(format!(
-                                "failed to encode worker input reply: {error}"
-                            ))
-                        })?;
-                        self.stdin.write_all(&payload).map_err(KernelError::Io)?;
-                        self.stdin.write_all(b"\n").map_err(KernelError::Io)?;
-                        self.stdin.flush().map_err(KernelError::Io)?;
-                    }
-                    "stream" => {
-                        let event: WorkerStreamEvent =
-                            serde_json::from_value(raw).map_err(|error| {
-                                KernelError::Worker(format!(
-                                    "failed to decode worker stream event: {error}"
-                                ))
-                            })?;
-                        if event.id != request_id || event.event != "stream" {
-                            return Err(KernelError::Worker(format!(
-                                "unexpected worker stream event for request {}",
-                                request_id
-                            )));
-                        }
-                        on_stream(&event.name, &event.text)?;
-                    }
-                    "debug_event" => {
-                        let event: WorkerDebugProtocolEvent =
-                            serde_json::from_value(raw).map_err(|error| {
-                                KernelError::Worker(format!(
-                                    "failed to decode worker debug event: {error}"
-                                ))
-                            })?;
-                        if event.id != request_id || event.event != "debug_event" {
-                            return Err(KernelError::Worker(format!(
-                                "unexpected worker debug event for request {}",
-                                request_id
-                            )));
-                        }
-                        on_debug_event(&WorkerDebugEvent {
-                            msg_type: event.msg_type,
-                            content: event.content,
-                        })?;
-                    }
-                    event_name => {
-                        return Err(KernelError::Worker(format!(
-                            "unexpected worker event kind {event_name:?} for request {}",
-                            request_id
-                        )));
                     }
                 }
-                continue;
+                WorkerExecutionMessage::Stream { name, text } => on_stream(&name, &text)?,
+                WorkerExecutionMessage::DebugEvent(event) => on_debug_event(&event)?,
+                WorkerExecutionMessage::Completion(outcome) => return Ok(outcome),
+                WorkerExecutionMessage::Failure(message) => {
+                    return Err(KernelError::Worker(message));
+                }
             }
-
-            let response: WorkerEnvelope<ExecutionOutcome> =
-                serde_json::from_value(raw).map_err(|error| {
-                    KernelError::Worker(format!("failed to decode worker response: {error}"))
-                })?;
-
-            if response.id != request_id {
-                return Err(KernelError::Worker(format!(
-                    "worker response id mismatch: expected {}, got {}",
-                    request_id, response.id
-                )));
-            }
-
-            return Ok(response.payload);
         }
     }
 
@@ -641,19 +641,59 @@ impl PythonWorker {
         Ok(response.payload)
     }
 
+    pub fn create_subshell(&mut self) -> Result<String, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::CreateSubshell { id: request_id };
+        let response: WorkerEnvelope<WorkerCreateSubshellReply> =
+            self.send_request(&request, request_id)?;
+        if response.payload.status == "ok" {
+            if response.payload.subshell_id.is_empty() {
+                Err(KernelError::Worker(
+                    "worker create_subshell response did not include subshell id".to_owned(),
+                ))
+            } else {
+                Ok(response.payload.subshell_id)
+            }
+        } else {
+            Err(KernelError::Worker(response.payload.evalue))
+        }
+    }
+
+    pub fn delete_subshell(&mut self, subshell_id: &str) -> Result<(), KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::DeleteSubshell {
+            id: request_id,
+            subshell_id,
+        };
+        let response: WorkerEnvelope<WorkerStatusReply> =
+            self.send_request(&request, request_id)?;
+        if response.payload.status == "ok" {
+            Ok(())
+        } else {
+            Err(KernelError::Worker(response.payload.evalue))
+        }
+    }
+
+    pub fn list_subshell(&mut self) -> Result<Vec<String>, KernelError> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        let request = WorkerRequest::ListSubshell { id: request_id };
+        let response: WorkerEnvelope<WorkerListSubshellReply> =
+            self.send_request(&request, request_id)?;
+        if response.payload.status == "ok" {
+            Ok(response.payload.subshell_id)
+        } else {
+            Err(KernelError::Worker(response.payload.evalue))
+        }
+    }
+
     pub fn restart(&mut self) -> Result<(), KernelError> {
         self.terminate();
         let replacement = Self::start()?;
         *self = replacement;
         Ok(())
-    }
-
-    fn stderr_summary(&mut self) -> String {
-        match self.child.try_wait() {
-            Ok(Some(status)) => format!("python worker exited unexpectedly with status {status}"),
-            Ok(None) => "python worker closed its protocol channel unexpectedly".to_owned(),
-            Err(error) => format!("python worker became unavailable: {error}"),
-        }
     }
 
     fn terminate(&mut self) {
@@ -667,6 +707,9 @@ impl PythonWorker {
             }
             Err(_) => {}
         }
+        if let Some(handle) = self.protocol_thread.take() {
+            let _ = handle.join();
+        }
     }
 
     fn send_request<T>(
@@ -677,34 +720,193 @@ impl PythonWorker {
     where
         T: for<'de> Deserialize<'de>,
     {
+        let (tx, rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .map_err(|_| KernelError::Worker("worker pending map mutex poisoned".to_owned()))?
+            .insert(request_id, PendingRequest::Response(tx));
+        if let Err(error) = self.write_request(request) {
+            let _ = self
+                .pending
+                .lock()
+                .map(|mut pending| pending.remove(&request_id));
+            return Err(error);
+        }
+        let raw = rx.recv().map_err(|error| {
+            KernelError::Worker(format!(
+                "worker response channel closed unexpectedly for request {request_id}: {error}"
+            ))
+        })?;
+        let response: WorkerEnvelope<T> = serde_json::from_value(raw).map_err(|error| {
+            KernelError::Worker(format!("failed to decode worker response: {error}"))
+        })?;
+        Ok(response)
+    }
+
+    fn send_input_reply(
+        &mut self,
+        request_id: u64,
+        value: String,
+        error: Option<String>,
+    ) -> Result<(), KernelError> {
+        self.write_request(&WorkerRequest::InputReply {
+            id: request_id,
+            value,
+            error,
+        })
+    }
+
+    fn write_request(&mut self, request: &WorkerRequest<'_>) -> Result<(), KernelError> {
         let payload = serde_json::to_vec(request).map_err(|error| {
             KernelError::Worker(format!("failed to encode worker request: {error}"))
         })?;
         self.stdin.write_all(&payload).map_err(KernelError::Io)?;
         self.stdin.write_all(b"\n").map_err(KernelError::Io)?;
         self.stdin.flush().map_err(KernelError::Io)?;
+        Ok(())
+    }
+}
 
-        let mut line = String::new();
-        let bytes_read = self
-            .protocol
-            .read_line(&mut line)
-            .map_err(KernelError::Io)?;
-        if bytes_read == 0 {
-            return Err(KernelError::Worker(self.stderr_summary()));
+fn spawn_protocol_reader(
+    protocol_read: OwnedFd,
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut protocol = BufReader::new(File::from(protocol_read));
+        loop {
+            let mut line = String::new();
+            let bytes_read = match protocol.read_line(&mut line) {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    fail_all_pending(
+                        &pending,
+                        format!("failed to read worker protocol message: {error}"),
+                    );
+                    return;
+                }
+            };
+            if bytes_read == 0 {
+                fail_all_pending(
+                    &pending,
+                    "python worker closed its protocol channel unexpectedly".to_owned(),
+                );
+                return;
+            }
+
+            let raw: Value = match serde_json::from_str(&line) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    fail_all_pending(
+                        &pending,
+                        format!("failed to decode worker protocol message: {error}"),
+                    );
+                    return;
+                }
+            };
+
+            let Some(request_id) = raw.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let is_event = raw.get("event").is_some();
+            let pending_request = if is_event {
+                pending
+                    .lock()
+                    .ok()
+                    .and_then(|pending_map| match pending_map.get(&request_id) {
+                        Some(PendingRequest::Execute(sender)) => {
+                            Some(PendingRequest::Execute(sender.clone()))
+                        }
+                        _ => None,
+                    })
+            } else {
+                pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending_map| pending_map.remove(&request_id))
+            };
+
+            let Some(pending_request) = pending_request else {
+                continue;
+            };
+
+            match pending_request {
+                PendingRequest::Execute(sender) => {
+                    let message = if let Some(event_name) = raw.get("event").and_then(Value::as_str)
+                    {
+                        match event_name {
+                            "input_request" => {
+                                match serde_json::from_value::<WorkerInputRequest>(raw) {
+                                    Ok(event) => WorkerExecutionMessage::InputRequest {
+                                        prompt: event.prompt,
+                                        password: event.password,
+                                    },
+                                    Err(error) => WorkerExecutionMessage::Failure(format!(
+                                        "failed to decode worker input request: {error}"
+                                    )),
+                                }
+                            }
+                            "stream" => match serde_json::from_value::<WorkerStreamEvent>(raw) {
+                                Ok(event) => WorkerExecutionMessage::Stream {
+                                    name: event.name,
+                                    text: event.text,
+                                },
+                                Err(error) => WorkerExecutionMessage::Failure(format!(
+                                    "failed to decode worker stream event: {error}"
+                                )),
+                            },
+                            "debug_event" => {
+                                match serde_json::from_value::<WorkerDebugProtocolEvent>(raw) {
+                                    Ok(event) => {
+                                        WorkerExecutionMessage::DebugEvent(WorkerDebugEvent {
+                                            msg_type: event.msg_type,
+                                            content: event.content,
+                                        })
+                                    }
+                                    Err(error) => WorkerExecutionMessage::Failure(format!(
+                                        "failed to decode worker debug event: {error}"
+                                    )),
+                                }
+                            }
+                            other => WorkerExecutionMessage::Failure(format!(
+                                "unexpected worker event kind {other:?} for request {request_id}"
+                            )),
+                        }
+                    } else {
+                        match serde_json::from_value::<WorkerEnvelope<ExecutionOutcome>>(raw) {
+                            Ok(response) => WorkerExecutionMessage::Completion(response.payload),
+                            Err(error) => WorkerExecutionMessage::Failure(format!(
+                                "failed to decode worker execution response: {error}"
+                            )),
+                        }
+                    };
+                    let _ = sender.send(message);
+                }
+                PendingRequest::Response(sender) => {
+                    let _ = sender.send(raw);
+                }
+            }
         }
+    })
+}
 
-        let response: WorkerEnvelope<T> = serde_json::from_str(&line).map_err(|error| {
-            KernelError::Worker(format!("failed to decode worker response: {error}"))
-        })?;
-
-        if response.id != request_id {
-            return Err(KernelError::Worker(format!(
-                "worker response id mismatch: expected {}, got {}",
-                request_id, response.id
-            )));
+fn fail_all_pending(pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>, message: String) {
+    let pending_requests = pending
+        .lock()
+        .map(|mut pending_map| pending_map.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (_, request) in pending_requests {
+        match request {
+            PendingRequest::Execute(sender) => {
+                let _ = sender.send(WorkerExecutionMessage::Failure(message.clone()));
+            }
+            PendingRequest::Response(sender) => {
+                let _ = sender.send(serde_json::json!({
+                    "id": 0,
+                    "status": "error",
+                    "evalue": message,
+                }));
+            }
         }
-
-        Ok(response)
     }
 }
 

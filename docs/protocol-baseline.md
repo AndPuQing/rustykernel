@@ -35,6 +35,9 @@ The current `ipykernel` comparison status is tracked separately in
 
 - `kernel_info_request` -> `kernel_info_reply`
 - `connect_request` -> `connect_reply`
+- `create_subshell_request` -> `create_subshell_reply`
+- `delete_subshell_request` -> `delete_subshell_reply`
+- `list_subshell_request` -> `list_subshell_reply`
 - `interrupt_request` -> `interrupt_reply`
 - `debug_request` -> `debug_reply`
 - `usage_request` -> `usage_reply`
@@ -62,6 +65,11 @@ The current `ipykernel` comparison status is tracked separately in
 
 - Python code runs in a long-lived worker process and preserves namespace state
   across normal cell execution.
+- `execute_request` with `header.subshell_id == null` continues to run on the
+  worker's main execution lane.
+- `execute_request` with a known `header.subshell_id` is routed onto that
+  subshell's dedicated execution lane while still sharing the same Python
+  namespace.
 - `stdout` and `stderr` are captured from the Python worker and emitted as
   `stream` messages.
 - Successful expression results are emitted as `execute_result`.
@@ -129,7 +137,8 @@ extensions such as:
 - debugger features still outside the currently covered baseline, such as a
   real `pause` flow and broader lifecycle hardening beyond the now-tested live
   `continue` / `next` / `stepIn` / `stepOut` paths
-- subshell requests
+- deeper subshell lifecycle hardening and coverage beyond the current
+  create/list/delete + routed execute baseline
 
 ## Test Coverage That Anchors This Baseline
 
@@ -142,7 +151,8 @@ extensions such as:
 - `tests/test_protocol_smoke.py` provides a shallow protocol smoke suite for
   `kernel_info_request`, `execute_request`, `complete_request`,
   `inspect_request`, `history_request`, `is_complete_request`,
-  `shutdown_request`, `interrupt_request`, `usage_request`, and `debug_request`.
+  `shutdown_request`, `interrupt_request`, `usage_request`,
+  subshell control requests, subshell execute routing, and `debug_request`.
 - `tests/test_ipykernel_compat.py` currently compares `kernel_info_request`,
   `execute_request`, `comm_info_request`, `complete_request`,
   `inspect_request`, and `is_complete_request` against `ipykernel`. The current

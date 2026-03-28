@@ -32,7 +32,10 @@ def test_kernel_info_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> 
     assert reply["content"]["protocol_version"] == "5.3"
     assert reply["content"]["language"] == "python"
     assert reply["content"]["debugger"] is True
-    assert reply["content"]["supported_features"] == ["debugger"]
+    assert reply["content"]["supported_features"] == [
+        "debugger",
+        "kernel subshells",
+    ]
     assert [message["content"]["execution_state"] for message in published] == [
         "busy",
         "idle",
@@ -67,6 +70,98 @@ def test_usage_request_smoke(tmp_path: Path, zmq_context: zmq.Context) -> None:
         "busy",
         "idle",
     ]
+
+
+def test_subshell_control_requests_smoke(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, create_published = client.request(
+            "control", "create_subshell_request", {}
+        )
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        list_reply, list_published = client.request(
+            "control", "list_subshell_request", {}
+        )
+        delete_reply, delete_published = client.request(
+            "control",
+            "delete_subshell_request",
+            {"subshell_id": subshell_id},
+        )
+        empty_list_reply, empty_list_published = client.request(
+            "control", "list_subshell_request", {}
+        )
+
+    assert create_reply["header"]["msg_type"] == "create_subshell_reply"
+    assert create_reply["content"]["status"] == "ok"
+    assert isinstance(subshell_id, str)
+    assert subshell_id
+    assert list_reply["content"] == {"status": "ok", "subshell_id": [subshell_id]}
+    assert delete_reply["content"] == {"status": "ok"}
+    assert empty_list_reply["content"] == {"status": "ok", "subshell_id": []}
+    for published in (
+        create_published,
+        list_published,
+        delete_published,
+        empty_list_published,
+    ):
+        assert [message["content"]["execution_state"] for message in published] == [
+            "busy",
+            "idle",
+        ]
+
+
+def test_subshell_execute_request_shares_namespace_and_uses_distinct_thread(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        create_reply, _ = client.request("control", "create_subshell_request", {})
+        subshell_id = create_reply["content"]["subshell_id"]
+
+        main_reply, main_published = client.request(
+            "shell",
+            "execute_request",
+            {"code": "import threading\nvalue = 6\nprint(threading.get_ident())"},
+        )
+        main_thread_id = int(
+            next(
+                message["content"]["text"]
+                for message in main_published
+                if message["header"]["msg_type"] == "stream"
+            ).strip()
+        )
+
+        header = send_client_message(
+            client.shell,
+            str(client.payload["key"]),
+            client.session,
+            "execute_request",
+            {
+                "code": "import threading\nprint(value)\nprint(threading.get_ident())",
+                "silent": False,
+                "store_history": True,
+            },
+            header_overrides={"subshell_id": subshell_id},
+        )
+        shell_reply = recv_message(client.shell, str(client.payload["key"]))
+        published = recv_iopub_messages_for_parent(
+            client.iopub,
+            str(client.payload["key"]),
+            str(header["msg_id"]),
+        )
+
+    assert main_reply["content"]["status"] == "ok"
+    assert shell_reply["content"]["status"] == "ok"
+    assert shell_reply["parent_header"]["subshell_id"] == subshell_id
+    stream_text = "".join(
+        message["content"]["text"]
+        for message in published
+        if message["header"]["msg_type"] == "stream"
+    )
+    lines = [line for line in stream_text.splitlines() if line]
+    assert lines[0] == "6"
+    assert int(lines[1]) != main_thread_id
 
 
 def test_debug_request_debug_info_smoke(

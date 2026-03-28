@@ -217,7 +217,7 @@ struct MessageLoopState {
     worker_kernel_info: WorkerKernelInfo,
     #[allow(dead_code)]
     debug_session: DebugSession,
-    pending_execute: Option<PendingExecute>,
+    pending_executes: HashMap<u64, PendingExecute>,
 }
 
 struct PendingExecute {
@@ -235,9 +235,19 @@ struct ExecuteCompletion {
 }
 
 enum ExecuteUpdate {
-    Stream { name: String, text: String },
-    DebugEvent(WorkerDebugEvent),
-    Completion(ExecuteCompletion),
+    Stream {
+        request_id: u64,
+        name: String,
+        text: String,
+    },
+    DebugEvent {
+        request_id: u64,
+        event: WorkerDebugEvent,
+    },
+    Completion {
+        request_id: u64,
+        completion: ExecuteCompletion,
+    },
 }
 
 struct HistoryStore {
@@ -289,7 +299,7 @@ impl MessageLoopState {
             worker_interrupt,
             worker_kernel_info,
             debug_session: DebugSession::new(),
-            pending_execute: None,
+            pending_executes: HashMap::new(),
         })
     }
 
@@ -421,7 +431,7 @@ impl MessageLoopState {
                 "text": "Python Reference",
                 "url": format!("https://docs.python.org/{language_version_major}.{language_version_minor}"),
             }],
-            "supported_features": ["debugger"],
+            "supported_features": ["debugger", "kernel subshells"],
             "language_info": {
                 "name": LANGUAGE,
                 "version": language_version,
@@ -435,6 +445,35 @@ impl MessageLoopState {
                 },
             },
         })
+    }
+
+    fn create_subshell_reply_content(&mut self) -> Result<Value, KernelError> {
+        let subshell_id = self.lock_worker()?.create_subshell()?;
+        Ok(json!({
+            "status": "ok",
+            "subshell_id": subshell_id,
+        }))
+    }
+
+    fn delete_subshell_reply_content(&mut self, request: &Value) -> Result<Value, KernelError> {
+        let subshell_id = request
+            .get("subshell_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                KernelError::Worker("delete_subshell_request missing subshell_id".to_owned())
+            })?;
+        self.lock_worker()?.delete_subshell(subshell_id)?;
+        Ok(json!({
+            "status": "ok",
+        }))
+    }
+
+    fn list_subshell_reply_content(&mut self) -> Result<Value, KernelError> {
+        let subshell_ids = self.lock_worker()?.list_subshell()?;
+        Ok(json!({
+            "status": "ok",
+            "subshell_id": subshell_ids,
+        }))
     }
 
     fn debug_reply_content(&mut self, request: &Value) -> Result<Value, KernelError> {
@@ -925,6 +964,7 @@ impl MessageLoopState {
         self.execution_count = 0;
         self.history.start_new_session();
         self.comms.clear();
+        self.pending_executes.clear();
         self.debug_session.reset()?;
         Ok(())
     }
@@ -934,7 +974,7 @@ impl MessageLoopState {
     }
 
     fn is_executing(&self) -> bool {
-        self.pending_execute.is_some()
+        !self.pending_executes.is_empty()
     }
 }
 
@@ -1505,43 +1545,43 @@ fn spawn_message_loop_thread(
 
             while let Ok(update) = execute_rx.try_recv() {
                 match update {
-                    ExecuteUpdate::Stream { name, text } => {
-                        publish_execute_stream(&iopub_socket, &state, &name, &text)?;
+                    ExecuteUpdate::Stream {
+                        request_id,
+                        name,
+                        text,
+                    } => {
+                        publish_execute_stream(&iopub_socket, &state, request_id, &name, &text)?;
                     }
-                    ExecuteUpdate::DebugEvent(event) => {
-                        publish_execute_debug_event(&iopub_socket, &state, &event)?;
+                    ExecuteUpdate::DebugEvent { request_id, event } => {
+                        publish_execute_debug_event(&iopub_socket, &state, request_id, &event)?;
                     }
-                    ExecuteUpdate::Completion(completion) => {
+                    ExecuteUpdate::Completion {
+                        request_id,
+                        completion,
+                    } => {
                         finalize_execute_completion(
                             &shell_socket,
                             &iopub_socket,
                             &mut state,
+                            request_id,
                             completion,
                         )?;
                     }
                 }
             }
 
-            let poll_shell = !state.is_executing();
-            let mut poll_items = if poll_shell {
-                vec![
-                    shell_socket.as_poll_item(zmq::POLLIN),
-                    control_socket.as_poll_item(zmq::POLLIN),
-                    stdin_socket.as_poll_item(zmq::POLLIN),
-                ]
-            } else {
-                vec![
-                    control_socket.as_poll_item(zmq::POLLIN),
-                    stdin_socket.as_poll_item(zmq::POLLIN),
-                ]
-            };
+            let mut poll_items = vec![
+                shell_socket.as_poll_item(zmq::POLLIN),
+                control_socket.as_poll_item(zmq::POLLIN),
+                stdin_socket.as_poll_item(zmq::POLLIN),
+            ];
             match zmq::poll(&mut poll_items, CHANNEL_POLL_INTERVAL_MS) {
                 Ok(_) => {}
                 Err(zmq::Error::ETERM) if shutdown.is_stopped() => return Ok(()),
                 Err(error) => return Err(KernelError::Zmq(error)),
             }
 
-            if poll_shell && poll_items[0].is_readable() {
+            if poll_items[0].is_readable() {
                 let frames = shell_socket.recv_multipart(0)?;
                 handle_request(
                     ChannelKind::Shell,
@@ -1555,8 +1595,7 @@ fn spawn_message_loop_thread(
                 )?;
             }
 
-            let control_index = if poll_shell { 1 } else { 0 };
-            if poll_items[control_index].is_readable() {
+            if poll_items[1].is_readable() {
                 let frames = control_socket.recv_multipart(0)?;
                 handle_request(
                     ChannelKind::Control,
@@ -1570,8 +1609,7 @@ fn spawn_message_loop_thread(
                 )?;
             }
 
-            let stdin_index = if poll_shell { 2 } else { 1 };
-            if poll_items[stdin_index].is_readable() {
+            if poll_items[2].is_readable() {
                 let frames = stdin_socket.recv_multipart(0)?;
                 handle_stdin_message(frames, &state)?;
             }
@@ -1627,65 +1665,69 @@ fn handle_request(
     Ok(())
 }
 
-fn spawn_execute_request(
+fn spawn_execute_request_from_handle(
     execute_tx: &mpsc::Sender<ExecuteUpdate>,
-    worker: Arc<Mutex<PythonWorker>>,
+    handle: crate::worker::WorkerExecutionHandle,
     request: JupyterMessage,
     code: String,
-    user_expressions: Value,
     execution_count: u32,
     silent: bool,
     store_history: bool,
 ) {
     let execute_tx = execute_tx.clone();
     thread::spawn(move || {
-        let outcome = worker
-            .lock()
-            .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))
-            .and_then(|mut worker| {
-                worker.execute(
-                    &code,
-                    &user_expressions,
-                    execution_count,
-                    silent,
-                    store_history,
-                    |_prompt, _password| {
-                        Err("stdin is not enabled for this execute_request".to_owned())
-                    },
-                    |name, text| {
-                        execute_tx
-                            .send(ExecuteUpdate::Stream {
-                                name: name.to_owned(),
-                                text: text.to_owned(),
-                            })
-                            .map_err(|error| {
-                                KernelError::Worker(format!(
-                                    "failed to send execute stream update: {error}"
-                                ))
-                            })
-                    },
-                    |event| {
-                        execute_tx
-                            .send(ExecuteUpdate::DebugEvent(WorkerDebugEvent {
-                                msg_type: event.msg_type.clone(),
-                                content: event.content.clone(),
-                            }))
-                            .map_err(|error| {
-                                KernelError::Worker(format!(
-                                    "failed to send execute debug event update: {error}"
-                                ))
-                            })
-                    },
-                )
-            });
-        let _ = execute_tx.send(ExecuteUpdate::Completion(ExecuteCompletion {
-            request,
-            code,
-            execution_count,
-            silent,
-            store_history,
-            outcome,
-        }));
+        let request_id = handle.request_id;
+        let outcome = loop {
+            match handle.recv() {
+                Ok(crate::worker::WorkerExecutionMessage::InputRequest { .. }) => {
+                    break Err(KernelError::Worker(
+                        "stdin is not enabled for this execute_request".to_owned(),
+                    ));
+                }
+                Ok(crate::worker::WorkerExecutionMessage::Stream { name, text }) => {
+                    if execute_tx
+                        .send(ExecuteUpdate::Stream {
+                            request_id,
+                            name,
+                            text,
+                        })
+                        .is_err()
+                    {
+                        break Err(KernelError::Worker(
+                            "failed to send execute stream update".to_owned(),
+                        ));
+                    }
+                }
+                Ok(crate::worker::WorkerExecutionMessage::DebugEvent(event)) => {
+                    if execute_tx
+                        .send(ExecuteUpdate::DebugEvent { request_id, event })
+                        .is_err()
+                    {
+                        break Err(KernelError::Worker(
+                            "failed to send execute debug event update".to_owned(),
+                        ));
+                    }
+                }
+                Ok(crate::worker::WorkerExecutionMessage::Completion(outcome)) => {
+                    break Ok(outcome);
+                }
+                Ok(crate::worker::WorkerExecutionMessage::Failure(message)) => {
+                    break Err(KernelError::Worker(message));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = execute_tx.send(ExecuteUpdate::Completion {
+            request_id,
+            completion: ExecuteCompletion {
+                request,
+                code,
+                execution_count,
+                silent,
+                store_history,
+                outcome,
+            },
+        });
     });
 }
 
@@ -1693,9 +1735,10 @@ fn finalize_execute_completion(
     reply_socket: &zmq::Socket,
     iopub_socket: &zmq::Socket,
     state: &mut MessageLoopState,
+    request_id: u64,
     completion: ExecuteCompletion,
 ) -> Result<(), KernelError> {
-    state.pending_execute = None;
+    state.pending_executes.remove(&request_id);
 
     let ExecuteCompletion {
         request,
@@ -1899,6 +1942,7 @@ fn handle_shell_request(
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "execute_request" => {
+            let subshell_id = request.header.subshell_id.clone();
             let silent = request
                 .content
                 .get("silent")
@@ -1946,6 +1990,7 @@ fn handle_shell_request(
                 let parent_header = request.header_value.clone();
                 let outcome = state.lock_worker()?.execute(
                     code,
+                    subshell_id.as_deref(),
                     user_expressions,
                     execution_count,
                     silent,
@@ -1981,6 +2026,7 @@ fn handle_shell_request(
                     reply_socket,
                     iopub_socket,
                     state,
+                    0,
                     ExecuteCompletion {
                         request: request.clone(),
                         code: code_owned,
@@ -1992,16 +2038,30 @@ fn handle_shell_request(
                 )?;
                 Ok(RequestDisposition::Deferred)
             } else {
-                state.pending_execute = Some(PendingExecute {
-                    parent_header: request.header_value.clone(),
-                    silent,
-                });
-                spawn_execute_request(
+                let (worker_request_id, handle) = {
+                    let mut worker = state.lock_worker()?;
+                    let handle = worker.execute_async(
+                        &code_owned,
+                        subshell_id.as_deref(),
+                        user_expressions,
+                        execution_count,
+                        silent,
+                        store_history,
+                    )?;
+                    (handle.request_id, handle)
+                };
+                state.pending_executes.insert(
+                    worker_request_id,
+                    PendingExecute {
+                        parent_header: request.header_value.clone(),
+                        silent,
+                    },
+                );
+                spawn_execute_request_from_handle(
                     execute_tx,
-                    Arc::clone(&state.worker),
+                    handle,
                     request.clone(),
-                    code_owned,
-                    user_expressions.clone(),
+                    code_owned.clone(),
                     execution_count,
                     silent,
                     store_history,
@@ -2220,6 +2280,33 @@ fn handle_control_request(
         "debug_request" => {
             let content = state.debug_reply_content(&request.content)?;
             send_reply(reply_socket, state, request, "debug_reply", content)?;
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
+        "create_subshell_request" => {
+            let content = state.create_subshell_reply_content()?;
+            send_reply(
+                reply_socket,
+                state,
+                request,
+                "create_subshell_reply",
+                content,
+            )?;
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
+        "delete_subshell_request" => {
+            let content = state.delete_subshell_reply_content(&request.content)?;
+            send_reply(
+                reply_socket,
+                state,
+                request,
+                "delete_subshell_reply",
+                content,
+            )?;
+            Ok(RequestDisposition::Complete { should_stop: false })
+        }
+        "list_subshell_request" => {
+            let content = state.list_subshell_reply_content()?;
+            send_reply(reply_socket, state, request, "list_subshell_reply", content)?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         _ => send_unsupported_reply(reply_socket, state, request),
@@ -2493,10 +2580,11 @@ fn publish_stream(
 fn publish_execute_stream(
     socket: &zmq::Socket,
     state: &MessageLoopState,
+    request_id: u64,
     name: &str,
     text: &str,
 ) -> Result<(), KernelError> {
-    let Some(pending) = state.pending_execute.as_ref() else {
+    let Some(pending) = state.pending_executes.get(&request_id) else {
         return Err(KernelError::Worker(
             "received execute stream update without a pending execute".to_owned(),
         ));
@@ -2512,6 +2600,7 @@ fn publish_execute_stream(
 fn publish_execute_debug_event(
     socket: &zmq::Socket,
     state: &MessageLoopState,
+    request_id: u64,
     event: &WorkerDebugEvent,
 ) -> Result<(), KernelError> {
     let rust_session_connected = matches!(
@@ -2531,7 +2620,7 @@ fn publish_execute_debug_event(
         state.debug_session.apply_event_state(&event.content)?;
     }
 
-    let Some(pending) = state.pending_execute.as_ref() else {
+    let Some(pending) = state.pending_executes.get(&request_id) else {
         return Err(KernelError::Worker(
             "received execute debug event update without a pending execute".to_owned(),
         ));
@@ -2567,7 +2656,11 @@ fn publish_debug_session_event(
 ) -> Result<(), KernelError> {
     let parent_header = if let Some(parent_header) = event.parent_header {
         parent_header
-    } else if let Some(pending) = state.pending_execute.as_ref() {
+    } else if let Some(pending) = state
+        .pending_executes
+        .values()
+        .find(|pending| !pending.silent)
+    {
         if pending.silent {
             return Ok(());
         }
@@ -2864,7 +2957,7 @@ mod tests {
         assert_eq!(reply.content.get("debugger"), Some(&json!(true)));
         assert_eq!(
             reply.content.get("supported_features"),
-            Some(&json!(["debugger"]))
+            Some(&json!(["debugger", "kernel subshells"]))
         );
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
@@ -4006,6 +4099,63 @@ mod tests {
         );
 
         let statuses = recv_iopub_messages_for_parent(&iopub, &signer, &request.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn control_channel_subshell_requests_round_trip() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let create_request = client_request("client-session", "create_subshell_request", json!({}));
+        send_client_message(&control, &signer, &create_request);
+        let create_reply = recv_message(&control, &signer);
+        assert_eq!(create_reply.header.msg_type, "create_subshell_reply");
+        let subshell_id = create_reply
+            .content
+            .get("subshell_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        let statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &create_request.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        let list_request = client_request("client-session", "list_subshell_request", json!({}));
+        send_client_message(&control, &signer, &list_request);
+        let list_reply = recv_message(&control, &signer);
+        assert_eq!(list_reply.header.msg_type, "list_subshell_reply");
+        assert_eq!(
+            list_reply.content.get("subshell_id"),
+            Some(&json!([subshell_id.clone()]))
+        );
+        let statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &list_request.header.msg_id, 2);
+        assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
+
+        let delete_request = client_request(
+            "client-session",
+            "delete_subshell_request",
+            json!({"subshell_id": subshell_id}),
+        );
+        send_client_message(&control, &signer, &delete_request);
+        let delete_reply = recv_message(&control, &signer);
+        assert_eq!(delete_reply.header.msg_type, "delete_subshell_reply");
+        assert_eq!(delete_reply.content.get("status"), Some(&json!("ok")));
+        let statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &delete_request.header.msg_id, 2);
         assert_eq!(status_message_states(&statuses), vec!["busy", "idle"]);
 
         runtime.stop().unwrap();

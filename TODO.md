@@ -107,7 +107,7 @@
   - [x] 引入 `debugpy` 集成方案
   - [x] 支持 `debug_request` / `debug_reply`
   - [x] 支持 `debug_event`
-  - [ ] 实施方案 B / Phase 1：在 Rust 侧引入 `DebugSession`，接管 DAP socket、response correlation 与 event pump。
+  - [x] 实施方案 B / Phase 1：在 Rust 侧引入 `DebugSession`，接管 DAP socket、response correlation 与 event pump。
     - 当前已完成第一批基础设施：`src/debug_session.rs` 已落地，具备 state cache、pending response slot、event queue、TCP 连接、DAP framing、后台 recv loop，以及通过 worker 暴露的 debugpy endpoint 直接发送 `initialize` / `attach` / `configurationDone` 的能力。
   - [x] 实施方案 B / Phase 2：让 Python worker 只暴露 debugpy listener endpoint，不再代发 real DAP request。
     - 当前 worker 的 live debug request 代理已移除，仅保留 `debug_listen`、`dumpCell`、breakpoint bookkeeping 与 synthetic stopped 载荷生成。
@@ -118,12 +118,13 @@
     - 当前已补 Rust runtime e2e 与 Python black-box smoke，覆盖真实 live `continue`、`next`、`stepIn`、`stepOut`，并验证 `threads` / `stackTrace` / `scopes` / `variables` 的基本联动。
 - [x] 评估是否实现 `usage_request`。
   - 当前已在 control channel 实现 `usage_request -> usage_reply`，返回内核进程树和宿主机的基础资源快照，并补了本地 smoke/runtime 测试。
-- [ ] 评估是否支持 subshell：
-  - [ ] `create_subshell_request`
-  - [ ] `delete_subshell_request`
-  - [ ] `list_subshell_request`
-- [ ] 在 `kernel_info_reply.supported_features` 中准确暴露已支持能力。
-  - 当前仍保持 `debugger: false` 与 `supported_features: []`，因为尚未实现真实 debugger / subshell 能力，只补了部分调试控制面壳。
+- [x] 评估是否支持 subshell：
+  - [x] `create_subshell_request`
+  - [x] `delete_subshell_request`
+  - [x] `list_subshell_request`
+  - 当前已支持基础 subshell 控制面与 `header.subshell_id` 执行路由：Python worker 现为单进程共享命名空间，主 shell 继续跑在 worker 主线程，额外 subshell 则跑在各自执行线程，并通过 Rust worker IPC 做 request/response correlation。
+- [x] 在 `kernel_info_reply.supported_features` 中准确暴露已支持能力。
+  - 当前 `debugger: true`，`supported_features: ["debugger", "kernel subshells"]`。
 
 完成标准：
 

@@ -69,8 +69,8 @@ Current `rustykernel` behavior:
 - the reply body is:
   - `status: "error"`
   - `ename: "NotImplemented"`
-  - `evalue: "unsupported message type: <msg_type>"`
-  - `traceback: []`
+- `evalue: "unsupported message type: <msg_type>"`
+- `traceback: []`
 
 That is the current local fallback behavior for requests that `ipykernel`
 implements but `rustykernel` does not yet support.
@@ -81,10 +81,11 @@ Current `rustykernel` behavior:
 
 - `implementation`, `implementation_version`, and `banner` are
   `rustykernel`-specific
-- `supported_features` currently advertises `["debugger"]`
+- `supported_features` currently advertises
+  `["debugger", "kernel subshells"]`
 - `debugger` is currently `true`
-- `kernel_info_reply` and kernelspec metadata now advertise debugger support,
-  but not subshell support
+- `kernel_info_reply` and kernelspec metadata now advertise both debugger and
+  kernel subshell support
 
 `rustykernel` now accepts a broader control-channel `debug_request` surface for
 `debugInfo`, `initialize`, `attach`, `disconnect`, `dumpCell`,
@@ -106,6 +107,22 @@ example a future real `pause`) still need a more re-entrant worker IPC design.
 For execute-boundary synthetic breakpoint stops, the worker now only emits a
 compact snapshot payload and Rust answers
 `stackTrace`/`scopes`/`variables` from its own cache.
+
+### Subshells now exist, but lifecycle hardening is still narrower than ipykernel
+
+Current `rustykernel` behavior:
+
+- control-channel `create_subshell_request`, `delete_subshell_request`, and
+  `list_subshell_request` are implemented
+- shell requests carrying `header.subshell_id` are routed to a dedicated worker
+  execution lane for that subshell
+- all subshell lanes still share one Python process and one user namespace
+- the current regression coverage focuses on create/list/delete, shared
+  namespace visibility, and distinct-thread execution
+
+This narrows a major protocol gap, but it is not yet a claim of full raw
+`ipykernel` subshell parity across every lifecycle, interrupt, or debugger edge
+case.
 
 The current `ipykernel` comparison test deliberately normalizes
 `kernel_info_reply` and does not require raw field-for-field equality.

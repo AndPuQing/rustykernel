@@ -61,7 +61,11 @@ def sign_message(key: str, parts: list[bytes]) -> bytes:
 
 
 def client_request(
-    session: str, msg_type: str, content: dict[str, object]
+    session: str,
+    msg_type: str,
+    content: dict[str, object],
+    *,
+    header_overrides: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], list[bytes]]:
     header = {
         "msg_id": str(uuid.uuid4()),
@@ -71,6 +75,8 @@ def client_request(
         "msg_type": msg_type,
         "version": "5.3",
     }
+    if header_overrides:
+        header.update(header_overrides)
     header_frame = json.dumps(header).encode("utf-8")
     parent_frame = b"{}"
     metadata_frame = b"{}"
@@ -84,8 +90,15 @@ def send_client_message(
     session: str,
     msg_type: str,
     content: dict[str, object],
+    *,
+    header_overrides: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    header, frames = client_request(session, msg_type, content)
+    header, frames = client_request(
+        session,
+        msg_type,
+        content,
+        header_overrides=header_overrides,
+    )
     signature = sign_message(key, frames)
     socket.send_multipart([b"<IDS|MSG>", signature, *frames])
     return header
