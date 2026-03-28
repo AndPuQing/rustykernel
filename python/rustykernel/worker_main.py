@@ -88,6 +88,9 @@ class RequestContext:
     comm_events: list[dict[str, object]] = dataclasses.field(default_factory=list)
     payloads: list[dict[str, object]] = dataclasses.field(default_factory=list)
     execute_result: dict[str, object] | None = None
+    stream_chunks: dict[str, list[str]] = dataclasses.field(
+        default_factory=lambda: {"stdout": [], "stderr": []}
+    )
     input_queue: queue.Queue[dict[str, object]] = dataclasses.field(
         default_factory=queue.Queue
     )
@@ -100,6 +103,31 @@ def current_request_context() -> RequestContext:
             "request-local state is only available while handling a request"
         )
     return context
+
+
+def try_current_request_context() -> RequestContext | None:
+    return getattr(_REQUEST_CONTEXT, "current", None)
+
+
+def record_stream_chunk(name: str, text: str) -> None:
+    context = try_current_request_context()
+    if context is None:
+        return
+    context.stream_chunks[name].append(text)
+
+
+def emit_live_stream(name: str, text: str) -> None:
+    context = try_current_request_context()
+    if context is None or context.request_id <= 0:
+        return
+    emit_protocol_message(
+        {
+            "id": context.request_id,
+            "event": "stream",
+            "name": name,
+            "text": text,
+        }
+    )
 
 
 @contextlib.contextmanager
@@ -131,6 +159,11 @@ def interrupt_requested(subshell_id: SubshellId) -> bool:
 def request_interrupt(subshell_id: SubshellId) -> None:
     with _INTERRUPT_FLAGS_LOCK:
         _INTERRUPT_FLAGS.add(subshell_id)
+
+
+def clear_interrupt(subshell_id: SubshellId) -> None:
+    with _INTERRUPT_FLAGS_LOCK:
+        _INTERRUPT_FLAGS.discard(subshell_id)
 
 
 def protocol_stdout() -> io.TextIOBase:
@@ -208,8 +241,9 @@ class WorkerBinaryStream(io.RawIOBase):
 
 
 class WorkerStream(io.TextIOBase):
-    def __init__(self, fd: int) -> None:
+    def __init__(self, fd: int, name: str) -> None:
         self._fd = fd
+        self._name = name
         self._buffer = WorkerBinaryStream(fd)
 
     @property
@@ -243,6 +277,12 @@ class WorkerStream(io.TextIOBase):
         if not data:
             return 0
 
+        context = try_current_request_context()
+        if context is not None and context.request_id > 0:
+            record_stream_chunk(self._name, data)
+            emit_live_stream(self._name, data)
+            return len(data)
+
         write_all(self._fd, data.encode(self.encoding, self.errors))
         return len(data)
 
@@ -250,6 +290,7 @@ class WorkerStream(io.TextIOBase):
 class FdCapture:
     def __init__(self, request_id: int | None = None) -> None:
         self._request_id = request_id
+        self._context = None
         self._buffer_lock = threading.Lock()
         self._emit_lock = threading.Lock()
         self._buffers: dict[str, list[str]] = {"stdout": [], "stderr": []}
@@ -259,6 +300,7 @@ class FdCapture:
         self._threads: list[threading.Thread] = []
 
     def __enter__(self) -> FdCapture:
+        self._context = try_current_request_context()
         flush_standard_streams()
         for name, fd in STREAM_FDS.items():
             self._saved_fds[name] = os.dup(fd)
@@ -312,6 +354,8 @@ class FdCapture:
     def _handle_text(self, name: str, text: str, *, final: bool) -> None:
         with self._buffer_lock:
             self._buffers[name].append(text)
+            if self._context is not None:
+                self._context.stream_chunks[name].append(text)
             combined = self._pending[name] + text
             emit_chunks: list[str] = []
             while True:
@@ -330,19 +374,12 @@ class FdCapture:
 
         for chunk in emit_chunks:
             with self._emit_lock:
-                emit_protocol_message(
-                    {
-                        "id": self._request_id,
-                        "event": "stream",
-                        "name": name,
-                        "text": chunk,
-                    }
-                )
+                emit_live_stream(name, chunk)
 
 
 def install_streams() -> None:
-    sys.stdout = WorkerStream(STREAM_FDS["stdout"])
-    sys.stderr = WorkerStream(STREAM_FDS["stderr"])
+    sys.stdout = WorkerStream(STREAM_FDS["stdout"], "stdout")
+    sys.stderr = WorkerStream(STREAM_FDS["stderr"], "stderr")
 
 
 def completion_kind(value: object) -> str:
@@ -1638,10 +1675,13 @@ def execute(
 
     sys.stdout.flush()
     sys.stderr.flush()
+    payload["stdout"] = "".join(context.stream_chunks["stdout"])
+    payload["stderr"] = "".join(context.stream_chunks["stderr"])
     payload["displays"] = list(context.display_events)
     payload["comm_events"] = list(context.comm_events)
     payload["debug_events"] = DEBUG_STATE.capture_breakpoint_stop(code)
     payload["payload"] = list(context.payloads)
+    clear_interrupt(subshell_id)
     context.payloads.clear()
     if payload["status"] == "ok" and context.execute_result is not None and not silent:
         payload["result"] = context.execute_result
@@ -1888,6 +1928,11 @@ class ExecutionLane:
         self.thread.join()
 
     def interrupt(self) -> None:
+        with self._active_lock:
+            active_request_id = self._active_request_id
+        if active_request_id is None:
+            return
+        request_interrupt(self.subshell_id)
         ident = self.thread.ident
         if ident is None:
             return
@@ -1895,12 +1940,6 @@ class ExecutionLane:
         if result > 1:
             _PY_ASYNC_EXC(ident, None)
             raise RuntimeError("failed to deliver KeyboardInterrupt to execution lane")
-        native_id = self.thread.native_id
-        if native_id is not None and hasattr(signal, "SIGUSR1"):
-            try:
-                signal.pthread_kill(native_id, signal.SIGUSR1)
-            except Exception:
-                pass
 
     def _run(self) -> None:
         while True:
@@ -1984,6 +2023,19 @@ class SubshellManager:
     def interrupt_all(self) -> None:
         with self._lock:
             lanes = list(self._lanes.values())
+        for lane in lanes:
+            try:
+                lane.interrupt()
+            except BaseException:
+                continue
+
+    def interrupt_subshells(self) -> None:
+        with self._lock:
+            lanes = [
+                lane
+                for subshell_id, lane in self._lanes.items()
+                if subshell_id is not None
+            ]
         for lane in lanes:
             try:
                 lane.interrupt()
@@ -2406,7 +2458,7 @@ while True:
             "subshell_id": SUBSHELL_MANAGER.list_subshells(),
         }
     elif kind == "interrupt":
-        SUBSHELL_MANAGER.interrupt_all()
+        SUBSHELL_MANAGER.interrupt_subshells()
         response = {"id": request["id"], "status": "ok"}
     elif kind == "execute":
         subshell_id = request.get("subshell_id")

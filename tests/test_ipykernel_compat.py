@@ -194,6 +194,33 @@ print("err", file=sys.stderr)
     )
 
 
+def collect_chunked_stream_flow(
+    kernel: RunningKernel,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    return kernel.execute(
+        """
+import os
+import subprocess
+import sys
+
+print("py-out")
+sys.stdout.flush()
+os.write(1, b"fd-out\\n")
+print("py-err", file=sys.stderr)
+sys.stderr.flush()
+os.write(2, b"fd-err\\n")
+subprocess.run(
+    [
+        sys.executable,
+        "-c",
+        "import sys; print('child-out'); sys.stdout.flush(); print('child-err', file=sys.stderr); sys.stderr.flush()",
+    ],
+    check=True,
+)
+"""
+    )
+
+
 def collect_interrupt_flow(
     kernel: RunningKernel,
 ) -> tuple[
@@ -510,6 +537,23 @@ def normalize_stream_iopub_messages(
         "streams": stream_text,
         "suffix": suffix,
     }
+
+
+def normalize_stream_message_sequence(
+    messages: list[dict[str, object]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "name": str(message["content"]["name"]),
+            "text": str(message["content"]["text"]),
+        }
+        for message in messages
+        if message["header"]["msg_type"] == "stream"
+    ]
+
+
+def normalize_traceback_lines(traceback: list[str]) -> list[str]:
+    return [strip_ansi(line) for line in traceback]
 
 
 def normalize_completion_reply(content: dict[str, object]) -> dict[str, object]:
@@ -845,6 +889,36 @@ def test_execute_user_expressions_match_ipykernel(
     )
 
 
+def test_execute_user_expression_tracebacks_match_ipykernel_details(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_execute_user_expressions(
+            rustykernel
+        )
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_execute_user_expressions(
+            ipykernel
+        )
+
+    for expression_name in ("missing", "syntax"):
+        assert normalize_traceback_lines(
+            rustykernel_reply["content"]["user_expressions"][expression_name][
+                "traceback"
+            ]
+        ) == normalize_traceback_lines(
+            ipykernel_reply["content"]["user_expressions"][expression_name]["traceback"]
+        )
+    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
+        ipykernel_messages
+    )
+
+
 def test_rich_display_flow_matches_ipykernel(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:
@@ -887,6 +961,29 @@ def test_stream_flow_matches_ipykernel(
     ) == normalize_stream_iopub_messages(ipykernel_messages)
 
 
+def test_chunked_stream_flow_matches_ipykernel_publication_details(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_chunked_stream_flow(
+            rustykernel
+        )
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_chunked_stream_flow(ipykernel)
+
+    assert normalize_execute_reply(
+        rustykernel_reply["content"]
+    ) == normalize_execute_reply(ipykernel_reply["content"])
+    assert normalize_stream_message_sequence(
+        rustykernel_messages
+    ) == normalize_stream_message_sequence(ipykernel_messages)
+
+
 def test_stdin_flow_matches_ipykernel() -> None:
     rustykernel_command, ipykernel_command = kernel_commands()
     rustykernel_input_request, rustykernel_reply, rustykernel_messages = run_stdin_flow(
@@ -894,6 +991,37 @@ def test_stdin_flow_matches_ipykernel() -> None:
     )
     ipykernel_input_request, ipykernel_reply, ipykernel_messages = run_stdin_flow(
         ipykernel_command
+    )
+
+    assert {
+        "prompt": rustykernel_input_request["content"]["prompt"],
+        "password": rustykernel_input_request["content"]["password"],
+    } == {
+        "prompt": ipykernel_input_request["content"]["prompt"],
+        "password": ipykernel_input_request["content"]["password"],
+    }
+    assert normalize_execute_reply(
+        rustykernel_reply["content"]
+    ) == normalize_execute_reply(ipykernel_reply["content"])
+    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
+        ipykernel_messages
+    )
+
+
+def test_password_stdin_flow_matches_ipykernel() -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    code = "import getpass\nsecret = getpass.getpass('Password: ')\nsecret"
+    rustykernel_input_request, rustykernel_reply, rustykernel_messages = run_stdin_flow(
+        rustykernel_command,
+        code=code,
+        input_value="s3cr3t",
+        socket_identity=b"compat-password-stdin-rustykernel",
+    )
+    ipykernel_input_request, ipykernel_reply, ipykernel_messages = run_stdin_flow(
+        ipykernel_command,
+        code=code,
+        input_value="s3cr3t",
+        socket_identity=b"compat-password-stdin-ipykernel",
     )
 
     assert {
@@ -944,6 +1072,33 @@ def test_interrupt_request_matches_ipykernel_semantics(
     assert normalize_iopub_messages(
         rustykernel_execute_messages
     ) == normalize_iopub_messages(ipykernel_execute_messages)
+
+
+def test_nested_runtime_traceback_matches_ipykernel(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    rustykernel_command, ipykernel_command = kernel_commands()
+    code = "def outer():\n    def inner():\n        1 / 0\n    inner()\nouter()"
+    with running_kernel(
+        rustykernel_command, tmp_path / "rusty-connection.json", zmq_context
+    ) as rustykernel:
+        rustykernel_reply, rustykernel_messages = collect_execute_exception(
+            rustykernel, code
+        )
+    with running_kernel(
+        ipykernel_command, tmp_path / "ipykernel-connection.json", zmq_context
+    ) as ipykernel:
+        ipykernel_reply, ipykernel_messages = collect_execute_exception(ipykernel, code)
+
+    assert normalize_execute_error_reply(
+        rustykernel_reply["content"]
+    ) == normalize_execute_error_reply(ipykernel_reply["content"])
+    assert normalize_traceback_lines(
+        rustykernel_reply["content"]["traceback"]
+    ) == normalize_traceback_lines(ipykernel_reply["content"]["traceback"])
+    assert normalize_traceback_lines(
+        rustykernel_messages[2]["content"]["traceback"]
+    ) == normalize_traceback_lines(ipykernel_messages[2]["content"]["traceback"])
 
 
 def test_comm_info_reply_matches_ipykernel(

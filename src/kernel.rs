@@ -226,6 +226,12 @@ struct PendingExecute {
     subshell_id: Option<String>,
 }
 
+#[derive(Default)]
+struct StreamBatch {
+    order: Vec<String>,
+    text_by_name: HashMap<String, String>,
+}
+
 struct ExecuteCompletion {
     request: JupyterMessage,
     code: String,
@@ -979,9 +985,18 @@ impl MessageLoopState {
             .pending_executes
             .values()
             .any(|pending| pending.subshell_id.is_some());
+        let has_live_debug_session = matches!(
+            self.debug_session.transport()?,
+            crate::debug_session::DebugTransport::Connected(_)
+        );
 
         if has_subshell_execute {
-            self.lock_worker()?.interrupt_subshells()?;
+            if has_live_debug_session {
+                self.worker_interrupt.interrupt()?;
+                self.debug_session.reset()?;
+            } else {
+                self.lock_worker()?.interrupt_subshells()?;
+            }
         }
         if has_main_execute {
             self.worker_interrupt.interrupt()?;
@@ -1560,6 +1575,7 @@ fn spawn_message_loop_thread(
 
             drain_debug_session_events(&iopub_socket, &state)?;
 
+            let mut stream_batches: HashMap<u64, StreamBatch> = HashMap::new();
             while let Ok(update) = execute_rx.try_recv() {
                 match update {
                     ExecuteUpdate::Stream {
@@ -1567,15 +1583,31 @@ fn spawn_message_loop_thread(
                         name,
                         text,
                     } => {
-                        publish_execute_stream(&iopub_socket, &state, request_id, &name, &text)?;
+                        let batch = stream_batches.entry(request_id).or_default();
+                        if !batch.text_by_name.contains_key(&name) {
+                            batch.order.push(name.clone());
+                        }
+                        batch.text_by_name.entry(name).or_default().push_str(&text);
                     }
                     ExecuteUpdate::DebugEvent { request_id, event } => {
+                        flush_execute_stream_batch(
+                            &iopub_socket,
+                            &state,
+                            request_id,
+                            stream_batches.remove(&request_id),
+                        )?;
                         publish_execute_debug_event(&iopub_socket, &state, request_id, &event)?;
                     }
                     ExecuteUpdate::Completion {
                         request_id,
                         completion,
                     } => {
+                        flush_execute_stream_batch(
+                            &iopub_socket,
+                            &state,
+                            request_id,
+                            stream_batches.remove(&request_id),
+                        )?;
                         finalize_execute_completion(
                             &shell_socket,
                             &iopub_socket,
@@ -1586,6 +1618,7 @@ fn spawn_message_loop_thread(
                     }
                 }
             }
+            flush_execute_stream_batches(&iopub_socket, &state, stream_batches)?;
 
             let mut poll_items = vec![
                 shell_socket.as_poll_item(zmq::POLLIN),
@@ -1767,24 +1800,6 @@ fn finalize_execute_completion(
     } = completion;
     let outcome = outcome?;
 
-    if !silent && !outcome.stdout.is_empty() {
-        publish_stream(
-            iopub_socket,
-            state,
-            request.header_value.clone(),
-            "stdout",
-            &outcome.stdout,
-        )?;
-    }
-    if !silent && !outcome.stderr.is_empty() {
-        publish_stream(
-            iopub_socket,
-            state,
-            request.header_value.clone(),
-            "stderr",
-            &outcome.stderr,
-        )?;
-    }
     if !silent {
         publish_comm_events(
             iopub_socket,
@@ -2615,6 +2630,37 @@ fn publish_execute_stream(
     publish_stream(socket, state, pending.parent_header.clone(), name, text)
 }
 
+fn flush_execute_stream_batches(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    stream_batches: HashMap<u64, StreamBatch>,
+) -> Result<(), KernelError> {
+    for (request_id, batch) in stream_batches {
+        flush_execute_stream_batch(socket, state, request_id, Some(batch))?;
+    }
+    Ok(())
+}
+
+fn flush_execute_stream_batch(
+    socket: &zmq::Socket,
+    state: &MessageLoopState,
+    request_id: u64,
+    batch: Option<StreamBatch>,
+) -> Result<(), KernelError> {
+    let Some(batch) = batch else {
+        return Ok(());
+    };
+
+    for name in batch.order {
+        let Some(text) = batch.text_by_name.get(&name) else {
+            continue;
+        };
+        publish_execute_stream(socket, state, request_id, &name, text)?;
+    }
+
+    Ok(())
+}
+
 fn publish_execute_debug_event(
     socket: &zmq::Socket,
     state: &MessageLoopState,
@@ -2672,6 +2718,14 @@ fn publish_debug_session_event(
     state: &MessageLoopState,
     event: DebugEventEnvelope,
 ) -> Result<(), KernelError> {
+    if matches!(
+        state.debug_session.transport()?,
+        crate::debug_session::DebugTransport::Inactive
+    ) && event.parent_header.is_none()
+    {
+        return Ok(());
+    }
+
     let parent_header = if let Some(parent_header) = event.parent_header {
         parent_header
     } else if let Some(pending) = state
@@ -5121,6 +5175,155 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_request_stops_running_debug_session_in_subshell_without_leaking_debug_state() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let shell = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().shell,
+            b"shell-client",
+        );
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+        control.set_rcvtimeo(10_000).unwrap();
+        let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+
+        let create_subshell =
+            client_request("client-session", "create_subshell_request", json!({}));
+        send_client_message(&control, &signer, &create_subshell);
+        let create_reply = recv_message(&control, &signer);
+        assert_eq!(create_reply.header.msg_type, "create_subshell_reply");
+        let subshell_id = create_reply
+            .content
+            .get("subshell_id")
+            .and_then(Value::as_str)
+            .expect("subshell id missing")
+            .to_owned();
+        let create_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &create_subshell.header.msg_id, 2);
+        assert_eq!(status_message_states(&create_statuses), vec!["busy", "idle"]);
+
+        let code = concat!(
+            "def runner():\n",
+            "    import time\n",
+            "    total = 0\n",
+            "    for _ in range(300):\n",
+            "        total += 1\n",
+            "        time.sleep(0.01)\n",
+            "    return total\n",
+            "\n",
+            "runner()\n",
+        );
+
+        let dump_cell_reply =
+            send_debug_request_and_drain_iopub(&control, &iopub, &signer, 1, "dumpCell", json!({ "code": code }));
+        assert_eq!(dump_cell_reply.content.get("success"), Some(&json!(true)));
+
+        initialize_live_debug_session(&control, &iopub, &signer, 2);
+
+        let execute = subshell_execute_request(
+            &subshell_id,
+            json!({
+                "code": code,
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &execute);
+        thread::sleep(Duration::from_millis(200));
+
+        let interrupt = client_request("client-session", "interrupt_request", json!({}));
+        send_client_message(&control, &signer, &interrupt);
+        let interrupt_reply = recv_message(&control, &signer);
+        assert_eq!(interrupt_reply.header.msg_type, "interrupt_reply");
+        assert_eq!(interrupt_reply.content.get("status"), Some(&json!("ok")));
+        let interrupt_statuses =
+            recv_iopub_messages_for_parent(&iopub, &signer, &interrupt.header.msg_id, 2);
+        assert_eq!(
+            status_message_states(&interrupt_statuses),
+            vec!["busy", "idle"]
+        );
+
+        let execute_reply = recv_message(&shell, &signer);
+        assert_eq!(execute_reply.header.msg_type, "execute_reply");
+        assert_eq!(execute_reply.content.get("status"), Some(&json!("error")));
+        assert_eq!(
+            execute_reply.content.get("ename"),
+            Some(&json!("KeyboardInterrupt"))
+        );
+        assert_eq!(
+            execute_reply.parent_header.get("subshell_id"),
+            Some(&json!(subshell_id.clone()))
+        );
+        let execute_tail =
+            recv_iopub_messages_until_idle_for_parent(&iopub, &signer, &execute.header.msg_id);
+        assert!(
+            execute_tail.iter().any(|message| {
+                message.header.msg_type == "error"
+                    && message.content.get("ename") == Some(&json!("KeyboardInterrupt"))
+            }),
+            "expected KeyboardInterrupt on iopub, got {:?}",
+            execute_tail
+                .iter()
+                .map(|message| (message.header.msg_type.clone(), message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        let probe = subshell_execute_request(
+            &subshell_id,
+            json!({
+                "code": "40 + 2",
+                "silent": false,
+                "store_history": true,
+                "allow_stdin": false,
+                "user_expressions": {},
+                "stop_on_error": true,
+            }),
+        );
+        send_client_message(&shell, &signer, &probe);
+        let probe_reply = recv_message(&shell, &signer);
+        assert_eq!(probe_reply.header.msg_type, "execute_reply");
+        assert_eq!(probe_reply.content.get("status"), Some(&json!("ok")));
+        assert_eq!(
+            probe_reply.parent_header.get("subshell_id"),
+            Some(&json!(subshell_id))
+        );
+        let probe_tail =
+            recv_iopub_messages_until_idle_for_parent(&iopub, &signer, &probe.header.msg_id);
+        assert!(
+            probe_tail
+                .iter()
+                .any(|message| message.header.msg_type == "execute_result"),
+            "expected execute_result after interrupt recovery, got {:?}",
+            probe_tail
+                .iter()
+                .map(|message| (message.header.msg_type.clone(), message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !probe_tail
+                .iter()
+                .any(|message| message.header.msg_type == "debug_event"),
+            "did not expect leaked debug_event on probe execute, got {:?}",
+            probe_tail
+                .iter()
+                .map(|message| (message.header.msg_type.clone(), message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        runtime.stop().unwrap();
+    }
+
+    #[test]
     fn continue_request_without_live_debug_session_returns_error_instead_of_fallback_success() {
         let _guard = test_lock();
         let connection = test_connection_info();
@@ -5478,6 +5681,13 @@ mod tests {
         JupyterMessage::new(Vec::new(), header, json!({}), json!({}), content)
     }
 
+    fn subshell_execute_request(subshell_id: &str, content: Value) -> JupyterMessage {
+        let mut request = client_request("client-session", "execute_request", content);
+        request.header.subshell_id = Some(subshell_id.to_owned());
+        request.header_value = serde_json::to_value(&request.header).unwrap();
+        request
+    }
+
     fn connect_dealer(context: &zmq::Context, endpoint: &str, identity: &[u8]) -> zmq::Socket {
         let socket = context.socket(zmq::DEALER).unwrap();
         socket.set_identity(identity).unwrap();
@@ -5639,6 +5849,42 @@ mod tests {
         let reply = recv_message(control, signer);
         let _ = recv_iopub_messages_until_idle_for_parent(iopub, signer, &request.header.msg_id);
         reply
+    }
+
+    fn initialize_live_debug_session(
+        control: &zmq::Socket,
+        iopub: &zmq::Socket,
+        signer: &MessageSigner,
+        initial_seq: i64,
+    ) {
+        for (offset, command, arguments) in [
+            (
+                0,
+                "initialize",
+                json!({
+                    "clientID": "rustykernel-test",
+                    "clientName": "rustykernel-test",
+                    "adapterID": "python",
+                }),
+            ),
+            (1, "attach", json!({})),
+            (2, "configurationDone", json!({})),
+        ] {
+            let reply = send_debug_request_and_drain_iopub(
+                control,
+                iopub,
+                signer,
+                initial_seq + offset,
+                command,
+                arguments,
+            );
+            assert_eq!(
+                reply.content.get("success"),
+                Some(&json!(true)),
+                "unexpected {command} reply: {:?}",
+                reply.content
+            );
+        }
     }
 
     fn debug_event_thread_id(messages: &[JupyterMessage], event_name: &str) -> i64 {

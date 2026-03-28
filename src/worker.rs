@@ -68,10 +68,6 @@ fn debug_event_msg_type() -> String {
 pub struct ExecutionOutcome {
     pub status: String,
     #[serde(default)]
-    pub stdout: String,
-    #[serde(default)]
-    pub stderr: String,
-    #[serde(default)]
     pub displays: Vec<ExecutionDisplayEvent>,
     #[serde(default)]
     pub comm_events: Vec<WorkerCommEvent>,
