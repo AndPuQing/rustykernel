@@ -3868,12 +3868,15 @@ mod tests {
             &runtime.channel_endpoints().shell,
             client_identity,
         );
+        shell.set_rcvtimeo(10_000).unwrap();
         let stdin_socket = connect_dealer(
             &context,
             &runtime.channel_endpoints().stdin,
             client_identity,
         );
+        stdin_socket.set_rcvtimeo(10_000).unwrap();
         let iopub = connect_subscriber(&context, &runtime.channel_endpoints().iopub);
+        iopub.set_rcvtimeo(10_000).unwrap();
 
         let request = client_request(
             "client-session",
@@ -3889,7 +3892,16 @@ mod tests {
         );
         send_client_message(&shell, &signer, &request);
 
-        let input_request = recv_message(&stdin_socket, &signer);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let input_request = loop {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for stdin input_request"
+            );
+            if let Some(message) = try_recv_message(&stdin_socket, &signer).unwrap() {
+                break message;
+            }
+        };
         assert_eq!(input_request.header.msg_type, "input_request");
         assert_eq!(input_request.content.get("prompt"), Some(&json!("Name: ")));
         assert_eq!(input_request.content.get("password"), Some(&json!(false)));
@@ -3925,6 +3937,9 @@ mod tests {
             Some(&json!("'Ada'"))
         );
 
+        drop(stdin_socket);
+        drop(shell);
+        drop(iopub);
         runtime.stop().unwrap();
     }
 
@@ -3960,6 +3975,8 @@ mod tests {
         let reply = recv_message(&shell, &signer);
         assert_eq!(reply.header.msg_type, "kernel_info_reply");
 
+        drop(stdin_socket);
+        drop(shell);
         runtime.stop().unwrap();
     }
 

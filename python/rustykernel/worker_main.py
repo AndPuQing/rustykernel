@@ -58,6 +58,7 @@ _INPUT_WAITERS_LOCK = threading.Lock()
 _INPUT_WAITERS: dict[int, queue.Queue[dict[str, object]]] = {}
 _INTERRUPT_FLAGS_LOCK = threading.Lock()
 _INTERRUPT_FLAGS: set[str | None] = set()
+_MAIN_THREAD_ID = threading.get_ident()
 _LIBC = ctypes.CDLL(None)
 _LIBC.fflush.argtypes = [ctypes.c_void_p]
 _LIBC.fflush.restype = ctypes.c_int
@@ -1147,6 +1148,25 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
             "password": password,
         }
     )
+
+    if threading.get_ident() == _MAIN_THREAD_ID:
+        while True:
+            raw_line = protocol_stdin().readline()
+            if not raw_line:
+                raise EOFError("stdin channel closed")
+            if not raw_line.strip():
+                continue
+
+            response = json.loads(raw_line)
+            if response.get("kind") != "input_reply":
+                continue
+            if int(response.get("id", -1)) != context.request_id:
+                continue
+
+            error = response.get("error")
+            if error:
+                raise EOFError(str(error))
+            return str(response.get("value", ""))
 
     while True:
         response = context.input_queue.get()

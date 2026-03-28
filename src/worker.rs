@@ -707,9 +707,7 @@ impl PythonWorker {
             }
             Err(_) => {}
         }
-        if let Some(handle) = self.protocol_thread.take() {
-            let _ = handle.join();
-        }
+        let _ = self.protocol_thread.take();
     }
 
     fn send_request<T>(
