@@ -91,6 +91,9 @@ class RequestContext:
     stream_chunks: dict[str, list[str]] = dataclasses.field(
         default_factory=lambda: {"stdout": [], "stderr": []}
     )
+    stream_pending: dict[str, str] = dataclasses.field(
+        default_factory=lambda: {"stdout": "", "stderr": ""}
+    )
     input_queue: queue.Queue[dict[str, object]] = dataclasses.field(
         default_factory=queue.Queue
     )
@@ -116,18 +119,47 @@ def record_stream_chunk(name: str, text: str) -> None:
     context.stream_chunks[name].append(text)
 
 
-def emit_live_stream(name: str, text: str) -> None:
-    context = try_current_request_context()
-    if context is None or context.request_id <= 0:
+def emit_live_stream(name: str, text: str, request_id: int | None = None) -> None:
+    if request_id is None:
+        context = try_current_request_context()
+        if context is None:
+            return
+        request_id = context.request_id
+
+    if request_id <= 0:
         return
     emit_protocol_message(
         {
-            "id": context.request_id,
+            "id": request_id,
             "event": "stream",
             "name": name,
             "text": text,
         }
     )
+
+
+def take_stream_chunks(
+    pending: dict[str, str], name: str, text: str, *, final: bool
+) -> list[str]:
+    combined = pending[name] + text
+    chunks: list[str] = []
+    while True:
+        newline = combined.find("\n")
+        if newline == -1:
+            break
+        chunks.append(combined[: newline + 1])
+        combined = combined[newline + 1 :]
+    if final and combined:
+        chunks.append(combined)
+        combined = ""
+    pending[name] = combined
+    return chunks
+
+
+def flush_pending_streams(context: RequestContext) -> None:
+    for name in STREAM_FDS:
+        for chunk in take_stream_chunks(context.stream_pending, name, "", final=True):
+            emit_live_stream(name, chunk, context.request_id)
 
 
 @contextlib.contextmanager
@@ -280,7 +312,10 @@ class WorkerStream(io.TextIOBase):
         context = try_current_request_context()
         if context is not None and context.request_id > 0:
             record_stream_chunk(self._name, data)
-            emit_live_stream(self._name, data)
+            for chunk in take_stream_chunks(
+                context.stream_pending, self._name, data, final=False
+            ):
+                emit_live_stream(self._name, chunk, context.request_id)
             return len(data)
 
         write_all(self._fd, data.encode(self.encoding, self.errors))
@@ -356,25 +391,14 @@ class FdCapture:
             self._buffers[name].append(text)
             if self._context is not None:
                 self._context.stream_chunks[name].append(text)
-            combined = self._pending[name] + text
-            emit_chunks: list[str] = []
-            while True:
-                newline = combined.find("\n")
-                if newline == -1:
-                    break
-                emit_chunks.append(combined[: newline + 1])
-                combined = combined[newline + 1 :]
-            if final and combined:
-                emit_chunks.append(combined)
-                combined = ""
-            self._pending[name] = combined
+            emit_chunks = take_stream_chunks(self._pending, name, text, final=final)
 
         if self._request_id is None:
             return
 
         for chunk in emit_chunks:
             with self._emit_lock:
-                emit_live_stream(name, chunk)
+                emit_live_stream(name, chunk, self._request_id)
 
 
 def install_streams() -> None:
@@ -1675,6 +1699,7 @@ def execute(
 
     sys.stdout.flush()
     sys.stderr.flush()
+    flush_pending_streams(context)
     payload["stdout"] = "".join(context.stream_chunks["stdout"])
     payload["stderr"] = "".join(context.stream_chunks["stderr"])
     payload["displays"] = list(context.display_events)

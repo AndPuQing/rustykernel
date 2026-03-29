@@ -36,7 +36,11 @@ class RunningKernel:
         header, frames = client_request("compat-session", msg_type, content)
         signature = sign_message(str(self.payload["key"]), frames)
         self.shell.send_multipart([b"<IDS|MSG>", signature, *frames])
-        reply = recv_message(self.shell, str(self.payload["key"]))
+        reply = recv_shell_reply_for_parent(
+            self.shell,
+            str(self.payload["key"]),
+            str(header["msg_id"]),
+        )
         self.drain_iopub()
         reply["request_header"] = header
         return reply
@@ -56,18 +60,19 @@ class RunningKernel:
         )
         signature = sign_message(str(self.payload["key"]), frames)
         self.shell.send_multipart([b"<IDS|MSG>", signature, *frames])
-        reply = recv_message(self.shell, str(self.payload["key"]))
+        reply = recv_shell_reply_for_parent(
+            self.shell,
+            str(self.payload["key"]),
+            str(header["msg_id"]),
+        )
         published = recv_iopub_messages_for_parent(
             self.iopub, str(self.payload["key"]), header["msg_id"]
         )
         return reply, published
 
     def drain_iopub(self) -> None:
-        while True:
-            try:
-                recv_message(self.iopub, str(self.payload["key"]))
-            except zmq.error.Again:
-                return
+        while self.iopub.poll(timeout=0):
+            recv_message(self.iopub, str(self.payload["key"]))
 
 
 def reserve_tcp_ports(count: int) -> list[int]:
@@ -180,6 +185,20 @@ def recv_iopub_messages_for_parent(
     return messages
 
 
+def recv_shell_reply_for_parent(
+    socket: zmq.Socket, key: str, parent_msg_id: str, timeout_s: float = 5.0
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            message = recv_message(socket, key)
+        except zmq.error.Again:
+            continue
+        if message["parent_header"].get("msg_id") == parent_msg_id:
+            return message
+    raise AssertionError("timed out waiting for shell reply")
+
+
 def send_message(
     socket: zmq.Socket,
     key: str,
@@ -198,10 +217,14 @@ def wait_for_ready(kernel: RunningKernel) -> None:
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         try:
-            reply = kernel.request("kernel_info_request", {})
+            send_message(
+                kernel.shell, str(kernel.payload["key"]), "kernel_info_request", {}
+            )
+            reply = recv_message(kernel.shell, str(kernel.payload["key"]))
         except zmq.error.Again:
             time.sleep(0.1)
             continue
+        kernel.drain_iopub()
         if reply["header"]["msg_type"] == "kernel_info_reply":
             return
     raise AssertionError(f"{kernel.name} did not answer kernel_info_request")

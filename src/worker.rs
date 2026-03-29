@@ -248,13 +248,6 @@ struct WorkerEnvelope<T> {
 }
 
 #[derive(Debug, Deserialize)]
-struct WorkerMessageMeta {
-    id: u64,
-    #[serde(default)]
-    event: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct WorkerStatusReply {
     #[serde(default)]
     status: String,
@@ -783,6 +776,93 @@ impl PythonWorker {
     }
 }
 
+fn parse_worker_message_prefix(line: &str) -> Option<(u64, bool)> {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'{') {
+        return None;
+    }
+    index += 1;
+
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'"') {
+        return None;
+    }
+    index += 1;
+
+    let key_start = index;
+    while let Some(byte) = bytes.get(index) {
+        if *byte == b'"' {
+            break;
+        }
+        index += 1;
+    }
+    let key_end = index;
+    if bytes.get(index) != Some(&b'"') || &bytes[key_start..key_end] != b"id" {
+        return None;
+    }
+    index += 1;
+
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b':') {
+        return None;
+    }
+    index += 1;
+
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        index += 1;
+    }
+    let value_start = index;
+    while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+        index += 1;
+    }
+    let request_id = std::str::from_utf8(bytes.get(value_start..index)?)
+        .ok()?
+        .parse()
+        .ok()?;
+
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b',') {
+        return Some((request_id, false));
+    }
+    index += 1;
+
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'"') {
+        return Some((request_id, false));
+    }
+    index += 1;
+
+    let second_key_start = index;
+    while let Some(byte) = bytes.get(index) {
+        if *byte == b'"' {
+            break;
+        }
+        index += 1;
+    }
+    let second_key_end = index;
+    if bytes.get(index) != Some(&b'"') {
+        return Some((request_id, false));
+    }
+
+    Some((
+        request_id,
+        &bytes[second_key_start..second_key_end] == b"event",
+    ))
+}
+
 fn spawn_protocol_reader(
     protocol_read: OwnedFd,
     pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
@@ -809,19 +889,15 @@ fn spawn_protocol_reader(
                 return;
             }
 
-            let meta: WorkerMessageMeta = match serde_json::from_str(&line) {
-                Ok(meta) => meta,
-                Err(error) => {
-                    fail_all_pending(
-                        &pending,
-                        format!("failed to decode worker protocol message: {error}"),
-                    );
-                    return;
-                }
+            let Some((request_id, is_event)) = parse_worker_message_prefix(&line) else {
+                fail_all_pending(
+                    &pending,
+                    "failed to decode worker protocol message prefix".to_owned(),
+                );
+                return;
             };
 
-            let request_id = meta.id;
-            let pending_request = if meta.event.is_some() {
+            let pending_request = if is_event {
                 pending
                     .lock()
                     .ok()
@@ -844,7 +920,16 @@ fn spawn_protocol_reader(
 
             match pending_request {
                 PendingRequest::Execute(sender) => {
-                    let message = if let Some(event_name) = meta.event.as_deref() {
+                    let message = if is_event {
+                        let event_name = if line.contains("\"event\": \"input_request\"") {
+                            "input_request"
+                        } else if line.contains("\"event\": \"stream\"") {
+                            "stream"
+                        } else if line.contains("\"event\": \"debug_event\"") {
+                            "debug_event"
+                        } else {
+                            ""
+                        };
                         match event_name {
                             "input_request" => {
                                 match serde_json::from_str::<WorkerInputRequest>(&line) {
