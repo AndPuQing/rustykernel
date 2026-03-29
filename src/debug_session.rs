@@ -528,7 +528,9 @@ impl DebugSession {
                 event,
                 parent_header,
             })
-            .map_err(|error| KernelError::Worker(format!("failed to queue debug event: {error}")))?;
+            .map_err(|error| {
+                KernelError::Worker(format!("failed to queue debug event: {error}"))
+            })?;
         self.notifier.notify_one();
         Ok(())
     }
