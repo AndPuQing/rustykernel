@@ -24,6 +24,7 @@ use crate::worker::{
     CommOutcome, ExecutionOutcome, PythonWorker, WorkerCommEvent, WorkerDebugEvent,
     WorkerDebugListen, WorkerInterruptHandle, WorkerKernelInfo,
 };
+use crate::zmq;
 
 const CHANNEL_POLL_INTERVAL_IDLE_MS: i64 = 10;
 const CHANNEL_POLL_INTERVAL_EXECUTING_MS: i64 = 1;
@@ -2869,7 +2870,7 @@ fn spawn_heartbeat_thread(
         socket.set_linger(0)?;
         socket.set_rcvtimeo(HEARTBEAT_POLL_INTERVAL_MS)?;
         if let Err(error) = socket.bind(&endpoint) {
-            let _ = ready_tx.send(Err(error));
+            let _ = ready_tx.send(Err(error.clone()));
             return Err(error);
         }
         let _ = ready_tx.send(Ok(()));
@@ -2932,6 +2933,7 @@ mod tests {
 
     use super::{ConnectionConfig, ConnectionInfo, KernelError, start_kernel};
     use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
+    use crate::zmq;
 
     fn test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

@@ -2,6 +2,7 @@ mod debug_session;
 mod kernel;
 mod protocol;
 mod worker;
+mod zmq;
 
 pub use crate::kernel::{
     ChannelEndpoints, ConnectionInfo, KernelError, KernelRuntime, KernelRuntimeInfo, healthcheck,
