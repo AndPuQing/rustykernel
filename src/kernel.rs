@@ -12,6 +12,12 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sysinfo::{Pid, System};
+use tokio::runtime::{Builder, Runtime};
+use tokio::time;
+use zeromq::Socket as _;
+use zeromq::SocketRecv as _;
+use zeromq::SocketSend as _;
+use zeromq::{PubSocket, RepSocket, RouterSocket, ZmqError, ZmqMessage};
 
 use crate::debug_session::{
     DebugEventEnvelope, DebugListenEndpoint, DebugSession, DebugStateCache,
@@ -24,7 +30,6 @@ use crate::worker::{
     CommOutcome, ExecutionOutcome, PythonWorker, WorkerCommEvent, WorkerDebugEvent,
     WorkerDebugListen, WorkerInterruptHandle, WorkerKernelInfo,
 };
-use crate::zmq;
 
 const CHANNEL_POLL_INTERVAL_IDLE_MS: i64 = 10;
 const CHANNEL_POLL_INTERVAL_EXECUTING_MS: i64 = 1;
@@ -86,7 +91,7 @@ pub enum KernelError {
     InvalidConnectionFile(serde_json::Error),
     Worker(String),
     Protocol(ProtocolError),
-    Zmq(zmq::Error),
+    Zmq(ZmqError),
     HeartbeatThreadPanicked,
     MessageLoopThreadPanicked,
 }
@@ -116,8 +121,8 @@ impl From<ProtocolError> for KernelError {
     }
 }
 
-impl From<zmq::Error> for KernelError {
-    fn from(error: zmq::Error) -> Self {
+impl From<ZmqError> for KernelError {
+    fn from(error: ZmqError) -> Self {
         Self::Zmq(error)
     }
 }
@@ -1471,9 +1476,11 @@ fn normalize_history_index(index: i32, line_count: i32) -> i32 {
     adjusted.clamp(0, line_count)
 }
 
+#[derive(Clone, Copy)]
 enum ChannelKind {
     Shell,
     Control,
+    Stdin,
 }
 
 enum RequestDisposition {
@@ -1484,20 +1491,18 @@ enum RequestDisposition {
 pub struct KernelRuntime {
     connection: ConnectionInfo,
     endpoints: ChannelEndpoints,
-    _context: zmq::Context,
     shutdown: Arc<ShutdownSignal>,
-    hb_thread: Option<JoinHandle<Result<(), zmq::Error>>>,
+    hb_thread: Option<JoinHandle<Result<(), ZmqError>>>,
     message_loop_thread: Option<JoinHandle<Result<(), KernelError>>>,
 }
 
 impl KernelRuntime {
     pub fn start(connection: ConnectionInfo) -> Result<Self, KernelError> {
         let endpoints = connection.channel_endpoints();
-        let context = zmq::Context::new();
         let shutdown = Arc::new(ShutdownSignal::new());
 
         let (hb_thread, hb_ready) =
-            spawn_heartbeat_thread(context.clone(), endpoints.hb.clone(), Arc::clone(&shutdown));
+            spawn_heartbeat_thread(endpoints.hb.clone(), Arc::clone(&shutdown));
         match hb_ready.recv() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -1508,7 +1513,6 @@ impl KernelRuntime {
         }
 
         let (message_loop_thread, message_loop_ready) = spawn_message_loop_thread(
-            context.clone(),
             connection.clone(),
             endpoints.clone(),
             Arc::clone(&shutdown),
@@ -1536,7 +1540,6 @@ impl KernelRuntime {
         Ok(Self {
             connection,
             endpoints,
-            _context: context,
             shutdown,
             hb_thread: Some(hb_thread),
             message_loop_thread: Some(message_loop_thread),
@@ -1590,24 +1593,95 @@ impl KernelRuntime {
 }
 
 impl Drop for KernelRuntime {
-    fn drop(&mut self) {
+fn drop(&mut self) {
         let _ = self.stop();
     }
 }
 
-fn bind_socket(
-    context: &zmq::Context,
-    socket_type: zmq::SocketType,
+fn build_transport_runtime() -> Runtime {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime for zeromq")
+}
+
+fn multipart_message(frames: Vec<Vec<u8>>) -> Result<ZmqMessage, ZmqError> {
+    let frames = frames.into_iter().map(bytes::Bytes::from).collect::<Vec<_>>();
+    ZmqMessage::try_from(frames).map_err(|_| ZmqError::Other("empty multipart messages are not supported"))
+}
+
+fn message_to_frames(message: ZmqMessage) -> Vec<Vec<u8>> {
+    message
+        .into_vec()
+        .into_iter()
+        .map(|frame| frame.to_vec())
+        .collect()
+}
+
+fn bind_socket<S: zeromq::Socket>(
+    runtime: &Runtime,
+    socket: &mut S,
     endpoint: &str,
-) -> Result<zmq::Socket, KernelError> {
-    let socket = context.socket(socket_type)?;
-    socket.set_linger(0)?;
-    socket.bind(endpoint)?;
-    Ok(socket)
+) -> Result<(), KernelError> {
+    runtime.block_on(socket.bind(endpoint))?;
+    Ok(())
+}
+
+fn send_frames<S: zeromq::SocketSend>(
+    runtime: &Runtime,
+    socket: &mut S,
+    frames: Vec<Vec<u8>>,
+) -> Result<(), KernelError> {
+    runtime.block_on(socket.send(multipart_message(frames)?))?;
+    Ok(())
+}
+
+fn recv_frames<S: zeromq::SocketRecv>(
+    runtime: &Runtime,
+    socket: &mut S,
+    timeout: Option<Duration>,
+) -> Result<Option<Vec<Vec<u8>>>, ZmqError> {
+    runtime.block_on(async {
+        match timeout {
+            Some(timeout) => match time::timeout(timeout, socket.recv()).await {
+                Ok(result) => result.map(message_to_frames).map(Some),
+                Err(_) => Ok(None),
+            },
+            None => socket.recv().await.map(message_to_frames).map(Some),
+        }
+    })
+}
+
+fn next_channel_message(
+    runtime: &Runtime,
+    shell_socket: &mut RouterSocket,
+    control_socket: &mut RouterSocket,
+    stdin_socket: &mut RouterSocket,
+    timeout_ms: i64,
+) -> Result<Option<(ChannelKind, Vec<Vec<u8>>)>, ZmqError> {
+    runtime.block_on(async {
+        if timeout_ms < 0 {
+            tokio::select! {
+                biased;
+                result = shell_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Shell, frames))),
+                result = control_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Control, frames))),
+                result = stdin_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Stdin, frames))),
+            }
+        } else {
+            let sleep = time::sleep(Duration::from_millis(timeout_ms as u64));
+            tokio::pin!(sleep);
+            tokio::select! {
+                biased;
+                _ = &mut sleep => Ok(None),
+                result = shell_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Shell, frames))),
+                result = control_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Control, frames))),
+                result = stdin_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Stdin, frames))),
+            }
+        }
+    })
 }
 
 fn spawn_message_loop_thread(
-    context: zmq::Context,
     connection: ConnectionInfo,
     endpoints: ChannelEndpoints,
     shutdown: Arc<ShutdownSignal>,
@@ -1617,14 +1691,19 @@ fn spawn_message_loop_thread(
 ) {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let handle = thread::spawn(move || {
-        let shell_socket = bind_socket(&context, zmq::ROUTER, &endpoints.shell)?;
-        let iopub_socket = bind_socket(&context, zmq::PUB, &endpoints.iopub)?;
-        let stdin_socket = bind_socket(&context, zmq::ROUTER, &endpoints.stdin)?;
-        let control_socket = bind_socket(&context, zmq::ROUTER, &endpoints.control)?;
+        let runtime = build_transport_runtime();
+        let mut shell_socket = RouterSocket::new();
+        bind_socket(&runtime, &mut shell_socket, &endpoints.shell)?;
+        let mut iopub_socket = PubSocket::new();
+        bind_socket(&runtime, &mut iopub_socket, &endpoints.iopub)?;
+        let mut stdin_socket = RouterSocket::new();
+        bind_socket(&runtime, &mut stdin_socket, &endpoints.stdin)?;
+        let mut control_socket = RouterSocket::new();
+        bind_socket(&runtime, &mut control_socket, &endpoints.control)?;
         let mut state = MessageLoopState::new(&connection)?;
         let (execute_tx, execute_rx) = mpsc::channel();
 
-        publish_status(&iopub_socket, &state, json!({}), "starting")?;
+        publish_status(&runtime, &mut iopub_socket, &state, json!({}), "starting")?;
         let _ = ready_tx.send(Ok(()));
 
         loop {
@@ -1632,7 +1711,7 @@ fn spawn_message_loop_thread(
                 return Ok(());
             }
 
-            drain_debug_session_events(&iopub_socket, &state)?;
+            drain_debug_session_events(&runtime, &mut iopub_socket, &state)?;
 
             let mut stream_batches: HashMap<u64, StreamBatch> = HashMap::new();
             while let Ok(update) = execute_rx.try_recv() {
@@ -1648,26 +1727,35 @@ fn spawn_message_loop_thread(
                     }
                     ExecuteUpdate::DebugEvent { request_id, event } => {
                         flush_execute_stream_batch(
-                            &iopub_socket,
+                            &runtime,
+                            &mut iopub_socket,
                             &state,
                             request_id,
                             stream_batches.remove(&request_id),
                         )?;
-                        publish_execute_debug_event(&iopub_socket, &state, request_id, &event)?;
+                        publish_execute_debug_event(
+                            &runtime,
+                            &mut iopub_socket,
+                            &state,
+                            request_id,
+                            &event,
+                        )?;
                     }
                     ExecuteUpdate::Completion {
                         request_id,
                         completion,
                     } => {
                         flush_execute_stream_batch(
-                            &iopub_socket,
+                            &runtime,
+                            &mut iopub_socket,
                             &state,
                             request_id,
                             stream_batches.remove(&request_id),
                         )?;
                         finalize_execute_completion(
-                            &shell_socket,
-                            &iopub_socket,
+                            &runtime,
+                            &mut shell_socket,
+                            &mut iopub_socket,
                             &mut state,
                             request_id,
                             completion,
@@ -1675,55 +1763,50 @@ fn spawn_message_loop_thread(
                     }
                 }
             }
-            flush_execute_stream_batches(&iopub_socket, &state, stream_batches)?;
+            flush_execute_stream_batches(&runtime, &mut iopub_socket, &state, stream_batches)?;
 
-            let mut poll_items = [
-                shell_socket.as_poll_item(zmq::POLLIN),
-                control_socket.as_poll_item(zmq::POLLIN),
-                stdin_socket.as_poll_item(zmq::POLLIN),
-            ];
             let poll_timeout_ms = if state.is_executing() {
                 CHANNEL_POLL_INTERVAL_EXECUTING_MS
             } else {
                 CHANNEL_POLL_INTERVAL_IDLE_MS
             };
-            match zmq::poll(&mut poll_items, poll_timeout_ms) {
-                Ok(_) => {}
-                Err(zmq::Error::ETERM) if shutdown.is_stopped() => return Ok(()),
+            let next_message = match next_channel_message(
+                &runtime,
+                &mut shell_socket,
+                &mut control_socket,
+                &mut stdin_socket,
+                poll_timeout_ms,
+            ) {
+                Ok(next_message) => next_message,
                 Err(error) => return Err(KernelError::Zmq(error)),
-            }
+            };
 
-            if poll_items[0].is_readable() {
-                let frames = shell_socket.recv_multipart(0)?;
-                handle_request(
-                    ChannelKind::Shell,
-                    frames,
-                    &shell_socket,
-                    &stdin_socket,
-                    &iopub_socket,
-                    &mut state,
-                    &execute_tx,
-                    shutdown.as_ref(),
-                )?;
-            }
+            let Some((channel, frames)) = next_message else {
+                continue;
+            };
 
-            if poll_items[1].is_readable() {
-                let frames = control_socket.recv_multipart(0)?;
-                handle_request(
-                    ChannelKind::Control,
-                    frames,
-                    &control_socket,
-                    &stdin_socket,
-                    &iopub_socket,
-                    &mut state,
-                    &execute_tx,
-                    shutdown.as_ref(),
-                )?;
-            }
-
-            if poll_items[2].is_readable() {
-                let frames = stdin_socket.recv_multipart(0)?;
-                handle_stdin_message(frames, &state)?;
+            match channel {
+                ChannelKind::Shell | ChannelKind::Control => {
+                    let reply_socket = if matches!(channel, ChannelKind::Shell) {
+                        &mut shell_socket
+                    } else {
+                        &mut control_socket
+                    };
+                    handle_request(
+                        &runtime,
+                        channel,
+                        frames,
+                        reply_socket,
+                        &mut stdin_socket,
+                        &mut iopub_socket,
+                        &mut state,
+                        &execute_tx,
+                        shutdown.as_ref(),
+                    )?;
+                }
+                ChannelKind::Stdin => {
+                    handle_stdin_message(frames, &state)?;
+                }
             }
         }
     });
@@ -1732,11 +1815,12 @@ fn spawn_message_loop_thread(
 }
 
 fn handle_request(
+    runtime: &Runtime,
     channel: ChannelKind,
     frames: Vec<Vec<u8>>,
-    reply_socket: &zmq::Socket,
-    stdin_socket: &zmq::Socket,
-    iopub_socket: &zmq::Socket,
+    reply_socket: &mut RouterSocket,
+    stdin_socket: &mut RouterSocket,
+    iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     execute_tx: &mpsc::Sender<ExecuteUpdate>,
     shutdown: &ShutdownSignal,
@@ -1747,10 +1831,11 @@ fn handle_request(
     };
 
     let parent_header = request.header_value.clone();
-    publish_status(iopub_socket, state, parent_header.clone(), "busy")?;
+    publish_status(runtime, iopub_socket, state, parent_header.clone(), "busy")?;
 
     let disposition = match channel {
         ChannelKind::Shell => handle_shell_request(
+            runtime,
             reply_socket,
             stdin_socket,
             iopub_socket,
@@ -1759,13 +1844,14 @@ fn handle_request(
             &request,
         )?,
         ChannelKind::Control => {
-            handle_control_request(reply_socket, iopub_socket, state, &request)?
+            handle_control_request(runtime, reply_socket, iopub_socket, state, &request)?
         }
+        ChannelKind::Stdin => unreachable!("stdin messages are handled before request dispatch"),
     };
 
     match disposition {
         RequestDisposition::Complete { should_stop } => {
-            publish_status(iopub_socket, state, parent_header, "idle")?;
+            publish_status(runtime, iopub_socket, state, parent_header, "idle")?;
 
             if should_stop {
                 shutdown.request_stop();
@@ -1845,8 +1931,9 @@ fn spawn_execute_request_from_handle(
 }
 
 fn finalize_execute_completion(
-    reply_socket: &zmq::Socket,
-    iopub_socket: &zmq::Socket,
+    runtime: &Runtime,
+    reply_socket: &mut RouterSocket,
+    iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request_id: u64,
     completion: ExecuteCompletion,
@@ -1865,6 +1952,7 @@ fn finalize_execute_completion(
 
     if !silent {
         publish_comm_events(
+            runtime,
             iopub_socket,
             state,
             request.header_value.clone(),
@@ -1872,6 +1960,7 @@ fn finalize_execute_completion(
         )?;
         let debug_events = filter_worker_debug_events_for_publish(state, &outcome.debug_events)?;
         publish_debug_events(
+            runtime,
             iopub_socket,
             state,
             request.header_value.clone(),
@@ -1888,6 +1977,7 @@ fn finalize_execute_completion(
             for display in outcome.displays {
                 if !display.content.is_null() {
                     publish_iopub_message(
+                        runtime,
                         iopub_socket,
                         state,
                         request.header_value.clone(),
@@ -1896,6 +1986,7 @@ fn finalize_execute_completion(
                     )?;
                 } else {
                     publish_display_event(
+                        runtime,
                         iopub_socket,
                         state,
                         request.header_value.clone(),
@@ -1909,6 +2000,7 @@ fn finalize_execute_completion(
 
             if let Some(result) = outcome.result {
                 publish_iopub_message(
+                    runtime,
                     iopub_socket,
                     state,
                     request.header_value.clone(),
@@ -1923,6 +2015,7 @@ fn finalize_execute_completion(
         }
 
         send_reply(
+            runtime,
             reply_socket,
             state,
             &request,
@@ -1943,6 +2036,7 @@ fn finalize_execute_completion(
 
         if !silent {
             publish_iopub_message(
+                runtime,
                 iopub_socket,
                 state,
                 request.header_value.clone(),
@@ -1956,6 +2050,7 @@ fn finalize_execute_completion(
         }
 
         send_reply(
+            runtime,
             reply_socket,
             state,
             &request,
@@ -1972,7 +2067,13 @@ fn finalize_execute_completion(
         )?;
     }
 
-    publish_status(iopub_socket, state, request.header_value.clone(), "idle")?;
+    publish_status(
+        runtime,
+        iopub_socket,
+        state,
+        request.header_value.clone(),
+        "idle",
+    )?;
     Ok(())
 }
 
@@ -2008,9 +2109,10 @@ fn filter_worker_debug_events_for_publish(
 }
 
 fn handle_shell_request(
-    reply_socket: &zmq::Socket,
-    stdin_socket: &zmq::Socket,
-    iopub_socket: &zmq::Socket,
+    runtime: &Runtime,
+    reply_socket: &mut RouterSocket,
+    stdin_socket: &mut RouterSocket,
+    iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     execute_tx: &mpsc::Sender<ExecuteUpdate>,
     request: &JupyterMessage,
@@ -2018,6 +2120,7 @@ fn handle_shell_request(
     match request.header.msg_type.as_str() {
         "kernel_info_request" => {
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2028,6 +2131,7 @@ fn handle_shell_request(
         }
         "connect_request" => {
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2067,6 +2171,7 @@ fn handle_shell_request(
 
             if !silent {
                 publish_iopub_message(
+                    runtime,
                     iopub_socket,
                     state,
                     request.header_value.clone(),
@@ -2100,6 +2205,7 @@ fn handle_shell_request(
                         store_history,
                         |prompt, password| {
                             request_stdin_input(
+                                runtime,
                                 stdin_socket,
                                 &signer,
                                 &kernel_session,
@@ -2113,6 +2219,7 @@ fn handle_shell_request(
                         |name, text| {
                             if !silent {
                                 publish_stream(
+                                    runtime,
                                     iopub_socket,
                                     state,
                                     request.header_value.clone(),
@@ -2127,6 +2234,7 @@ fn handle_shell_request(
                 };
 
                 finalize_execute_completion(
+                    runtime,
                     reply_socket,
                     iopub_socket,
                     state,
@@ -2188,6 +2296,7 @@ fn handle_shell_request(
                 .unwrap_or_default();
             let outcome = state.with_worker(|worker| worker.is_complete(code))?;
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2213,6 +2322,7 @@ fn handle_shell_request(
             let completion =
                 state.with_worker(|worker| worker.complete(code, cursor_pos.max(0) as usize))?;
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2247,6 +2357,7 @@ fn handle_shell_request(
                 worker.inspect(code, cursor_pos.max(0) as usize, detail_level as u8)
             })?;
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2262,6 +2373,7 @@ fn handle_shell_request(
         }
         "history_request" => {
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2285,7 +2397,7 @@ fn handle_shell_request(
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
             let outcome = state
                 .with_worker(|worker| worker.comm_open(comm_id, target_name, data, metadata))?;
-            handle_comm_outcome(iopub_socket, state, request, &outcome)?;
+            handle_comm_outcome(runtime, iopub_socket, state, request, &outcome)?;
             if outcome.registered {
                 state.register_comm(&request.content);
             } else {
@@ -2302,7 +2414,7 @@ fn handle_shell_request(
             let data = request.content.get("data").unwrap_or(&Value::Null);
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
             let outcome = state.with_worker(|worker| worker.comm_msg(comm_id, data, metadata))?;
-            handle_comm_outcome(iopub_socket, state, request, &outcome)?;
+            handle_comm_outcome(runtime, iopub_socket, state, request, &outcome)?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "comm_close" => {
@@ -2314,12 +2426,13 @@ fn handle_shell_request(
             let data = request.content.get("data").unwrap_or(&Value::Null);
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
             let outcome = state.with_worker(|worker| worker.comm_close(comm_id, data, metadata))?;
-            handle_comm_outcome(iopub_socket, state, request, &outcome)?;
+            handle_comm_outcome(runtime, iopub_socket, state, request, &outcome)?;
             state.close_comm(&request.content);
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "comm_info_request" => {
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2328,20 +2441,24 @@ fn handle_shell_request(
             )?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
-        "shutdown_request" => handle_shutdown_request(reply_socket, iopub_socket, state, request),
-        _ => send_unsupported_reply(reply_socket, state, request),
+        "shutdown_request" => {
+            handle_shutdown_request(runtime, reply_socket, iopub_socket, state, request)
+        }
+        _ => send_unsupported_reply(runtime, reply_socket, state, request),
     }
 }
 
 fn handle_control_request(
-    reply_socket: &zmq::Socket,
-    iopub_socket: &zmq::Socket,
+    runtime: &Runtime,
+    reply_socket: &mut RouterSocket,
+    iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
     match request.header.msg_type.as_str() {
         "kernel_info_request" => {
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2352,6 +2469,7 @@ fn handle_control_request(
         }
         "connect_request" => {
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2360,12 +2478,15 @@ fn handle_control_request(
             )?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
-        "shutdown_request" => handle_shutdown_request(reply_socket, iopub_socket, state, request),
+        "shutdown_request" => {
+            handle_shutdown_request(runtime, reply_socket, iopub_socket, state, request)
+        }
         "interrupt_request" => {
             if state.is_executing() {
                 state.interrupt()?;
             }
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2376,6 +2497,7 @@ fn handle_control_request(
         }
         "usage_request" => {
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2386,12 +2508,13 @@ fn handle_control_request(
         }
         "debug_request" => {
             let content = state.debug_reply_content(&request.content)?;
-            send_reply(reply_socket, state, request, "debug_reply", content)?;
+            send_reply(runtime, reply_socket, state, request, "debug_reply", content)?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "create_subshell_request" => {
             let content = state.create_subshell_reply_content()?;
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2403,6 +2526,7 @@ fn handle_control_request(
         "delete_subshell_request" => {
             let content = state.delete_subshell_reply_content(&request.content)?;
             send_reply(
+                runtime,
                 reply_socket,
                 state,
                 request,
@@ -2413,16 +2537,17 @@ fn handle_control_request(
         }
         "list_subshell_request" => {
             let content = state.list_subshell_reply_content()?;
-            send_reply(reply_socket, state, request, "list_subshell_reply", content)?;
+            send_reply(runtime, reply_socket, state, request, "list_subshell_reply", content)?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
-        _ => send_unsupported_reply(reply_socket, state, request),
+        _ => send_unsupported_reply(runtime, reply_socket, state, request),
     }
 }
 
 fn handle_shutdown_request(
-    reply_socket: &zmq::Socket,
-    iopub_socket: &zmq::Socket,
+    runtime: &Runtime,
+    reply_socket: &mut RouterSocket,
+    iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
@@ -2437,6 +2562,7 @@ fn handle_shutdown_request(
     }
 
     send_reply(
+        runtime,
         reply_socket,
         state,
         request,
@@ -2447,6 +2573,7 @@ fn handle_shutdown_request(
         }),
     )?;
     publish_iopub_message(
+        runtime,
         iopub_socket,
         state,
         request.header_value.clone(),
@@ -2462,12 +2589,14 @@ fn handle_shutdown_request(
 }
 
 fn send_unsupported_reply(
-    reply_socket: &zmq::Socket,
+    runtime: &Runtime,
+    reply_socket: &mut RouterSocket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
     let reply_type = reply_type_for(&request.header.msg_type);
     send_reply(
+        runtime,
         reply_socket,
         state,
         request,
@@ -2483,7 +2612,8 @@ fn send_unsupported_reply(
 }
 
 fn request_stdin_input(
-    stdin_socket: &zmq::Socket,
+    runtime: &Runtime,
+    stdin_socket: &mut RouterSocket,
     signer: &MessageSigner,
     kernel_session: &str,
     identities: &[Vec<u8>],
@@ -2507,19 +2637,19 @@ fn request_stdin_input(
         }),
     );
 
-    stdin_socket
-        .send_multipart(
-            signer
-                .encode(&input_request)
-                .map_err(|error| error.to_string())?,
-            0,
-        )
+    send_frames(
+        runtime,
+        stdin_socket,
+        signer
+            .encode(&input_request)
+            .map_err(|error| error.to_string())?,
+    )
         .map_err(|error| error.to_string())?;
 
     loop {
-        let frames = stdin_socket
-            .recv_multipart(0)
-            .map_err(|error| error.to_string())?;
+        let frames = recv_frames(runtime, stdin_socket, None)
+            .map_err(|error| error.to_string())?
+            .expect("blocking stdin receive cannot time out");
         let message = match signer.decode(frames) {
             Ok(message) => message,
             Err(_) => continue,
@@ -2551,7 +2681,8 @@ fn handle_stdin_message(frames: Vec<Vec<u8>>, state: &MessageLoopState) -> Resul
 }
 
 fn send_reply(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut impl zeromq::SocketSend,
     state: &MessageLoopState,
     request: &JupyterMessage,
     msg_type: &str,
@@ -2564,17 +2695,19 @@ fn send_reply(
         json!({}),
         content,
     );
-    socket.send_multipart(state.signer.encode(&reply)?, 0)?;
+    send_frames(runtime, socket, state.signer.encode(&reply)?)?;
     Ok(())
 }
 
 fn publish_status(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     execution_state: &str,
 ) -> Result<(), KernelError> {
     publish_iopub_message(
+        runtime,
         socket,
         state,
         parent_header,
@@ -2584,7 +2717,8 @@ fn publish_status(
 }
 
 fn publish_iopub_message(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     msg_type: &str,
@@ -2597,12 +2731,13 @@ fn publish_iopub_message(
         json!({}),
         content,
     );
-    socket.send_multipart(state.signer.encode(&message)?, 0)?;
+    send_frames(runtime, socket, state.signer.encode(&message)?)?;
     Ok(())
 }
 
 fn publish_display_event(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     msg_type: &str,
@@ -2611,6 +2746,7 @@ fn publish_display_event(
     transient: Value,
 ) -> Result<(), KernelError> {
     publish_iopub_message(
+        runtime,
         socket,
         state,
         parent_header,
@@ -2624,13 +2760,15 @@ fn publish_display_event(
 }
 
 fn publish_comm_events(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &mut MessageLoopState,
     parent_header: Value,
     events: &[WorkerCommEvent],
 ) -> Result<(), KernelError> {
     for event in events {
         publish_iopub_message(
+            runtime,
             socket,
             state,
             parent_header.clone(),
@@ -2643,7 +2781,8 @@ fn publish_comm_events(
 }
 
 fn publish_debug_events(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     events: &[WorkerDebugEvent],
@@ -2655,6 +2794,7 @@ fn publish_debug_events(
             state.debug_session.apply_event_state(&event.content)?;
         }
         publish_iopub_message(
+            runtime,
             socket,
             state,
             parent_header.clone(),
@@ -2666,13 +2806,15 @@ fn publish_debug_events(
 }
 
 fn publish_stream(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     name: &str,
     text: &str,
 ) -> Result<(), KernelError> {
     publish_iopub_message(
+        runtime,
         socket,
         state,
         parent_header,
@@ -2685,7 +2827,8 @@ fn publish_stream(
 }
 
 fn publish_execute_stream(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     request_id: u64,
     name: &str,
@@ -2701,22 +2844,24 @@ fn publish_execute_stream(
         return Ok(());
     }
 
-    publish_stream(socket, state, pending.parent_header.clone(), name, text)
+    publish_stream(runtime, socket, state, pending.parent_header.clone(), name, text)
 }
 
 fn flush_execute_stream_batches(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     stream_batches: HashMap<u64, StreamBatch>,
 ) -> Result<(), KernelError> {
     for (request_id, batch) in stream_batches {
-        flush_execute_stream_batch(socket, state, request_id, Some(batch))?;
+        flush_execute_stream_batch(runtime, socket, state, request_id, Some(batch))?;
     }
     Ok(())
 }
 
 fn flush_execute_stream_batch(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     request_id: u64,
     batch: Option<StreamBatch>,
@@ -2726,14 +2871,15 @@ fn flush_execute_stream_batch(
     };
 
     for segment in batch.segments {
-        publish_execute_stream(socket, state, request_id, &segment.name, &segment.text)?;
+        publish_execute_stream(runtime, socket, state, request_id, &segment.name, &segment.text)?;
     }
 
     Ok(())
 }
 
 fn publish_execute_debug_event(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     request_id: u64,
     event: &WorkerDebugEvent,
@@ -2766,6 +2912,7 @@ fn publish_execute_debug_event(
     }
 
     publish_iopub_message(
+        runtime,
         socket,
         state,
         pending.parent_header.clone(),
@@ -2775,17 +2922,19 @@ fn publish_execute_debug_event(
 }
 
 fn drain_debug_session_events(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
 ) -> Result<(), KernelError> {
     while let Some(event) = state.debug_session.try_recv_event()? {
-        publish_debug_session_event(socket, state, event)?;
+        publish_debug_session_event(runtime, socket, state, event)?;
     }
     Ok(())
 }
 
 fn publish_debug_session_event(
-    socket: &zmq::Socket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     event: DebugEventEnvelope,
 ) -> Result<(), KernelError> {
@@ -2812,17 +2961,19 @@ fn publish_debug_session_event(
         return Ok(());
     };
 
-    publish_iopub_message(socket, state, parent_header, "debug_event", event.event)
+    publish_iopub_message(runtime, socket, state, parent_header, "debug_event", event.event)
 }
 
 fn handle_comm_outcome(
-    iopub_socket: &zmq::Socket,
+    runtime: &Runtime,
+    iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
     outcome: &CommOutcome,
 ) -> Result<(), KernelError> {
     if !outcome.stdout.is_empty() {
         publish_stream(
+            runtime,
             iopub_socket,
             state,
             request.header_value.clone(),
@@ -2832,6 +2983,7 @@ fn handle_comm_outcome(
     }
     if !outcome.stderr.is_empty() {
         publish_stream(
+            runtime,
             iopub_socket,
             state,
             request.header_value.clone(),
@@ -2840,6 +2992,7 @@ fn handle_comm_outcome(
         )?;
     }
     publish_comm_events(
+        runtime,
         iopub_socket,
         state,
         request.header_value.clone(),
@@ -2857,20 +3010,20 @@ fn reply_type_for(msg_type: &str) -> String {
 }
 
 fn spawn_heartbeat_thread(
-    context: zmq::Context,
     endpoint: String,
     shutdown: Arc<ShutdownSignal>,
 ) -> (
-    JoinHandle<Result<(), zmq::Error>>,
-    mpsc::Receiver<Result<(), zmq::Error>>,
+    JoinHandle<Result<(), ZmqError>>,
+    mpsc::Receiver<Result<(), ZmqError>>,
 ) {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let handle = thread::spawn(move || {
-        let socket = context.socket(zmq::REP)?;
-        socket.set_linger(0)?;
-        socket.set_rcvtimeo(HEARTBEAT_POLL_INTERVAL_MS)?;
-        if let Err(error) = socket.bind(&endpoint) {
-            let _ = ready_tx.send(Err(error.clone()));
+        let runtime = build_transport_runtime();
+        let mut socket = RepSocket::new();
+        if let Err(error) = runtime.block_on(socket.bind(&endpoint)) {
+            let _ = ready_tx.send(Err(ZmqError::Network(io::Error::other(
+                error.to_string(),
+            ))));
             return Err(error);
         }
         let _ = ready_tx.send(Ok(()));
@@ -2880,10 +3033,15 @@ fn spawn_heartbeat_thread(
                 return Ok(());
             }
 
-            match socket.recv_multipart(0) {
-                Ok(message) => socket.send_multipart(message, 0)?,
-                Err(zmq::Error::EAGAIN) => {}
-                Err(zmq::Error::ETERM) if shutdown.is_stopped() => return Ok(()),
+            match recv_frames(
+                &runtime,
+                &mut socket,
+                Some(Duration::from_millis(HEARTBEAT_POLL_INTERVAL_MS as u64)),
+            ) {
+                Ok(Some(message)) => {
+                    runtime.block_on(socket.send(multipart_message(message)?))?;
+                }
+                Ok(None) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2925,15 +3083,154 @@ pub fn runtime_info() -> KernelRuntimeInfo {
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
+    use zeromq::Socket as _;
+    use zeromq::SocketSend as _;
+    use zeromq::{DealerSocket, ReqSocket, SocketOptions, SubSocket, ZmqError};
 
-    use super::{ConnectionConfig, ConnectionInfo, KernelError, start_kernel};
+    use super::{
+        ConnectionConfig, ConnectionInfo, KernelError, build_transport_runtime, multipart_message,
+        recv_frames, start_kernel,
+    };
     use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
-    use crate::zmq;
+
+    mod zmq {
+        use super::*;
+
+        #[derive(Clone, Copy)]
+        pub enum SocketType {
+            Dealer,
+            Sub,
+            Req,
+        }
+
+        #[derive(Clone)]
+        pub struct Context {
+            runtime: Arc<tokio::runtime::Runtime>,
+        }
+
+        impl Context {
+            pub fn new() -> Self {
+                Self {
+                    runtime: Arc::new(build_transport_runtime()),
+                }
+            }
+
+            pub fn socket(&self, socket_type: SocketType) -> Result<Socket, ZmqError> {
+                Ok(Socket::new(Arc::clone(&self.runtime), socket_type))
+            }
+        }
+
+        pub struct Socket {
+            runtime: Arc<tokio::runtime::Runtime>,
+            inner: Mutex<InnerSocket>,
+            rcvtimeo: Mutex<Option<Duration>>,
+            sndtimeo: Mutex<Option<Duration>>,
+        }
+
+        enum InnerSocket {
+            Dealer(DealerSocket),
+            Sub(SubSocket),
+            Req(ReqSocket),
+        }
+
+        impl Socket {
+            fn new(runtime: Arc<tokio::runtime::Runtime>, socket_type: SocketType) -> Self {
+                let inner = match socket_type {
+                    SocketType::Dealer => InnerSocket::Dealer(DealerSocket::new()),
+                    SocketType::Sub => InnerSocket::Sub(SubSocket::new()),
+                    SocketType::Req => InnerSocket::Req(ReqSocket::new()),
+                };
+                Self {
+                    runtime,
+                    inner: Mutex::new(inner),
+                    rcvtimeo: Mutex::new(None),
+                    sndtimeo: Mutex::new(None),
+                }
+            }
+
+            pub fn set_rcvtimeo(&self, timeout_ms: i32) -> Result<(), ZmqError> {
+                *self.rcvtimeo.lock().expect("test rcvtimeo mutex poisoned") =
+                    if timeout_ms < 0 {
+                        None
+                    } else {
+                        Some(Duration::from_millis(timeout_ms as u64))
+                    };
+                Ok(())
+            }
+
+            pub fn set_sndtimeo(&self, timeout_ms: i32) -> Result<(), ZmqError> {
+                *self.sndtimeo.lock().expect("test sndtimeo mutex poisoned") =
+                    if timeout_ms < 0 {
+                        None
+                    } else {
+                        Some(Duration::from_millis(timeout_ms as u64))
+                    };
+                Ok(())
+            }
+
+            pub fn set_identity(&self, identity: &[u8]) -> Result<(), ZmqError> {
+                let mut options = SocketOptions::default();
+                options.peer_identity(
+                    zeromq::util::PeerIdentity::try_from(identity.to_vec())
+                        .map_err(|_| ZmqError::PeerIdentity)?,
+                );
+
+                let mut inner = self.inner.lock().expect("test socket mutex poisoned");
+                *inner = match &*inner {
+                    InnerSocket::Dealer(_) => InnerSocket::Dealer(DealerSocket::with_options(options)),
+                    InnerSocket::Req(_) => InnerSocket::Req(ReqSocket::with_options(options)),
+                    InnerSocket::Sub(_) => return Err(ZmqError::Socket("identity is unsupported for SUB socket")),
+                };
+                Ok(())
+            }
+
+            pub fn set_subscribe(&self, subscription: &[u8]) -> Result<(), ZmqError> {
+                let mut inner = self.inner.lock().expect("test socket mutex poisoned");
+                match &mut *inner {
+                    InnerSocket::Sub(socket) => self
+                        .runtime
+                        .block_on(socket.subscribe(&String::from_utf8_lossy(subscription))),
+                    _ => Err(ZmqError::Socket("subscriptions are only supported for SUB sockets")),
+                }
+            }
+
+            pub fn connect(&self, endpoint: &str) -> Result<(), ZmqError> {
+                let mut inner = self.inner.lock().expect("test socket mutex poisoned");
+                match &mut *inner {
+                    InnerSocket::Dealer(socket) => self.runtime.block_on(socket.connect(endpoint)),
+                    InnerSocket::Sub(socket) => self.runtime.block_on(socket.connect(endpoint)),
+                    InnerSocket::Req(socket) => self.runtime.block_on(socket.connect(endpoint)),
+                }
+            }
+
+            pub fn send_multipart(&self, frames: Vec<Vec<u8>>, _flags: i32) -> Result<(), ZmqError> {
+                let _timeout = *self.sndtimeo.lock().expect("test sndtimeo mutex poisoned");
+                let message = multipart_message(frames)?;
+                let mut inner = self.inner.lock().expect("test socket mutex poisoned");
+                match &mut *inner {
+                    InnerSocket::Dealer(socket) => self.runtime.block_on(socket.send(message)),
+                    InnerSocket::Req(socket) => self.runtime.block_on(socket.send(message)),
+                    InnerSocket::Sub(_) => Err(ZmqError::Socket("cannot send on SUB socket")),
+                }
+            }
+
+            pub fn recv_multipart(&self, _flags: i32) -> Result<Vec<Vec<u8>>, ZmqError> {
+                let timeout = *self.rcvtimeo.lock().expect("test rcvtimeo mutex poisoned");
+                let mut inner = self.inner.lock().expect("test socket mutex poisoned");
+                let message = match &mut *inner {
+                    InnerSocket::Dealer(socket) => recv_frames(&self.runtime, socket, timeout)?,
+                    InnerSocket::Sub(socket) => recv_frames(&self.runtime, socket, timeout)?,
+                    InnerSocket::Req(socket) => recv_frames(&self.runtime, socket, timeout)?,
+                };
+                message.ok_or(ZmqError::NoMessage)
+            }
+        }
+    }
 
     fn test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3029,16 +3326,16 @@ mod tests {
         let mut runtime = start_kernel(connection).unwrap();
 
         let context = zmq::Context::new();
-        let socket = context.socket(zmq::REQ).unwrap();
+        let socket = context.socket(zmq::SocketType::Req).unwrap();
         socket.set_rcvtimeo(2_000).unwrap();
         socket.set_sndtimeo(2_000).unwrap();
         socket.connect(&runtime.channel_endpoints().hb).unwrap();
 
         thread::sleep(Duration::from_millis(100));
 
-        socket.send("ping", 0).unwrap();
-        let reply = socket.recv_bytes(0).unwrap();
-        assert_eq!(reply, b"ping");
+        socket.send_multipart(vec![b"ping".to_vec()], 0).unwrap();
+        let reply = socket.recv_multipart(0).unwrap();
+        assert_eq!(reply, vec![b"ping".to_vec()]);
 
         runtime.stop().unwrap();
         assert!(!runtime.is_running());
@@ -5770,7 +6067,7 @@ mod tests {
     }
 
     fn connect_dealer(context: &zmq::Context, endpoint: &str, identity: &[u8]) -> zmq::Socket {
-        let socket = context.socket(zmq::DEALER).unwrap();
+        let socket = context.socket(zmq::SocketType::Dealer).unwrap();
         socket.set_identity(identity).unwrap();
         socket.set_rcvtimeo(2_000).unwrap();
         socket.set_sndtimeo(2_000).unwrap();
@@ -5780,7 +6077,7 @@ mod tests {
     }
 
     fn connect_subscriber(context: &zmq::Context, endpoint: &str) -> zmq::Socket {
-        let socket = context.socket(zmq::SUB).unwrap();
+        let socket = context.socket(zmq::SocketType::Sub).unwrap();
         socket.set_rcvtimeo(2_000).unwrap();
         socket.set_subscribe(b"").unwrap();
         socket.connect(endpoint).unwrap();
@@ -5802,10 +6099,10 @@ mod tests {
     fn try_recv_message(
         socket: &zmq::Socket,
         signer: &MessageSigner,
-    ) -> Result<Option<JupyterMessage>, zmq::Error> {
+    ) -> Result<Option<JupyterMessage>, ZmqError> {
         match socket.recv_multipart(0) {
             Ok(frames) => Ok(Some(signer.decode(frames).unwrap())),
-            Err(zmq::Error::EAGAIN) => Ok(None),
+            Err(ZmqError::NoMessage) => Ok(None),
             Err(error) => Err(error),
         }
     }
