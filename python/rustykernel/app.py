@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -49,6 +50,10 @@ class KernelApp:
             return 0
 
         parse_connection_file(self.connection_file)
+        os.environ["RUSTYKERNEL_PYTHON_EXECUTABLE"] = sys.executable
+        os.environ["RUSTYKERNEL_PYTHON_VERSION"] = ".".join(
+            str(part) for part in sys.version_info[:3]
+        )
         kernel = start_kernel(self.connection_file)
 
         try:

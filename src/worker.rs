@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use crate::kernel::KernelError;
 
 const PYTHON_WORKER_SCRIPT: &str = include_str!("../python/rustykernel/worker_main.py");
+pub const WORKER_PYTHON_EXECUTABLE_ENV: &str = "RUSTYKERNEL_PYTHON_EXECUTABLE";
 #[cfg(unix)]
 const WORKER_PROTOCOL_ENV: &str = "RUSTYKERNEL_PROTOCOL_FD";
 #[cfg(unix)]
@@ -374,15 +375,20 @@ impl PythonWorker {
         #[cfg(unix)]
         let (protocol_read, protocol_write) = create_worker_protocol_pipe()?;
 
-        let interpreter = if python_supports_ipython("python3", &[]) {
-            ("python3", Vec::<&str>::new())
-        } else if python_supports_ipython("uv", &["run", "python"]) {
-            ("uv", vec!["run", "python"])
+        let mut command = if let Some(executable) = std::env::var_os(WORKER_PYTHON_EXECUTABLE_ENV) {
+            Command::new(executable)
         } else {
-            ("python3", Vec::<&str>::new())
+            let interpreter = if python_supports_ipython("python3", &[]) {
+                ("python3", Vec::<&str>::new())
+            } else if python_supports_ipython("uv", &["run", "python"]) {
+                ("uv", vec!["run", "python"])
+            } else {
+                ("python3", Vec::<&str>::new())
+            };
+            let mut command = Command::new(interpreter.0);
+            command.args(interpreter.1);
+            command
         };
-
-        let mut command = Command::new(interpreter.0);
         #[cfg(unix)]
         {
             let protocol_write_fd = protocol_write.as_raw_fd();
@@ -392,7 +398,6 @@ impl PythonWorker {
             }
         }
         command
-            .args(interpreter.1)
             .arg("-u")
             .arg("-c")
             .arg(PYTHON_WORKER_SCRIPT)

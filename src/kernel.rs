@@ -28,6 +28,7 @@ use crate::worker::{
 const CHANNEL_POLL_INTERVAL_IDLE_MS: i64 = 10;
 const CHANNEL_POLL_INTERVAL_EXECUTING_MS: i64 = 1;
 const HEARTBEAT_POLL_INTERVAL_MS: i32 = 10;
+const PYTHON_VERSION_ENV: &str = "RUSTYKERNEL_PYTHON_VERSION";
 
 #[derive(Deserialize)]
 struct ConnectionConfig {
@@ -213,8 +214,8 @@ struct MessageLoopState {
     execution_count: u32,
     history: HistoryStore,
     comms: CommStore,
-    worker: Arc<Mutex<PythonWorker>>,
-    worker_interrupt: WorkerInterruptHandle,
+    worker: Arc<Mutex<Option<PythonWorker>>>,
+    worker_interrupt: Option<WorkerInterruptHandle>,
     worker_kernel_info: WorkerKernelInfo,
     #[allow(dead_code)]
     debug_session: DebugSession,
@@ -290,9 +291,15 @@ struct CommEntry {
 
 impl MessageLoopState {
     fn new(connection: &ConnectionInfo) -> Result<Self, KernelError> {
-        let mut worker = PythonWorker::start()?;
-        let worker_kernel_info = worker.kernel_info()?;
-        let worker_interrupt = worker.interrupt_handle();
+        let (worker, worker_interrupt, worker_kernel_info) =
+            if let Some(worker_kernel_info) = worker_kernel_info_from_env() {
+                (None, None, worker_kernel_info)
+            } else {
+                let mut worker = PythonWorker::start()?;
+                let worker_kernel_info = worker.kernel_info()?;
+                let worker_interrupt = worker.interrupt_handle();
+                (Some(worker), Some(worker_interrupt), worker_kernel_info)
+            };
         Ok(Self {
             connection: connection.clone(),
             signer: MessageSigner::new(&connection.signature_scheme, &connection.key)?,
@@ -311,10 +318,39 @@ impl MessageLoopState {
         })
     }
 
-    fn lock_worker(&self) -> Result<std::sync::MutexGuard<'_, PythonWorker>, KernelError> {
+    fn ensure_worker_started(&mut self) -> Result<(), KernelError> {
+        if self.worker_interrupt.is_some() {
+            return Ok(());
+        }
+
+        let worker = PythonWorker::start()?;
+        self.worker_interrupt = Some(worker.interrupt_handle());
         self.worker
             .lock()
-            .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))
+            .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))?
+            .replace(worker);
+        Ok(())
+    }
+
+    fn with_worker<T>(
+        &mut self,
+        f: impl FnOnce(&mut PythonWorker) -> Result<T, KernelError>,
+    ) -> Result<T, KernelError> {
+        self.ensure_worker_started()?;
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))?;
+        let worker = worker
+            .as_mut()
+            .ok_or_else(|| KernelError::Worker("python worker was not available".to_owned()))?;
+        f(worker)
+    }
+
+    fn worker_interrupt_handle(&self) -> Result<&WorkerInterruptHandle, KernelError> {
+        self.worker_interrupt
+            .as_ref()
+            .ok_or_else(|| KernelError::Worker("python worker interrupt handle missing".to_owned()))
     }
 
     fn next_execution_count(&mut self, content: &Value) -> u32 {
@@ -456,7 +492,7 @@ impl MessageLoopState {
     }
 
     fn create_subshell_reply_content(&mut self) -> Result<Value, KernelError> {
-        let subshell_id = self.lock_worker()?.create_subshell()?;
+        let subshell_id = self.with_worker(|worker| worker.create_subshell())?;
         Ok(json!({
             "status": "ok",
             "subshell_id": subshell_id,
@@ -470,14 +506,14 @@ impl MessageLoopState {
             .ok_or_else(|| {
                 KernelError::Worker("delete_subshell_request missing subshell_id".to_owned())
             })?;
-        self.lock_worker()?.delete_subshell(subshell_id)?;
+        self.with_worker(|worker| worker.delete_subshell(subshell_id))?;
         Ok(json!({
             "status": "ok",
         }))
     }
 
     fn list_subshell_reply_content(&mut self) -> Result<Value, KernelError> {
-        let subshell_ids = self.lock_worker()?.list_subshell()?;
+        let subshell_ids = self.with_worker(|worker| worker.list_subshell())?;
         Ok(json!({
             "status": "ok",
             "subshell_id": subshell_ids,
@@ -506,10 +542,10 @@ impl MessageLoopState {
             "threads" | "stackTrace" | "scopes" | "variables" | "continue" | "next" | "stepIn"
             | "stepOut" | "pause" => self.handle_debug_passthrough(command, request_seq, arguments),
             "debugInfo" => {
-                let reply = self.lock_worker()?.debug_request(request)?;
+                let reply = self.with_worker(|worker| worker.debug_request(request))?;
                 self.overlay_debug_info(reply)
             }
-            _ => self.lock_worker()?.debug_request(request),
+            _ => self.with_worker(|worker| worker.debug_request(request)),
         }
     }
 
@@ -522,7 +558,7 @@ impl MessageLoopState {
             available,
             host,
             port,
-        } = self.lock_worker()?.debug_listen()?;
+        } = self.with_worker(|worker| worker.debug_listen())?;
         if !available {
             return Err(KernelError::Worker(
                 "debugpy listener is not available in python worker".to_owned(),
@@ -648,7 +684,7 @@ impl MessageLoopState {
         request: &Value,
         arguments: Value,
     ) -> Result<Value, KernelError> {
-        let _ = self.lock_worker()?.debug_request(request)?;
+        let _ = self.with_worker(|worker| worker.debug_request(request))?;
         let state = self.debug_session.state_snapshot()?;
         if !state.initialized && !state.attached {
             return Ok(self.synthesize_set_breakpoints_reply(request_seq, &arguments));
@@ -963,12 +999,14 @@ impl MessageLoopState {
     }
 
     fn restart(&mut self) -> Result<(), KernelError> {
-        let worker_kernel_info = {
-            let mut worker = self.lock_worker()?;
-            worker.restart()?;
-            worker.kernel_info()?
-        };
-        self.worker_kernel_info = worker_kernel_info;
+        if self.worker_interrupt.is_some() {
+            let worker_kernel_info = self.with_worker(|worker| {
+                worker.restart()?;
+                Ok((worker.kernel_info()?, worker.interrupt_handle()))
+            })?;
+            self.worker_kernel_info = worker_kernel_info.0;
+            self.worker_interrupt = Some(worker_kernel_info.1);
+        }
         self.execution_count = 0;
         self.history.start_new_session();
         self.comms.clear();
@@ -993,14 +1031,14 @@ impl MessageLoopState {
 
         if has_subshell_execute {
             if has_live_debug_session {
-                self.worker_interrupt.interrupt()?;
+                self.worker_interrupt_handle()?.interrupt()?;
                 self.debug_session.reset()?;
             } else {
-                self.lock_worker()?.interrupt_subshells()?;
+                self.with_worker(|worker| worker.interrupt_subshells())?;
             }
         }
         if has_main_execute {
-            self.worker_interrupt.interrupt()?;
+            self.worker_interrupt_handle()?.interrupt()?;
         }
 
         Ok(())
@@ -1411,6 +1449,18 @@ fn normalize_history_index(index: i32, line_count: i32) -> i32 {
         index
     };
     adjusted.clamp(0, line_count)
+}
+
+fn worker_kernel_info_from_env() -> Option<WorkerKernelInfo> {
+    let version = std::env::var(PYTHON_VERSION_ENV).ok()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some(WorkerKernelInfo {
+        language_version: version,
+        language_version_major: major,
+        language_version_minor: minor,
+    })
 }
 
 enum ChannelKind {
@@ -2026,39 +2076,48 @@ fn handle_shell_request(
                 let kernel_session = state.kernel_session.clone();
                 let request_identities = request.identities.clone();
                 let parent_header = request.header_value.clone();
-                let outcome = state.lock_worker()?.execute(
-                    code,
-                    subshell_id.as_deref(),
-                    user_expressions,
-                    execution_count,
-                    silent,
-                    store_history,
-                    |prompt, password| {
-                        request_stdin_input(
-                            stdin_socket,
-                            &signer,
-                            &kernel_session,
-                            &request_identities,
-                            &parent_header,
-                            prompt,
-                            password,
-                            allow_stdin,
-                        )
-                    },
-                    |name, text| {
-                        if !silent {
-                            publish_stream(
-                                iopub_socket,
-                                state,
-                                request.header_value.clone(),
-                                name,
-                                text,
-                            )?;
-                        }
-                        Ok(())
-                    },
-                    |_event| Ok(()),
-                )?;
+                state.ensure_worker_started()?;
+                let outcome = {
+                    let mut worker = state.worker.lock().map_err(|_| {
+                        KernelError::Worker("python worker mutex poisoned".to_owned())
+                    })?;
+                    let worker = worker.as_mut().ok_or_else(|| {
+                        KernelError::Worker("python worker was not available".to_owned())
+                    })?;
+                    worker.execute(
+                        code,
+                        subshell_id.as_deref(),
+                        user_expressions,
+                        execution_count,
+                        silent,
+                        store_history,
+                        |prompt, password| {
+                            request_stdin_input(
+                                stdin_socket,
+                                &signer,
+                                &kernel_session,
+                                &request_identities,
+                                &parent_header,
+                                prompt,
+                                password,
+                                allow_stdin,
+                            )
+                        },
+                        |name, text| {
+                            if !silent {
+                                publish_stream(
+                                    iopub_socket,
+                                    state,
+                                    request.header_value.clone(),
+                                    name,
+                                    text,
+                                )?;
+                            }
+                            Ok(())
+                        },
+                        |_event| Ok(()),
+                    )?
+                };
 
                 finalize_execute_completion(
                     reply_socket,
@@ -2077,7 +2136,13 @@ fn handle_shell_request(
                 Ok(RequestDisposition::Deferred)
             } else {
                 let (worker_request_id, handle) = {
-                    let mut worker = state.lock_worker()?;
+                    state.ensure_worker_started()?;
+                    let mut worker = state.worker.lock().map_err(|_| {
+                        KernelError::Worker("python worker mutex poisoned".to_owned())
+                    })?;
+                    let worker = worker.as_mut().ok_or_else(|| {
+                        KernelError::Worker("python worker was not available".to_owned())
+                    })?;
                     let handle = worker.execute_async(
                         &code_owned,
                         subshell_id.as_deref(),
@@ -2114,7 +2179,7 @@ fn handle_shell_request(
                 .get("code")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let outcome = state.lock_worker()?.is_complete(code)?;
+            let outcome = state.with_worker(|worker| worker.is_complete(code))?;
             send_reply(
                 reply_socket,
                 state,
@@ -2138,9 +2203,8 @@ fn handle_shell_request(
                 .get("cursor_pos")
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
-            let completion = state
-                .lock_worker()?
-                .complete(code, cursor_pos.max(0) as usize)?;
+            let completion =
+                state.with_worker(|worker| worker.complete(code, cursor_pos.max(0) as usize))?;
             send_reply(
                 reply_socket,
                 state,
@@ -2172,11 +2236,9 @@ fn handle_shell_request(
                 .get("detail_level")
                 .and_then(Value::as_u64)
                 .unwrap_or_default();
-            let inspection = state.lock_worker()?.inspect(
-                code,
-                cursor_pos.max(0) as usize,
-                detail_level as u8,
-            )?;
+            let inspection = state.with_worker(|worker| {
+                worker.inspect(code, cursor_pos.max(0) as usize, detail_level as u8)
+            })?;
             send_reply(
                 reply_socket,
                 state,
@@ -2215,8 +2277,7 @@ fn handle_shell_request(
             let data = request.content.get("data").unwrap_or(&Value::Null);
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
             let outcome = state
-                .lock_worker()?
-                .comm_open(comm_id, target_name, data, metadata)?;
+                .with_worker(|worker| worker.comm_open(comm_id, target_name, data, metadata))?;
             handle_comm_outcome(iopub_socket, state, request, &outcome)?;
             if outcome.registered {
                 state.register_comm(&request.content);
@@ -2233,7 +2294,7 @@ fn handle_shell_request(
                 .unwrap_or_default();
             let data = request.content.get("data").unwrap_or(&Value::Null);
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
-            let outcome = state.lock_worker()?.comm_msg(comm_id, data, metadata)?;
+            let outcome = state.with_worker(|worker| worker.comm_msg(comm_id, data, metadata))?;
             handle_comm_outcome(iopub_socket, state, request, &outcome)?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
@@ -2245,7 +2306,7 @@ fn handle_shell_request(
                 .unwrap_or_default();
             let data = request.content.get("data").unwrap_or(&Value::Null);
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
-            let outcome = state.lock_worker()?.comm_close(comm_id, data, metadata)?;
+            let outcome = state.with_worker(|worker| worker.comm_close(comm_id, data, metadata))?;
             handle_comm_outcome(iopub_socket, state, request, &outcome)?;
             state.close_comm(&request.content);
             Ok(RequestDisposition::Complete { should_stop: false })
