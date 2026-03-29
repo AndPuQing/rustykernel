@@ -119,7 +119,13 @@ def record_stream_chunk(name: str, text: str) -> None:
     context.stream_chunks[name].append(text)
 
 
-def emit_live_stream(name: str, text: str, request_id: int | None = None) -> None:
+def emit_live_stream(
+    name: str,
+    text: str,
+    request_id: int | None = None,
+    *,
+    source: str = "python",
+) -> None:
     if request_id is None:
         context = try_current_request_context()
         if context is None:
@@ -134,6 +140,7 @@ def emit_live_stream(name: str, text: str, request_id: int | None = None) -> Non
             "event": "stream",
             "name": name,
             "text": text,
+            "source": source,
         }
     )
 
@@ -159,7 +166,7 @@ def take_stream_chunks(
 def flush_pending_streams(context: RequestContext) -> None:
     for name in STREAM_FDS:
         for chunk in take_stream_chunks(context.stream_pending, name, "", final=True):
-            emit_live_stream(name, chunk, context.request_id)
+            emit_live_stream(name, chunk, context.request_id, source="python")
 
 
 @contextlib.contextmanager
@@ -315,7 +322,7 @@ class WorkerStream(io.TextIOBase):
             for chunk in take_stream_chunks(
                 context.stream_pending, self._name, data, final=False
             ):
-                emit_live_stream(self._name, chunk, context.request_id)
+                emit_live_stream(self._name, chunk, context.request_id, source="python")
             return len(data)
 
         write_all(self._fd, data.encode(self.encoding, self.errors))
@@ -398,7 +405,7 @@ class FdCapture:
 
         for chunk in emit_chunks:
             with self._emit_lock:
-                emit_live_stream(name, chunk, self._request_id)
+                emit_live_stream(name, chunk, self._request_id, source="fd")
 
 
 def install_streams() -> None:

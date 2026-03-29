@@ -232,6 +232,12 @@ struct WorkerStreamEvent {
     name: String,
     #[serde(default)]
     text: String,
+    #[serde(default = "worker_stream_source_default")]
+    source: String,
+}
+
+fn worker_stream_source_default() -> String {
+    "python".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,8 +284,15 @@ struct WorkerListSubshellReply {
 
 #[derive(Debug)]
 pub enum WorkerExecutionMessage {
-    InputRequest { prompt: String, password: bool },
-    Stream { name: String, text: String },
+    InputRequest {
+        prompt: String,
+        password: bool,
+    },
+    Stream {
+        name: String,
+        text: String,
+        source: String,
+    },
     DebugEvent(WorkerDebugEvent),
     Completion(ExecutionOutcome),
     Failure(String),
@@ -367,63 +380,64 @@ impl PythonWorker {
     pub fn start() -> Result<Self, KernelError> {
         #[cfg(not(unix))]
         {
-            return Err(KernelError::Worker(
+            Err(KernelError::Worker(
                 "python worker side-channel IPC requires unix support".to_owned(),
-            ));
+            ))
         }
 
-        #[cfg(unix)]
-        let (protocol_read, protocol_write) = create_worker_protocol_pipe()?;
-
-        let mut command = if let Some(executable) = std::env::var_os(WORKER_PYTHON_EXECUTABLE_ENV) {
-            Command::new(executable)
-        } else {
-            let interpreter = if python_supports_ipython("python3", &[]) {
-                ("python3", Vec::<&str>::new())
-            } else if python_supports_ipython("uv", &["run", "python"]) {
-                ("uv", vec!["run", "python"])
-            } else {
-                ("python3", Vec::<&str>::new())
-            };
-            let mut command = Command::new(interpreter.0);
-            command.args(interpreter.1);
-            command
-        };
         #[cfg(unix)]
         {
-            let protocol_write_fd = protocol_write.as_raw_fd();
-            command.env(WORKER_PROTOCOL_ENV, WORKER_PROTOCOL_FD.to_string());
-            unsafe {
-                command.pre_exec(move || install_worker_protocol_fd(protocol_write_fd));
+            let (protocol_read, protocol_write) = create_worker_protocol_pipe()?;
+
+            let mut command =
+                if let Some(executable) = std::env::var_os(WORKER_PYTHON_EXECUTABLE_ENV) {
+                    Command::new(executable)
+                } else {
+                    let interpreter = if python_supports_ipython("python3", &[]) {
+                        ("python3", Vec::<&str>::new())
+                    } else if python_supports_ipython("uv", &["run", "python"]) {
+                        ("uv", vec!["run", "python"])
+                    } else {
+                        ("python3", Vec::<&str>::new())
+                    };
+                    let mut command = Command::new(interpreter.0);
+                    command.args(interpreter.1);
+                    command
+                };
+            {
+                let protocol_write_fd = protocol_write.as_raw_fd();
+                command.env(WORKER_PROTOCOL_ENV, WORKER_PROTOCOL_FD.to_string());
+                unsafe {
+                    command.pre_exec(move || install_worker_protocol_fd(protocol_write_fd));
+                }
             }
+            command
+                .arg("-u")
+                .arg("-c")
+                .arg(PYTHON_WORKER_SCRIPT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+
+            let mut child = command.spawn().map_err(KernelError::Io)?;
+            drop(protocol_write);
+
+            let stdin = child.stdin.take().ok_or_else(|| {
+                KernelError::Worker("python worker stdin pipe was not available".to_owned())
+            })?;
+            let interrupt_handle = WorkerInterruptHandle::new(child.id());
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let protocol_thread = Some(spawn_protocol_reader(protocol_read, Arc::clone(&pending)));
+
+            Ok(Self {
+                child,
+                stdin,
+                next_id: 1,
+                interrupt_handle,
+                pending,
+                protocol_thread,
+            })
         }
-        command
-            .arg("-u")
-            .arg("-c")
-            .arg(PYTHON_WORKER_SCRIPT)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        let mut child = command.spawn().map_err(KernelError::Io)?;
-        #[cfg(unix)]
-        drop(protocol_write);
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            KernelError::Worker("python worker stdin pipe was not available".to_owned())
-        })?;
-        let interrupt_handle = WorkerInterruptHandle::new(child.id());
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let protocol_thread = Some(spawn_protocol_reader(protocol_read, Arc::clone(&pending)));
-
-        Ok(Self {
-            child,
-            stdin,
-            next_id: 1,
-            interrupt_handle,
-            pending,
-            protocol_thread,
-        })
     }
 
     pub fn interrupt_handle(&self) -> WorkerInterruptHandle {
@@ -502,7 +516,7 @@ impl PythonWorker {
                         }
                     }
                 }
-                WorkerExecutionMessage::Stream { name, text } => on_stream(&name, &text)?,
+                WorkerExecutionMessage::Stream { name, text, .. } => on_stream(&name, &text)?,
                 WorkerExecutionMessage::DebugEvent(event) => on_debug_event(&event)?,
                 WorkerExecutionMessage::Completion(outcome) => return Ok(outcome),
                 WorkerExecutionMessage::Failure(message) => {
@@ -868,6 +882,7 @@ fn parse_worker_message_prefix(line: &str) -> Option<(u64, bool)> {
     ))
 }
 
+#[cfg(unix)]
 fn spawn_protocol_reader(
     protocol_read: OwnedFd,
     pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
@@ -951,6 +966,7 @@ fn spawn_protocol_reader(
                                 Ok(event) => WorkerExecutionMessage::Stream {
                                     name: event.name,
                                     text: event.text,
+                                    source: event.source,
                                 },
                                 Err(error) => WorkerExecutionMessage::Failure(format!(
                                     "failed to decode worker stream event: {error}"

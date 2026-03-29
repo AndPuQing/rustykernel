@@ -51,9 +51,6 @@ class KernelApp:
 
         parse_connection_file(self.connection_file)
         os.environ["RUSTYKERNEL_PYTHON_EXECUTABLE"] = sys.executable
-        os.environ["RUSTYKERNEL_PYTHON_VERSION"] = ".".join(
-            str(part) for part in sys.version_info[:3]
-        )
         kernel = start_kernel(self.connection_file)
 
         try:

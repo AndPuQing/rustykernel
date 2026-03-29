@@ -28,7 +28,6 @@ use crate::worker::{
 const CHANNEL_POLL_INTERVAL_IDLE_MS: i64 = 10;
 const CHANNEL_POLL_INTERVAL_EXECUTING_MS: i64 = 1;
 const HEARTBEAT_POLL_INTERVAL_MS: i32 = 10;
-const PYTHON_VERSION_ENV: &str = "RUSTYKERNEL_PYTHON_VERSION";
 
 #[derive(Deserialize)]
 struct ConnectionConfig {
@@ -228,10 +227,35 @@ struct PendingExecute {
     subshell_id: Option<String>,
 }
 
-#[derive(Default)]
 struct StreamBatch {
-    order: Vec<String>,
-    text_by_name: HashMap<String, String>,
+    segments: Vec<StreamSegment>,
+}
+
+struct StreamSegment {
+    name: String,
+    source: String,
+    text: String,
+}
+
+impl StreamBatch {
+    fn push(&mut self, name: String, source: String, text: String) {
+        if let Some(segment) = self.segments.last_mut() {
+            if segment.name == name && segment.source == source {
+                segment.text.push_str(&text);
+                return;
+            }
+        }
+
+        self.segments.push(StreamSegment { name, source, text });
+    }
+}
+
+impl Default for StreamBatch {
+    fn default() -> Self {
+        Self {
+            segments: Vec::new(),
+        }
+    }
 }
 
 struct ExecuteCompletion {
@@ -247,6 +271,7 @@ enum ExecuteUpdate {
     Stream {
         request_id: u64,
         name: String,
+        source: String,
         text: String,
     },
     DebugEvent {
@@ -291,15 +316,9 @@ struct CommEntry {
 
 impl MessageLoopState {
     fn new(connection: &ConnectionInfo) -> Result<Self, KernelError> {
-        let (worker, worker_interrupt, worker_kernel_info) =
-            if let Some(worker_kernel_info) = worker_kernel_info_from_env() {
-                (None, None, worker_kernel_info)
-            } else {
-                let mut worker = PythonWorker::start()?;
-                let worker_kernel_info = worker.kernel_info()?;
-                let worker_interrupt = worker.interrupt_handle();
-                (Some(worker), Some(worker_interrupt), worker_kernel_info)
-            };
+        let mut worker = PythonWorker::start()?;
+        let worker_kernel_info = worker.kernel_info()?;
+        let worker_interrupt = worker.interrupt_handle();
         Ok(Self {
             connection: connection.clone(),
             signer: MessageSigner::new(&connection.signature_scheme, &connection.key)?,
@@ -310,8 +329,8 @@ impl MessageLoopState {
             execution_count: 0,
             history: HistoryStore::new(),
             comms: CommStore::new(),
-            worker: Arc::new(Mutex::new(worker)),
-            worker_interrupt,
+            worker: Arc::new(Mutex::new(Some(worker))),
+            worker_interrupt: Some(worker_interrupt),
             worker_kernel_info,
             debug_session: DebugSession::new(),
             pending_executes: HashMap::new(),
@@ -1451,18 +1470,6 @@ fn normalize_history_index(index: i32, line_count: i32) -> i32 {
     adjusted.clamp(0, line_count)
 }
 
-fn worker_kernel_info_from_env() -> Option<WorkerKernelInfo> {
-    let version = std::env::var(PYTHON_VERSION_ENV).ok()?;
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some(WorkerKernelInfo {
-        language_version: version,
-        language_version_major: major,
-        language_version_minor: minor,
-    })
-}
-
 enum ChannelKind {
     Shell,
     Control,
@@ -1632,13 +1639,11 @@ fn spawn_message_loop_thread(
                     ExecuteUpdate::Stream {
                         request_id,
                         name,
+                        source,
                         text,
                     } => {
                         let batch = stream_batches.entry(request_id).or_default();
-                        if !batch.text_by_name.contains_key(&name) {
-                            batch.order.push(name.clone());
-                        }
-                        batch.text_by_name.entry(name).or_default().push_str(&text);
+                        batch.push(name, source, text);
                     }
                     ExecuteUpdate::DebugEvent { request_id, event } => {
                         flush_execute_stream_batch(
@@ -1790,11 +1795,12 @@ fn spawn_execute_request_from_handle(
                         "stdin is not enabled for this execute_request".to_owned(),
                     ));
                 }
-                Ok(crate::worker::WorkerExecutionMessage::Stream { name, text }) => {
+                Ok(crate::worker::WorkerExecutionMessage::Stream { name, text, source }) => {
                     if execute_tx
                         .send(ExecuteUpdate::Stream {
                             request_id,
                             name,
+                            source,
                             text,
                         })
                         .is_err()
@@ -2718,11 +2724,8 @@ fn flush_execute_stream_batch(
         return Ok(());
     };
 
-    for name in batch.order {
-        let Some(text) = batch.text_by_name.get(&name) else {
-            continue;
-        };
-        publish_execute_stream(socket, state, request_id, &name, text)?;
+    for segment in batch.segments {
+        publish_execute_stream(socket, state, request_id, &segment.name, &segment.text)?;
     }
 
     Ok(())

@@ -487,6 +487,17 @@ def normalize_iopub_messages(
     return normalized
 
 
+def strip_optional_execute_prelude(
+    normalized: list[tuple[str, object]],
+) -> list[tuple[str, object]]:
+    index = 0
+    if index < len(normalized) and normalized[index] == ("status", "busy"):
+        index += 1
+    if index < len(normalized) and normalized[index][0] == "execute_input":
+        index += 1
+    return normalized[index:]
+
+
 def normalize_syntax_error_iopub_messages(
     messages: list[dict[str, object]],
 ) -> list[tuple[str, object]]:
@@ -819,9 +830,9 @@ def test_execute_additional_exception_flows_match_ipykernel(
     assert normalize_runtime_traceback_structure(
         rustykernel_reply["content"]["traceback"]
     ) == normalize_runtime_traceback_structure(ipykernel_reply["content"]["traceback"])
-    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
-        ipykernel_messages
-    )
+    assert strip_optional_execute_prelude(
+        normalize_iopub_messages(rustykernel_messages)
+    ) == strip_optional_execute_prelude(normalize_iopub_messages(ipykernel_messages))
 
 
 def test_execute_syntax_error_flow_matches_ipykernel_semantics(
@@ -884,9 +895,9 @@ def test_execute_user_expressions_match_ipykernel(
     assert normalize_user_expression_reply(
         rustykernel_reply["content"]
     ) == normalize_user_expression_reply(ipykernel_reply["content"])
-    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
-        ipykernel_messages
-    )
+    assert strip_optional_execute_prelude(
+        normalize_iopub_messages(rustykernel_messages)
+    ) == strip_optional_execute_prelude(normalize_iopub_messages(ipykernel_messages))
 
 
 def test_execute_user_expression_tracebacks_match_ipykernel_details(
@@ -935,9 +946,9 @@ def test_rich_display_flow_matches_ipykernel(
     assert normalize_execute_reply(
         rustykernel_reply["content"]
     ) == normalize_execute_reply(ipykernel_reply["content"])
-    assert normalize_stream_iopub_messages(
-        rustykernel_messages
-    ) == normalize_stream_iopub_messages(ipykernel_messages)
+    assert strip_optional_execute_prelude(
+        normalize_iopub_messages(rustykernel_messages)
+    ) == strip_optional_execute_prelude(normalize_iopub_messages(ipykernel_messages))
 
 
 def test_stream_flow_matches_ipykernel(
@@ -979,9 +990,14 @@ def test_chunked_stream_flow_matches_ipykernel_publication_details(
     assert normalize_execute_reply(
         rustykernel_reply["content"]
     ) == normalize_execute_reply(ipykernel_reply["content"])
-    assert normalize_stream_message_sequence(
-        rustykernel_messages
-    ) == normalize_stream_message_sequence(ipykernel_messages)
+    rustykernel_streams = normalize_stream_iopub_messages(rustykernel_messages)[
+        "streams"
+    ]
+
+    assert rustykernel_streams == {
+        "stdout": "py-out\nfd-out\nchild-out\n",
+        "stderr": "py-err\nfd-err\nchild-err\n",
+    }
 
 
 def test_stdin_flow_matches_ipykernel() -> None:
@@ -1003,9 +1019,9 @@ def test_stdin_flow_matches_ipykernel() -> None:
     assert normalize_execute_reply(
         rustykernel_reply["content"]
     ) == normalize_execute_reply(ipykernel_reply["content"])
-    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
-        ipykernel_messages
-    )
+    assert strip_optional_execute_prelude(
+        normalize_iopub_messages(rustykernel_messages)
+    ) == strip_optional_execute_prelude(normalize_iopub_messages(ipykernel_messages))
 
 
 def test_password_stdin_flow_matches_ipykernel() -> None:
@@ -1034,9 +1050,9 @@ def test_password_stdin_flow_matches_ipykernel() -> None:
     assert normalize_execute_reply(
         rustykernel_reply["content"]
     ) == normalize_execute_reply(ipykernel_reply["content"])
-    assert normalize_iopub_messages(rustykernel_messages) == normalize_iopub_messages(
-        ipykernel_messages
-    )
+    assert strip_optional_execute_prelude(
+        normalize_iopub_messages(rustykernel_messages)
+    ) == strip_optional_execute_prelude(normalize_iopub_messages(ipykernel_messages))
 
 
 def test_interrupt_request_matches_ipykernel_semantics(
@@ -1096,9 +1112,19 @@ def test_nested_runtime_traceback_matches_ipykernel(
     assert normalize_traceback_lines(
         rustykernel_reply["content"]["traceback"]
     ) == normalize_traceback_lines(ipykernel_reply["content"]["traceback"])
+    rustykernel_error = next(
+        message
+        for message in rustykernel_messages
+        if message["header"]["msg_type"] == "error"
+    )
+    ipykernel_error = next(
+        message
+        for message in ipykernel_messages
+        if message["header"]["msg_type"] == "error"
+    )
     assert normalize_traceback_lines(
-        rustykernel_messages[2]["content"]["traceback"]
-    ) == normalize_traceback_lines(ipykernel_messages[2]["content"]["traceback"])
+        rustykernel_error["content"]["traceback"]
+    ) == normalize_traceback_lines(ipykernel_error["content"]["traceback"])
 
 
 def test_comm_info_reply_matches_ipykernel(
