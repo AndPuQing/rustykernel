@@ -12,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::sync::Notify;
 
 use crate::kernel::KernelError;
 
@@ -177,6 +178,7 @@ pub struct DebugSession {
     responses: Arc<Mutex<HashMap<i64, mpsc::Sender<Value>>>>,
     event_tx: mpsc::Sender<DebugEventEnvelope>,
     event_rx: Mutex<mpsc::Receiver<DebugEventEnvelope>>,
+    notifier: Arc<Notify>,
     writer: Mutex<Option<TcpStream>>,
     next_seq: AtomicI64,
 }
@@ -190,9 +192,14 @@ impl DebugSession {
             responses: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             event_rx: Mutex::new(event_rx),
+            notifier: Arc::new(Notify::new()),
             writer: Mutex::new(None),
             next_seq: AtomicI64::new(1),
         }
+    }
+
+    pub fn notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.notifier)
     }
 
     pub fn next_seq(&self) -> i64 {
@@ -273,6 +280,7 @@ impl DebugSession {
         let responses = Arc::clone(&self.responses);
         let state = Arc::clone(&self.state);
         let event_tx = self.event_tx.clone();
+        let notifier = Arc::clone(&self.notifier);
         thread::spawn(move || {
             let mut buffer = Vec::<u8>::new();
             let mut chunk = [0_u8; 4096];
@@ -308,6 +316,7 @@ impl DebugSession {
                                 event: message,
                                 parent_header: None,
                             });
+                            notifier.notify_one();
                         }
                         _ => {}
                     }
@@ -519,7 +528,9 @@ impl DebugSession {
                 event,
                 parent_header,
             })
-            .map_err(|error| KernelError::Worker(format!("failed to queue debug event: {error}")))
+            .map_err(|error| KernelError::Worker(format!("failed to queue debug event: {error}")))?;
+        self.notifier.notify_one();
+        Ok(())
     }
 
     pub fn try_recv_event(&self) -> Result<Option<DebugEventEnvelope>, KernelError> {

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sysinfo::{Pid, System};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Notify;
 use tokio::time;
 use zeromq::Socket as _;
 use zeromq::SocketRecv as _;
@@ -30,10 +31,6 @@ use crate::worker::{
     CommOutcome, ExecutionOutcome, PythonWorker, WorkerCommEvent, WorkerDebugEvent,
     WorkerDebugListen, WorkerInterruptHandle, WorkerKernelInfo,
 };
-
-const CHANNEL_POLL_INTERVAL_IDLE_MS: i64 = 10;
-const CHANNEL_POLL_INTERVAL_EXECUTING_MS: i64 = 1;
-const HEARTBEAT_POLL_INTERVAL_MS: i32 = 10;
 
 #[derive(Deserialize)]
 struct ConnectionConfig {
@@ -178,6 +175,7 @@ struct ShutdownSignal {
     is_stopped: AtomicBool,
     lock: Mutex<bool>,
     cvar: Condvar,
+    wake: Notify,
 }
 
 impl ShutdownSignal {
@@ -186,11 +184,13 @@ impl ShutdownSignal {
             is_stopped: AtomicBool::new(false),
             lock: Mutex::new(false),
             cvar: Condvar::new(),
+            wake: Notify::new(),
         }
     }
 
     fn request_stop(&self) {
         self.is_stopped.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
         if let Ok(mut stopped) = self.lock.lock() {
             *stopped = true;
             self.cvar.notify_all();
@@ -288,6 +288,31 @@ enum ExecuteUpdate {
         request_id: u64,
         completion: ExecuteCompletion,
     },
+}
+
+#[derive(Clone)]
+struct ExecuteUpdateSender {
+    tx: mpsc::Sender<ExecuteUpdate>,
+    wake: Arc<Notify>,
+}
+
+impl ExecuteUpdateSender {
+    fn new(tx: mpsc::Sender<ExecuteUpdate>) -> Self {
+        Self {
+            tx,
+            wake: Arc::new(Notify::new()),
+        }
+    }
+
+    fn send(&self, update: ExecuteUpdate) -> Result<(), mpsc::SendError<ExecuteUpdate>> {
+        self.tx.send(update)?;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.wake)
+    }
 }
 
 struct HistoryStore {
@@ -1652,33 +1677,17 @@ fn recv_frames<S: zeromq::SocketRecv>(
     })
 }
 
-fn next_channel_message(
-    runtime: &Runtime,
+async fn next_channel_message(
     shell_socket: &mut RouterSocket,
     control_socket: &mut RouterSocket,
     stdin_socket: &mut RouterSocket,
-    timeout_ms: i64,
 ) -> Result<Option<(ChannelKind, Vec<Vec<u8>>)>, ZmqError> {
-    runtime.block_on(async {
-        if timeout_ms < 0 {
-            tokio::select! {
-                biased;
-                result = shell_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Shell, frames))),
-                result = control_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Control, frames))),
-                result = stdin_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Stdin, frames))),
-            }
-        } else {
-            let sleep = time::sleep(Duration::from_millis(timeout_ms as u64));
-            tokio::pin!(sleep);
-            tokio::select! {
-                biased;
-                _ = &mut sleep => Ok(None),
-                result = shell_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Shell, frames))),
-                result = control_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Control, frames))),
-                result = stdin_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Stdin, frames))),
-            }
-        }
-    })
+    tokio::select! {
+        biased;
+        result = shell_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Shell, frames))),
+        result = control_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Control, frames))),
+        result = stdin_socket.recv() => result.map(message_to_frames).map(|frames| Some((ChannelKind::Stdin, frames))),
+    }
 }
 
 fn spawn_message_loop_thread(
@@ -1702,6 +1711,9 @@ fn spawn_message_loop_thread(
         bind_socket(&runtime, &mut control_socket, &endpoints.control)?;
         let mut state = MessageLoopState::new(&connection)?;
         let (execute_tx, execute_rx) = mpsc::channel();
+        let execute_tx = ExecuteUpdateSender::new(execute_tx);
+        let execute_wake = execute_tx.notifier();
+        let debug_wake = state.debug_session.notifier();
 
         publish_status(&runtime, &mut iopub_socket, &state, json!({}), "starting")?;
         let _ = ready_tx.send(Ok(()));
@@ -1765,18 +1777,25 @@ fn spawn_message_loop_thread(
             }
             flush_execute_stream_batches(&runtime, &mut iopub_socket, &state, stream_batches)?;
 
-            let poll_timeout_ms = if state.is_executing() {
-                CHANNEL_POLL_INTERVAL_EXECUTING_MS
-            } else {
-                CHANNEL_POLL_INTERVAL_IDLE_MS
-            };
-            let next_message = match next_channel_message(
-                &runtime,
-                &mut shell_socket,
-                &mut control_socket,
-                &mut stdin_socket,
-                poll_timeout_ms,
-            ) {
+            let execute_ready = execute_wake.notified();
+            let debug_ready = debug_wake.notified();
+            let shutdown_ready = shutdown.wake.notified();
+            tokio::pin!(execute_ready);
+            tokio::pin!(debug_ready);
+            tokio::pin!(shutdown_ready);
+            let next_message = match runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_ready => Ok(None),
+                    _ = &mut execute_ready => Ok(None),
+                    _ = &mut debug_ready => Ok(None),
+                    next_message = next_channel_message(
+                        &mut shell_socket,
+                        &mut control_socket,
+                        &mut stdin_socket,
+                    ) => next_message,
+                }
+            }) {
                 Ok(next_message) => next_message,
                 Err(error) => return Err(KernelError::Zmq(error)),
             };
@@ -1822,7 +1841,7 @@ fn handle_request(
     stdin_socket: &mut RouterSocket,
     iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
-    execute_tx: &mpsc::Sender<ExecuteUpdate>,
+    execute_tx: &ExecuteUpdateSender,
     shutdown: &ShutdownSignal,
 ) -> Result<(), KernelError> {
     let request = match state.signer.decode(frames) {
@@ -1864,7 +1883,7 @@ fn handle_request(
 }
 
 fn spawn_execute_request_from_handle(
-    execute_tx: &mpsc::Sender<ExecuteUpdate>,
+    execute_tx: &ExecuteUpdateSender,
     handle: crate::worker::WorkerExecutionHandle,
     request: JupyterMessage,
     code: String,
@@ -2114,7 +2133,7 @@ fn handle_shell_request(
     stdin_socket: &mut RouterSocket,
     iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
-    execute_tx: &mpsc::Sender<ExecuteUpdate>,
+    execute_tx: &ExecuteUpdateSender,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
     match request.header.msg_type.as_str() {
@@ -3033,11 +3052,17 @@ fn spawn_heartbeat_thread(
                 return Ok(());
             }
 
-            match recv_frames(
-                &runtime,
-                &mut socket,
-                Some(Duration::from_millis(HEARTBEAT_POLL_INTERVAL_MS as u64)),
-            ) {
+            let shutdown_ready = shutdown.wake.notified();
+            tokio::pin!(shutdown_ready);
+            let next_message = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_ready => Ok(None),
+                    result = socket.recv() => result.map(message_to_frames).map(Some),
+                }
+            });
+
+            match next_message {
                 Ok(Some(message)) => {
                     runtime.block_on(socket.send(multipart_message(message)?))?;
                 }
@@ -3339,6 +3364,59 @@ mod tests {
 
         runtime.stop().unwrap();
         assert!(!runtime.is_running());
+    }
+
+    #[test]
+    fn heartbeat_stop_returns_promptly_while_idle() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection).unwrap();
+
+        let started = std::time::Instant::now();
+        runtime.stop().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "idle heartbeat shutdown took {:?}",
+            started.elapsed()
+        );
+        assert!(!runtime.is_running());
+    }
+
+    #[test]
+    fn wait_for_shutdown_returns_after_control_shutdown_request() {
+        let _guard = test_lock();
+        let connection = test_connection_info();
+        let mut runtime = start_kernel(connection.clone()).unwrap();
+        let signer = MessageSigner::new(&connection.signature_scheme, &connection.key).unwrap();
+        let context = zmq::Context::new();
+        let control = connect_dealer(
+            &context,
+            &runtime.channel_endpoints().control,
+            b"control-client",
+        );
+
+        let request = client_request(
+            "client-session",
+            "shutdown_request",
+            json!({
+                "restart": false,
+            }),
+        );
+        send_client_message(&control, &signer, &request);
+
+        let _reply = recv_message(&control, &signer);
+
+        let started = std::time::Instant::now();
+        runtime.wait_for_shutdown();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "wait_for_shutdown took {:?}",
+            started.elapsed()
+        );
+        assert!(!runtime.is_running());
+        runtime.stop().unwrap();
     }
 
     #[test]
