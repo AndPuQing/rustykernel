@@ -143,24 +143,16 @@ pub(crate) fn handle_shell_request(
                 )?;
             }
 
-            let worker_request_id = {
-                state.ensure_worker_started()?;
-                let mut worker = state
-                    .worker
-                    .lock()
-                    .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))?;
-                let worker = worker.as_mut().ok_or_else(|| {
-                    KernelError::Worker("python worker was not available".to_owned())
-                })?;
-                worker.execute_async(
+            let worker_request_id = state.with_worker(|worker| {
+                Ok(worker.execute_async(
                     code,
                     subshell_id.as_deref(),
                     user_expressions,
                     execution_count,
                     silent,
                     store_history,
-                )?
-            };
+                )?)
+            })?;
 
             state.pending_executes.insert(
                 worker_request_id,
@@ -175,6 +167,7 @@ pub(crate) fn handle_shell_request(
                     phase: ExecutePhase::Running,
                 },
             );
+            state.on_execute_started();
             Ok(RequestDisposition::Deferred)
         }
         "is_complete_request" => {

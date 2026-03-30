@@ -15,58 +15,52 @@ use super::execute::{KernelEventSender, PendingExecute};
 use super::history::HistoryStore;
 use super::{ConnectionInfo, KernelError, process_is_kernel_descendant};
 
-pub(crate) struct MessageLoopState {
-    pub(crate) connection: ConnectionInfo,
-    pub(crate) signer: MessageSigner,
-    pub(crate) kernel_session: String,
-    pub(crate) execution_count: u32,
-    pub(crate) history: HistoryStore,
-    pub(crate) comms: CommStore,
-    pub(crate) worker: Arc<Mutex<Option<PythonWorker>>>,
-    pub(crate) kernel_events: KernelEventSender,
-    pub(crate) worker_epoch: u64,
-    pub(crate) worker_interrupt: Option<WorkerInterruptHandle>,
-    pub(crate) worker_kernel_info: WorkerKernelInfo,
-    pub(crate) debug: DebugBridge,
-    pub(crate) pending_executes: HashMap<u64, PendingExecute>,
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerLifecycleState {
+    Stopped,
+    Starting,
+    Ready,
+    Executing,
+    Interrupting,
+    Restarting,
+    Failed,
 }
 
-impl MessageLoopState {
-    pub(crate) fn new(
-        connection: &ConnectionInfo,
-        kernel_events: KernelEventSender,
-    ) -> Result<Self, KernelError> {
-        let worker_epoch = 1;
-        let mut worker = PythonWorker::start(kernel_events.clone(), worker_epoch)?;
-        let worker_kernel_info = worker.kernel_info()?;
-        let worker_interrupt = worker.interrupt_handle();
+pub(crate) struct WorkerLifecycle {
+    worker: Arc<Mutex<Option<PythonWorker>>>,
+    interrupt: Option<WorkerInterruptHandle>,
+    kernel_info: WorkerKernelInfo,
+    epoch: u64,
+    state: WorkerLifecycleState,
+    active_executes: usize,
+}
+
+impl WorkerLifecycle {
+    fn start(kernel_events: KernelEventSender) -> Result<Self, KernelError> {
+        let epoch = 1;
+        let (worker, kernel_info, interrupt) = Self::spawn_worker(kernel_events, epoch)?;
         Ok(Self {
-            connection: connection.clone(),
-            signer: MessageSigner::new(&connection.signature_scheme, &connection.key)?,
-            kernel_session: connection
-                .kernel_name
-                .clone()
-                .unwrap_or_else(|| IMPLEMENTATION.to_owned()),
-            execution_count: 0,
-            history: HistoryStore::new(),
-            comms: CommStore::new(),
             worker: Arc::new(Mutex::new(Some(worker))),
-            kernel_events,
-            worker_epoch,
-            worker_interrupt: Some(worker_interrupt),
-            worker_kernel_info,
-            debug: DebugBridge::new(),
-            pending_executes: HashMap::new(),
+            interrupt: Some(interrupt),
+            kernel_info,
+            epoch,
+            state: WorkerLifecycleState::Ready,
+            active_executes: 0,
         })
     }
 
-    pub(crate) fn ensure_worker_started(&mut self) -> Result<(), KernelError> {
-        if self.worker_interrupt.is_some() {
-            return Ok(());
-        }
+    fn spawn_worker(
+        kernel_events: KernelEventSender,
+        epoch: u64,
+    ) -> Result<(PythonWorker, WorkerKernelInfo, WorkerInterruptHandle), KernelError> {
+        let mut worker = PythonWorker::start(kernel_events, epoch)?;
+        let kernel_info = worker.kernel_info()?;
+        let interrupt = worker.interrupt_handle();
+        Ok((worker, kernel_info, interrupt))
+    }
 
-        let worker = PythonWorker::start(self.kernel_events.clone(), self.worker_epoch)?;
-        self.worker_interrupt = Some(worker.interrupt_handle());
+    fn replace_worker(&mut self, worker: PythonWorker) -> Result<(), KernelError> {
         self.worker
             .lock()
             .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))?
@@ -74,11 +68,71 @@ impl MessageLoopState {
         Ok(())
     }
 
+    fn take_worker(&mut self) -> Result<Option<PythonWorker>, KernelError> {
+        self.worker
+            .lock()
+            .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))
+            .map(|mut worker| worker.take())
+    }
+
+    fn set_failed(&mut self) {
+        self.interrupt = None;
+        self.active_executes = 0;
+        self.state = WorkerLifecycleState::Failed;
+    }
+
+    fn set_ready(&mut self, kernel_info: WorkerKernelInfo, interrupt: WorkerInterruptHandle) {
+        self.kernel_info = kernel_info;
+        self.interrupt = Some(interrupt);
+        self.active_executes = 0;
+        self.state = WorkerLifecycleState::Ready;
+    }
+
+    pub(crate) fn state(&self) -> WorkerLifecycleState {
+        self.state
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn kernel_info(&self) -> &WorkerKernelInfo {
+        &self.kernel_info
+    }
+
+    pub(crate) fn ensure_started(
+        &mut self,
+        kernel_events: KernelEventSender,
+    ) -> Result<(), KernelError> {
+        if !matches!(
+            self.state,
+            WorkerLifecycleState::Stopped | WorkerLifecycleState::Failed
+        ) {
+            return Ok(());
+        }
+
+        self.state = WorkerLifecycleState::Starting;
+        let _ = self.take_worker()?;
+
+        match Self::spawn_worker(kernel_events, self.epoch) {
+            Ok((worker, kernel_info, interrupt)) => {
+                self.replace_worker(worker)?;
+                self.set_ready(kernel_info, interrupt);
+                Ok(())
+            }
+            Err(error) => {
+                self.set_failed();
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn with_worker<T>(
         &mut self,
+        kernel_events: KernelEventSender,
         f: impl FnOnce(&mut PythonWorker) -> Result<T, KernelError>,
     ) -> Result<T, KernelError> {
-        self.ensure_worker_started()?;
+        self.ensure_started(kernel_events)?;
         let mut worker = self
             .worker
             .lock()
@@ -89,10 +143,140 @@ impl MessageLoopState {
         f(worker)
     }
 
-    pub(crate) fn worker_interrupt_handle(&self) -> Result<&WorkerInterruptHandle, KernelError> {
-        self.worker_interrupt
+    pub(crate) fn interrupt_handle(&self) -> Result<&WorkerInterruptHandle, KernelError> {
+        self.interrupt
             .as_ref()
             .ok_or_else(|| KernelError::Worker("python worker interrupt handle missing".to_owned()))
+    }
+
+    pub(crate) fn on_execute_started(&mut self) {
+        self.active_executes += 1;
+        if matches!(self.state, WorkerLifecycleState::Ready) {
+            self.state = WorkerLifecycleState::Executing;
+        }
+    }
+
+    pub(crate) fn on_execute_finished(&mut self) -> Result<(), KernelError> {
+        if self.active_executes == 0 {
+            return Err(KernelError::Worker(
+                "worker lifecycle lost track of active executes".to_owned(),
+            ));
+        }
+
+        self.active_executes -= 1;
+        if self.active_executes == 0 {
+            self.state = WorkerLifecycleState::Ready;
+        } else if !matches!(self.state, WorkerLifecycleState::Interrupting) {
+            self.state = WorkerLifecycleState::Executing;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_interrupting(&mut self) -> WorkerLifecycleState {
+        let previous = self.state;
+        if self.active_executes > 0 {
+            self.state = WorkerLifecycleState::Interrupting;
+        }
+        previous
+    }
+
+    pub(crate) fn restore_state(&mut self, state: WorkerLifecycleState) {
+        self.state = state;
+    }
+
+    pub(crate) fn restart(&mut self, kernel_events: KernelEventSender) -> Result<(), KernelError> {
+        self.state = WorkerLifecycleState::Restarting;
+        self.active_executes = 0;
+        self.epoch += 1;
+        let epoch = self.epoch;
+
+        match self.take_worker()? {
+            Some(mut worker) => {
+                if let Err(error) = worker.restart(kernel_events, epoch) {
+                    self.set_failed();
+                    return Err(error);
+                }
+                let kernel_info = worker.kernel_info()?;
+                let interrupt = worker.interrupt_handle();
+                self.replace_worker(worker)?;
+                self.set_ready(kernel_info, interrupt);
+                Ok(())
+            }
+            None => match Self::spawn_worker(kernel_events, epoch) {
+                Ok((worker, kernel_info, interrupt)) => {
+                    self.replace_worker(worker)?;
+                    self.set_ready(kernel_info, interrupt);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.set_failed();
+                    Err(error)
+                }
+            },
+        }
+    }
+}
+
+pub(crate) struct MessageLoopState {
+    pub(crate) connection: ConnectionInfo,
+    pub(crate) signer: MessageSigner,
+    pub(crate) kernel_session: String,
+    pub(crate) execution_count: u32,
+    pub(crate) history: HistoryStore,
+    pub(crate) comms: CommStore,
+    pub(crate) worker: WorkerLifecycle,
+    pub(crate) kernel_events: KernelEventSender,
+    pub(crate) debug: DebugBridge,
+    pub(crate) pending_executes: HashMap<u64, PendingExecute>,
+}
+
+impl MessageLoopState {
+    pub(crate) fn new(
+        connection: &ConnectionInfo,
+        kernel_events: KernelEventSender,
+    ) -> Result<Self, KernelError> {
+        Ok(Self {
+            connection: connection.clone(),
+            signer: MessageSigner::new(&connection.signature_scheme, &connection.key)?,
+            kernel_session: connection
+                .kernel_name
+                .clone()
+                .unwrap_or_else(|| IMPLEMENTATION.to_owned()),
+            execution_count: 0,
+            history: HistoryStore::new(),
+            comms: CommStore::new(),
+            worker: WorkerLifecycle::start(kernel_events.clone())?,
+            kernel_events,
+            debug: DebugBridge::new(),
+            pending_executes: HashMap::new(),
+        })
+    }
+
+    pub(crate) fn with_worker<T>(
+        &mut self,
+        f: impl FnOnce(&mut PythonWorker) -> Result<T, KernelError>,
+    ) -> Result<T, KernelError> {
+        self.worker.with_worker(self.kernel_events.clone(), f)
+    }
+
+    pub(crate) fn worker_interrupt_handle(&self) -> Result<&WorkerInterruptHandle, KernelError> {
+        self.worker.interrupt_handle()
+    }
+
+    pub(crate) fn worker_epoch(&self) -> u64 {
+        self.worker.epoch()
+    }
+
+    pub(crate) fn worker_lifecycle_state(&self) -> WorkerLifecycleState {
+        self.worker.state()
+    }
+
+    pub(crate) fn on_execute_started(&mut self) {
+        self.worker.on_execute_started();
+    }
+
+    pub(crate) fn on_execute_finished(&mut self) -> Result<(), KernelError> {
+        self.worker.on_execute_finished()
     }
 
     pub(crate) fn next_execution_count(&mut self, content: &Value) -> u32 {
@@ -195,9 +379,10 @@ impl MessageLoopState {
     }
 
     pub(crate) fn kernel_info_content(&self) -> Value {
-        let language_version = &self.worker_kernel_info.language_version;
-        let language_version_major = self.worker_kernel_info.language_version_major;
-        let language_version_minor = self.worker_kernel_info.language_version_minor;
+        let worker_kernel_info = self.worker.kernel_info();
+        let language_version = &worker_kernel_info.language_version;
+        let language_version_major = worker_kernel_info.language_version_major;
+        let language_version_minor = worker_kernel_info.language_version_minor;
 
         json!({
             "status": "ok",
@@ -262,16 +447,9 @@ impl MessageLoopState {
     }
 
     pub(crate) fn restart(&mut self) -> Result<(), KernelError> {
-        if self.worker_interrupt.is_some() {
-            self.worker_epoch += 1;
-            let worker_epoch = self.worker_epoch;
-            let kernel_events = self.kernel_events.clone();
-            let worker_kernel_info = self.with_worker(|worker| {
-                worker.restart(kernel_events, worker_epoch)?;
-                Ok((worker.kernel_info()?, worker.interrupt_handle()))
-            })?;
-            self.worker_kernel_info = worker_kernel_info.0;
-            self.worker_interrupt = Some(worker_kernel_info.1);
+        if let Err(error) = self.worker.restart(self.kernel_events.clone()) {
+            self.pending_executes.clear();
+            return Err(error);
         }
         self.execution_count = 0;
         self.history.start_new_session();
@@ -291,23 +469,98 @@ impl MessageLoopState {
             .values()
             .any(|pending| pending.subshell_id.is_some());
         let has_live_debug_session = self.debug.is_connected()?;
+        let previous_state = self.worker.mark_interrupting();
 
-        if has_subshell_execute {
-            if has_live_debug_session {
-                self.worker_interrupt_handle()?.interrupt()?;
-                self.debug.on_subshell_interrupt()?;
-            } else {
-                self.with_worker(|worker| worker.interrupt_subshells())?;
+        let result = (|| -> Result<(), KernelError> {
+            if has_subshell_execute {
+                if has_live_debug_session {
+                    self.worker_interrupt_handle()?.interrupt()?;
+                    self.debug.on_subshell_interrupt()?;
+                } else {
+                    self.with_worker(|worker| worker.interrupt_subshells())?;
+                }
             }
-        }
-        if has_main_execute {
-            self.worker_interrupt_handle()?.interrupt()?;
+            if has_main_execute {
+                self.worker_interrupt_handle()?.interrupt()?;
+            }
+
+            Ok(())
+        })();
+
+        if result.is_err() {
+            self.worker.restore_state(previous_state);
         }
 
-        Ok(())
+        result
     }
 
     pub(crate) fn is_executing(&self) -> bool {
-        !self.pending_executes.is_empty()
+        matches!(
+            self.worker_lifecycle_state(),
+            WorkerLifecycleState::Executing | WorkerLifecycleState::Interrupting
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkerLifecycle, WorkerLifecycleState};
+    use crate::kernel::KernelError;
+
+    fn started_lifecycle() -> WorkerLifecycle {
+        WorkerLifecycle {
+            worker: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            interrupt: None,
+            kernel_info: crate::worker::WorkerKernelInfo {
+                language_version: "3.12.0".to_owned(),
+                language_version_major: 3,
+                language_version_minor: 12,
+            },
+            epoch: 1,
+            state: WorkerLifecycleState::Ready,
+            active_executes: 0,
+        }
+    }
+
+    #[test]
+    fn lifecycle_transitions_between_ready_executing_and_interrupting() -> Result<(), KernelError> {
+        let mut lifecycle = started_lifecycle();
+
+        assert_eq!(lifecycle.state(), WorkerLifecycleState::Ready);
+        lifecycle.on_execute_started();
+        assert_eq!(lifecycle.state(), WorkerLifecycleState::Executing);
+
+        let previous = lifecycle.mark_interrupting();
+        assert_eq!(previous, WorkerLifecycleState::Executing);
+        assert_eq!(lifecycle.state(), WorkerLifecycleState::Interrupting);
+
+        lifecycle.on_execute_finished()?;
+        assert_eq!(lifecycle.state(), WorkerLifecycleState::Ready);
+        assert_eq!(lifecycle.active_executes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_keeps_interrupting_until_last_execute_finishes() -> Result<(), KernelError> {
+        let mut lifecycle = started_lifecycle();
+
+        lifecycle.on_execute_started();
+        lifecycle.on_execute_started();
+        lifecycle.mark_interrupting();
+        lifecycle.on_execute_finished()?;
+        assert_eq!(lifecycle.state(), WorkerLifecycleState::Interrupting);
+
+        lifecycle.on_execute_finished()?;
+        assert_eq!(lifecycle.state(), WorkerLifecycleState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_reports_unbalanced_execute_completion() {
+        let mut lifecycle = started_lifecycle();
+        let error = lifecycle
+            .on_execute_finished()
+            .expect_err("completion without execute should fail");
+        assert!(matches!(error, KernelError::Worker(_)));
     }
 }

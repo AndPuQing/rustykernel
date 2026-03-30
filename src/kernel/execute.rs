@@ -136,6 +136,7 @@ pub(crate) fn finalize_execute_completion(
     let pending = state.pending_executes.remove(&request_id).ok_or_else(|| {
         KernelError::Worker("received execute completion without a pending execute".to_owned())
     })?;
+    state.on_execute_finished()?;
 
     let PendingExecute {
         request,

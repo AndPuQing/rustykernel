@@ -245,7 +245,7 @@ pub(crate) fn spawn_message_loop_thread(
                         worker_epoch,
                         update,
                     } => {
-                        if worker_epoch != state.worker_epoch {
+                        if worker_epoch != state.worker_epoch() {
                             continue;
                         }
                         match update {
