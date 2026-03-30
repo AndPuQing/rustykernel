@@ -55,9 +55,10 @@ class KernelApp:
 
         try:
             while kernel.is_running:
-                time.sleep(0.25)
-        except KeyboardInterrupt:
-            pass
+                try:
+                    time.sleep(0.25)
+                except KeyboardInterrupt:
+                    kernel.interrupt()
         finally:
             kernel.stop()
 

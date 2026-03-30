@@ -203,6 +203,29 @@ impl ShutdownSignal {
     }
 }
 
+pub(crate) struct InterruptSignal {
+    pending: AtomicBool,
+    pub(crate) wake: tokio::sync::Notify,
+}
+
+impl InterruptSignal {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn request_interrupt(&self) {
+        self.pending.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+
+    pub(crate) fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
+}
+
 pub fn healthcheck() -> &'static str {
     "ok"
 }

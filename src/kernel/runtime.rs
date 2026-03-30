@@ -23,7 +23,7 @@ use super::io::{
     send_stdin_input_request,
 };
 use super::state::MessageLoopState;
-use super::{ChannelEndpoints, ConnectionInfo, KernelError, ShutdownSignal};
+use super::{ChannelEndpoints, ConnectionInfo, InterruptSignal, KernelError, ShutdownSignal};
 
 type SpawnedThread<E> = (JoinHandle<Result<(), E>>, mpsc::Receiver<Result<(), E>>);
 
@@ -31,6 +31,7 @@ pub struct KernelRuntime {
     connection: ConnectionInfo,
     endpoints: ChannelEndpoints,
     shutdown: Arc<ShutdownSignal>,
+    interrupt: Arc<InterruptSignal>,
     hb_thread: Option<JoinHandle<Result<(), ZmqError>>>,
     message_loop_thread: Option<JoinHandle<Result<(), KernelError>>>,
 }
@@ -39,6 +40,7 @@ impl KernelRuntime {
     pub fn start(connection: ConnectionInfo) -> Result<Self, KernelError> {
         let endpoints = connection.channel_endpoints();
         let shutdown = Arc::new(ShutdownSignal::new());
+        let interrupt = Arc::new(InterruptSignal::new());
 
         let (hb_thread, hb_ready) =
             spawn_heartbeat_thread(endpoints.hb.clone(), Arc::clone(&shutdown));
@@ -51,8 +53,12 @@ impl KernelRuntime {
             Err(_) => return Err(KernelError::HeartbeatThreadPanicked),
         }
 
-        let (message_loop_thread, message_loop_ready) =
-            spawn_message_loop_thread(connection.clone(), endpoints.clone(), Arc::clone(&shutdown));
+        let (message_loop_thread, message_loop_ready) = spawn_message_loop_thread(
+            connection.clone(),
+            endpoints.clone(),
+            Arc::clone(&shutdown),
+            Arc::clone(&interrupt),
+        );
         match message_loop_ready.recv() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -77,6 +83,7 @@ impl KernelRuntime {
             connection,
             endpoints,
             shutdown,
+            interrupt,
             hb_thread: Some(hb_thread),
             message_loop_thread: Some(message_loop_thread),
         })
@@ -96,6 +103,14 @@ impl KernelRuntime {
 
     pub fn wait_for_shutdown(&self) {
         self.shutdown.wait();
+    }
+
+    pub fn interrupt(&self) {
+        if self.shutdown.is_stopped() {
+            return;
+        }
+
+        self.interrupt.request_interrupt();
     }
 
     pub fn stop(&mut self) -> Result<(), KernelError> {
@@ -210,6 +225,7 @@ pub(crate) fn spawn_message_loop_thread(
     connection: ConnectionInfo,
     endpoints: ChannelEndpoints,
     shutdown: Arc<ShutdownSignal>,
+    interrupt: Arc<InterruptSignal>,
 ) -> SpawnedThread<KernelError> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let handle = thread::spawn(move || {
@@ -234,6 +250,10 @@ pub(crate) fn spawn_message_loop_thread(
         loop {
             if shutdown.is_stopped() {
                 return Ok(());
+            }
+
+            if interrupt.take_pending() && state.is_executing() {
+                state.interrupt()?;
             }
 
             drain_debug_session_events(&runtime, &mut iopub_socket, &mut state)?;
@@ -374,13 +394,16 @@ pub(crate) fn spawn_message_loop_thread(
             let kernel_ready = kernel_wake.notified();
             let debug_ready = debug_wake.notified();
             let shutdown_ready = shutdown.wake.notified();
+            let interrupt_ready = interrupt.wake.notified();
             tokio::pin!(kernel_ready);
             tokio::pin!(debug_ready);
             tokio::pin!(shutdown_ready);
+            tokio::pin!(interrupt_ready);
             let next_message = match runtime.block_on(async {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_ready => Ok(None),
+                    _ = &mut interrupt_ready => Ok(None),
                     _ = &mut kernel_ready => Ok(None),
                     _ = &mut debug_ready => Ok(None),
                     next_message = next_channel_message(

@@ -121,6 +121,26 @@ def recv_iopub_messages_for_parent(
     return messages
 
 
+def recv_iopub_messages_until_parent_predicate(
+    socket: zmq.Socket,
+    key: str,
+    parent_msg_id: str,
+    predicate,
+    timeout_s: float = 10.0,
+) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout_s
+    messages = []
+    while time.monotonic() < deadline:
+        message = recv_message(socket, key)
+        if message["parent_header"].get("msg_id") != parent_msg_id:
+            continue
+        messages.append(message)
+        if predicate(message):
+            return messages
+
+    raise AssertionError("timed out waiting for matching parent iopub message")
+
+
 @pytest.fixture()
 def zmq_context() -> zmq.Context:
     context = zmq.Context()
@@ -1422,5 +1442,90 @@ def test_control_interrupt_interrupts_running_execution(
     finally:
         shell.close(0)
         control.close(0)
+        iopub.close(0)
+        kernel.stop()
+
+
+def test_running_kernel_interrupt_interrupts_running_execution(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+    kernel = rustykernel.start_kernel(str(path))
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(kernel.endpoints.shell)
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(kernel.endpoints.iopub)
+    shell.setsockopt(zmq.RCVTIMEO, 3000)
+    iopub.setsockopt(zmq.RCVTIMEO, 3000)
+    time.sleep(0.1)
+
+    try:
+        long_running_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "import time\ntime.sleep(30)",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        recv_iopub_messages_until_parent_predicate(
+            iopub,
+            str(payload["key"]),
+            str(long_running_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "status"
+                and message["content"].get("execution_state") == "busy"
+            ),
+        )
+
+        kernel.interrupt()
+
+        long_running_reply = recv_message(shell, str(payload["key"]))
+        assert long_running_reply["content"]["status"] == "error"
+        assert long_running_reply["content"]["ename"] == "KeyboardInterrupt"
+        assert kernel.is_running is True
+
+        long_running_published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), str(long_running_header["msg_id"]), 3
+        )
+        assert [
+            message["header"]["msg_type"] for message in long_running_published[-2:]
+        ] == ["error", "status"]
+
+        probe_header = send_client_message(
+            shell,
+            str(payload["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "40 + 2",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        probe_reply = recv_message(shell, str(payload["key"]))
+        assert probe_reply["content"]["status"] == "ok"
+        probe_published = recv_iopub_messages_for_parent(
+            iopub, str(payload["key"]), str(probe_header["msg_id"]), 3
+        )
+        assert any(
+            message["header"]["msg_type"] == "execute_result"
+            and message["content"]["data"]["text/plain"] == "42"
+            for message in probe_published
+        )
+    finally:
+        shell.close(0)
         iopub.close(0)
         kernel.stop()

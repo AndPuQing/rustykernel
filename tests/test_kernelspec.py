@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -108,6 +109,49 @@ def recv_message(socket: zmq.Socket, key: str) -> dict[str, object]:
         "metadata": json.loads(payload_frames[2]),
         "content": json.loads(payload_frames[3]),
     }
+
+
+def recv_iopub_messages_for_parent(
+    socket: zmq.Socket,
+    key: str,
+    parent_msg_id: str,
+    timeout_s: float = 3.0,
+) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout_s
+    messages = []
+    idle_seen = False
+    while time.monotonic() < deadline and not idle_seen:
+        message = recv_message(socket, key)
+        if message["parent_header"].get("msg_id") != parent_msg_id:
+            continue
+        messages.append(message)
+        idle_seen = (
+            message["header"]["msg_type"] == "status"
+            and message["content"].get("execution_state") == "idle"
+        )
+
+    assert idle_seen, "timed out waiting for parent idle status"
+    return messages
+
+
+def recv_iopub_messages_until_parent_predicate(
+    socket: zmq.Socket,
+    key: str,
+    parent_msg_id: str,
+    predicate,
+    timeout_s: float = 10.0,
+) -> list[dict[str, object]]:
+    deadline = time.monotonic() + timeout_s
+    messages = []
+    while time.monotonic() < deadline:
+        message = recv_message(socket, key)
+        if message["parent_header"].get("msg_id") != parent_msg_id:
+            continue
+        messages.append(message)
+        if predicate(message):
+            return messages
+
+    raise AssertionError("timed out waiting for matching parent iopub message")
 
 
 @pytest.fixture()
@@ -324,6 +368,121 @@ def test_kernelspec_argv_starts_a_real_kernel(
                 seen_result = True
 
         assert seen_result, "kernel did not publish execute_result"
+    finally:
+        shell.close(0)
+        iopub.close(0)
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_kernelspec_cli_sigint_interrupts_execution_without_exiting(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    connection = connection_payload()
+    connection_file = write_connection_file(tmp_path, connection)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "rustykernel", "-f", str(connection_file)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=os.environ.copy(),
+    )
+
+    shell = zmq_context.socket(zmq.DEALER)
+    shell.connect(f"tcp://127.0.0.1:{connection['shell_port']}")
+    shell.setsockopt(zmq.RCVTIMEO, 3000)
+
+    iopub = zmq_context.socket(zmq.SUB)
+    iopub.setsockopt(zmq.SUBSCRIBE, b"")
+    iopub.connect(f"tcp://127.0.0.1:{connection['iopub_port']}")
+    iopub.setsockopt(zmq.RCVTIMEO, 3000)
+
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            header = send_client_message(
+                shell,
+                str(connection["key"]),
+                "python-test-session",
+                "kernel_info_request",
+                {},
+            )
+            try:
+                reply = recv_message(shell, str(connection["key"]))
+            except zmq.error.Again:
+                time.sleep(0.1)
+                continue
+            if reply["parent_header"].get("msg_id") == header["msg_id"]:
+                assert reply["header"]["msg_type"] == "kernel_info_reply"
+                break
+        else:
+            raise AssertionError("kernel did not answer kernel_info_request")
+
+        long_running_header = send_client_message(
+            shell,
+            str(connection["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "import time\ntime.sleep(30)",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        recv_iopub_messages_until_parent_predicate(
+            iopub,
+            str(connection["key"]),
+            str(long_running_header["msg_id"]),
+            lambda message: (
+                message["header"]["msg_type"] == "status"
+                and message["content"].get("execution_state") == "busy"
+            ),
+        )
+
+        process.send_signal(signal.SIGINT)
+
+        long_running_reply = recv_message(shell, str(connection["key"]))
+        assert long_running_reply["content"]["status"] == "error"
+        assert long_running_reply["content"]["ename"] == "KeyboardInterrupt"
+        assert process.poll() is None
+
+        long_running_published = recv_iopub_messages_for_parent(
+            iopub, str(connection["key"]), str(long_running_header["msg_id"]), 3
+        )
+        assert [
+            message["header"]["msg_type"] for message in long_running_published[-2:]
+        ] == ["error", "status"]
+
+        probe_header = send_client_message(
+            shell,
+            str(connection["key"]),
+            "python-test-session",
+            "execute_request",
+            {
+                "code": "40 + 2",
+                "silent": False,
+                "store_history": True,
+                "allow_stdin": False,
+                "user_expressions": {},
+                "stop_on_error": True,
+            },
+        )
+        probe_reply = recv_message(shell, str(connection["key"]))
+        assert probe_reply["content"]["status"] == "ok"
+        probe_published = recv_iopub_messages_for_parent(
+            iopub, str(connection["key"]), str(probe_header["msg_id"]), 3
+        )
+        assert any(
+            message["header"]["msg_type"] == "execute_result"
+            and message["content"]["data"]["text/plain"] == "42"
+            for message in probe_published
+        )
     finally:
         shell.close(0)
         iopub.close(0)

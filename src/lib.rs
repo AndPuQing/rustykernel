@@ -67,6 +67,12 @@ impl RunningKernel {
         self.runtime = None;
         Ok(())
     }
+
+    fn interrupt(&self) {
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.interrupt();
+        }
+    }
 }
 
 #[cfg(feature = "python")]
