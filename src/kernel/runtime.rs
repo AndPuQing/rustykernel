@@ -226,7 +226,7 @@ pub(crate) fn spawn_message_loop_thread(
         let kernel_event_tx = KernelEventSender::new(kernel_event_tx);
         let kernel_wake = kernel_event_tx.notifier();
         let mut state = MessageLoopState::new(&connection, kernel_event_tx.clone())?;
-        let debug_wake = state.debug_session.notifier();
+        let debug_wake = state.debug.notifier();
 
         publish_status(&runtime, &mut iopub_socket, &state, json!({}), "starting")?;
         let _ = ready_tx.send(Ok(()));

@@ -2,7 +2,6 @@ use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use zeromq::{PubSocket, RouterSocket};
 
-use crate::debug_session::DebugEventEnvelope;
 use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
 use crate::worker::{CommOutcome, WorkerCommEvent};
 
@@ -221,7 +220,7 @@ pub(crate) fn drain_debug_session_events(
     socket: &mut PubSocket,
     state: &mut MessageLoopState,
 ) -> Result<(), KernelError> {
-    while let Some(event) = state.debug_session.try_recv_event()? {
+    while let Some(event) = state.debug.drain_event()? {
         publish_debug_session_event(runtime, socket, state, event)?;
     }
     Ok(())
@@ -231,20 +230,8 @@ pub(crate) fn publish_debug_session_event(
     runtime: &Runtime,
     socket: &mut PubSocket,
     state: &mut MessageLoopState,
-    event: DebugEventEnvelope,
+    event: crate::debug::DebugEventEnvelope,
 ) -> Result<(), KernelError> {
-    if event.debug_epoch != 0 && event.debug_epoch != state.debug_epoch {
-        return Ok(());
-    }
-    state.debug_state.update_from_event(&event.event);
-    if matches!(
-        state.debug_session.transport()?,
-        crate::debug_session::DebugTransport::Inactive
-    ) && event.parent_header.is_none()
-    {
-        return Ok(());
-    }
-
     let parent_header = if let Some(parent_header) = event.parent_header {
         parent_header
     } else if let Some(pending) = state

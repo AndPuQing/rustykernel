@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use sysinfo::{Pid, System};
 
-use crate::debug_session::{DebugSession, DebugStateCache};
+use crate::debug::DebugBridge;
 use crate::protocol::{
     IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE, MessageHeader, MessageSigner,
 };
@@ -25,11 +25,9 @@ pub(crate) struct MessageLoopState {
     pub(crate) worker: Arc<Mutex<Option<PythonWorker>>>,
     pub(crate) kernel_events: KernelEventSender,
     pub(crate) worker_epoch: u64,
-    pub(crate) debug_epoch: u64,
     pub(crate) worker_interrupt: Option<WorkerInterruptHandle>,
     pub(crate) worker_kernel_info: WorkerKernelInfo,
-    pub(crate) debug_session: DebugSession,
-    pub(crate) debug_state: DebugStateCache,
+    pub(crate) debug: DebugBridge,
     pub(crate) pending_executes: HashMap<u64, PendingExecute>,
 }
 
@@ -55,11 +53,9 @@ impl MessageLoopState {
             worker: Arc::new(Mutex::new(Some(worker))),
             kernel_events,
             worker_epoch,
-            debug_epoch: 1,
             worker_interrupt: Some(worker_interrupt),
             worker_kernel_info,
-            debug_session: DebugSession::new(),
-            debug_state: DebugStateCache::default(),
+            debug: DebugBridge::new(),
             pending_executes: HashMap::new(),
         })
     }
@@ -281,9 +277,7 @@ impl MessageLoopState {
         self.history.start_new_session();
         self.comms.clear();
         self.pending_executes.clear();
-        self.debug_epoch += 1;
-        self.debug_session.reset()?;
-        self.debug_state = DebugStateCache::default();
+        self.debug.on_restart()?;
         Ok(())
     }
 
@@ -296,17 +290,12 @@ impl MessageLoopState {
             .pending_executes
             .values()
             .any(|pending| pending.subshell_id.is_some());
-        let has_live_debug_session = matches!(
-            self.debug_session.transport()?,
-            crate::debug_session::DebugTransport::Connected(_)
-        );
+        let has_live_debug_session = self.debug.is_connected()?;
 
         if has_subshell_execute {
             if has_live_debug_session {
                 self.worker_interrupt_handle()?.interrupt()?;
-                self.debug_epoch += 1;
-                self.debug_session.reset()?;
-                self.debug_state = DebugStateCache::default();
+                self.debug.on_subshell_interrupt()?;
             } else {
                 self.with_worker(|worker| worker.interrupt_subshells())?;
             }

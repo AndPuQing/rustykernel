@@ -304,22 +304,9 @@ pub(crate) fn publish_execute_debug_event(
     request_id: u64,
     event: &WorkerDebugEvent,
 ) -> Result<(), KernelError> {
-    let rust_session_connected = matches!(
-        state.debug_session.transport()?,
-        crate::debug_session::DebugTransport::Connected(_)
-    );
-    if rust_session_connected
-        && !(event.content.get("event") == Some(&json!("stopped"))
-            && event.content.get("seq") == Some(&json!(0)))
-    {
+    let Some(content) = state.debug.accept_worker_event(event)? else {
         return Ok(());
-    }
-    if rust_session_connected
-        || (event.content.get("event") == Some(&json!("stopped"))
-            && event.content.get("seq") == Some(&json!(0)))
-    {
-        state.debug_state.update_from_event(&event.content);
-    }
+    };
 
     let Some(pending) = state.pending_executes.get(&request_id) else {
         return Err(KernelError::Worker(
@@ -337,7 +324,7 @@ pub(crate) fn publish_execute_debug_event(
         state,
         pending.request.header_value.clone(),
         &event.msg_type,
-        event.content.clone(),
+        content,
     )
 }
 
