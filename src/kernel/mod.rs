@@ -13,7 +13,7 @@ use crate::protocol::{IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE, Protoc
 mod comms;
 mod debug;
 mod dispatch;
-mod execute;
+pub(crate) mod execute;
 mod history;
 mod io;
 mod runtime;

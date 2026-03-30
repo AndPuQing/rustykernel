@@ -14,11 +14,13 @@ use zeromq::{PubSocket, RepSocket, RouterSocket, ZmqError, ZmqMessage};
 
 use super::dispatch::{ChannelKind, handle_request};
 use super::execute::{
-    ExecuteUpdate, ExecuteUpdateSender, StreamBatch, finalize_execute_completion,
+    KernelEvent, KernelEventSender, StreamBatch, WorkerUpdateEvent, finalize_execute_completion,
     flush_execute_stream_batch, flush_execute_stream_batches, publish_execute_comm_event,
     publish_execute_debug_event, publish_execute_display_event,
 };
-use super::io::{drain_debug_session_events, handle_stdin_message, publish_status};
+use super::io::{
+    drain_debug_session_events, handle_stdin_message, publish_status, send_stdin_input_request,
+};
 use super::state::MessageLoopState;
 use super::{ChannelEndpoints, ConnectionInfo, KernelError, ShutdownSignal};
 
@@ -171,6 +173,7 @@ pub(crate) fn send_frames<S: zeromq::SocketSend>(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn recv_frames<S: zeromq::SocketRecv>(
     runtime: &Runtime,
     socket: &mut S,
@@ -219,10 +222,10 @@ pub(crate) fn spawn_message_loop_thread(
         bind_socket(&runtime, &mut stdin_socket, &endpoints.stdin)?;
         let mut control_socket = RouterSocket::new();
         bind_socket(&runtime, &mut control_socket, &endpoints.control)?;
-        let mut state = MessageLoopState::new(&connection)?;
-        let (execute_tx, execute_rx) = mpsc::channel();
-        let execute_tx = ExecuteUpdateSender::new(execute_tx);
-        let execute_wake = execute_tx.notifier();
+        let (kernel_event_tx, kernel_event_rx) = mpsc::channel();
+        let kernel_event_tx = KernelEventSender::new(kernel_event_tx);
+        let kernel_wake = kernel_event_tx.notifier();
+        let mut state = MessageLoopState::new(&connection, kernel_event_tx.clone())?;
         let debug_wake = state.debug_session.notifier();
 
         publish_status(&runtime, &mut iopub_socket, &state, json!({}), "starting")?;
@@ -233,103 +236,150 @@ pub(crate) fn spawn_message_loop_thread(
                 return Ok(());
             }
 
-            drain_debug_session_events(&runtime, &mut iopub_socket, &state)?;
+            drain_debug_session_events(&runtime, &mut iopub_socket, &mut state)?;
 
             let mut stream_batches: HashMap<u64, StreamBatch> = HashMap::new();
-            while let Ok(update) = execute_rx.try_recv() {
-                match update {
-                    ExecuteUpdate::Stream {
-                        request_id,
-                        name,
-                        source,
-                        text,
+            while let Ok(event) = kernel_event_rx.try_recv() {
+                match event {
+                    KernelEvent::WorkerUpdate {
+                        worker_epoch,
+                        update,
                     } => {
-                        let batch = stream_batches.entry(request_id).or_default();
-                        batch.push(name, source, text);
-                    }
-                    ExecuteUpdate::DebugEvent { request_id, event } => {
-                        flush_execute_stream_batch(
-                            &runtime,
-                            &mut iopub_socket,
-                            &state,
-                            request_id,
-                            stream_batches.remove(&request_id),
-                        )?;
-                        publish_execute_debug_event(
-                            &runtime,
-                            &mut iopub_socket,
-                            &state,
-                            request_id,
-                            &event,
-                        )?;
-                    }
-                    ExecuteUpdate::DisplayEvent { request_id, event } => {
-                        flush_execute_stream_batch(
-                            &runtime,
-                            &mut iopub_socket,
-                            &state,
-                            request_id,
-                            stream_batches.remove(&request_id),
-                        )?;
-                        publish_execute_display_event(
-                            &runtime,
-                            &mut iopub_socket,
-                            &state,
-                            request_id,
-                            &event,
-                        )?;
-                    }
-                    ExecuteUpdate::CommEvent { request_id, event } => {
-                        flush_execute_stream_batch(
-                            &runtime,
-                            &mut iopub_socket,
-                            &state,
-                            request_id,
-                            stream_batches.remove(&request_id),
-                        )?;
-                        publish_execute_comm_event(
-                            &runtime,
-                            &mut iopub_socket,
-                            &mut state,
-                            request_id,
-                            &event,
-                        )?;
-                    }
-                    ExecuteUpdate::Completion {
-                        request_id,
-                        completion,
-                    } => {
-                        flush_execute_stream_batch(
-                            &runtime,
-                            &mut iopub_socket,
-                            &state,
-                            request_id,
-                            stream_batches.remove(&request_id),
-                        )?;
-                        finalize_execute_completion(
-                            &runtime,
-                            &mut shell_socket,
-                            &mut iopub_socket,
-                            &mut state,
-                            request_id,
-                            completion,
-                        )?;
+                        if worker_epoch != state.worker_epoch {
+                            continue;
+                        }
+                        match update {
+                            WorkerUpdateEvent::InputRequest {
+                                request_id,
+                                prompt,
+                                password,
+                            } => {
+                                let Some(pending) = state.pending_executes.get_mut(&request_id)
+                                else {
+                                    continue;
+                                };
+                                if !pending.allow_stdin {
+                                    state.with_worker(|worker| {
+                                        worker.send_input_reply(
+                                            request_id,
+                                            String::new(),
+                                            Some(
+                                                "stdin is not enabled for this execute_request"
+                                                    .to_owned(),
+                                            ),
+                                        )
+                                    })?;
+                                    continue;
+                                }
+                                let input_request_id = send_stdin_input_request(
+                                    &runtime,
+                                    &mut stdin_socket,
+                                    &state.signer,
+                                    &state.kernel_session,
+                                    &pending.request.identities,
+                                    &pending.request.header_value,
+                                    &prompt,
+                                    password,
+                                    pending.allow_stdin,
+                                )?;
+                                pending.phase = super::execute::ExecutePhase::WaitingInput {
+                                    input_request_msg_id: input_request_id,
+                                };
+                            }
+                            WorkerUpdateEvent::Stream {
+                                request_id,
+                                name,
+                                source,
+                                text,
+                            } => {
+                                let batch = stream_batches.entry(request_id).or_default();
+                                batch.push(name, source, text);
+                            }
+                            WorkerUpdateEvent::DebugEvent { request_id, event } => {
+                                flush_execute_stream_batch(
+                                    &runtime,
+                                    &mut iopub_socket,
+                                    &state,
+                                    request_id,
+                                    stream_batches.remove(&request_id),
+                                )?;
+                                publish_execute_debug_event(
+                                    &runtime,
+                                    &mut iopub_socket,
+                                    &mut state,
+                                    request_id,
+                                    &event,
+                                )?;
+                            }
+                            WorkerUpdateEvent::DisplayEvent { request_id, event } => {
+                                flush_execute_stream_batch(
+                                    &runtime,
+                                    &mut iopub_socket,
+                                    &state,
+                                    request_id,
+                                    stream_batches.remove(&request_id),
+                                )?;
+                                publish_execute_display_event(
+                                    &runtime,
+                                    &mut iopub_socket,
+                                    &mut state,
+                                    request_id,
+                                    &event,
+                                )?;
+                            }
+                            WorkerUpdateEvent::CommEvent { request_id, event } => {
+                                flush_execute_stream_batch(
+                                    &runtime,
+                                    &mut iopub_socket,
+                                    &state,
+                                    request_id,
+                                    stream_batches.remove(&request_id),
+                                )?;
+                                publish_execute_comm_event(
+                                    &runtime,
+                                    &mut iopub_socket,
+                                    &mut state,
+                                    request_id,
+                                    &event,
+                                )?;
+                            }
+                            WorkerUpdateEvent::Completion {
+                                request_id,
+                                outcome,
+                            } => {
+                                flush_execute_stream_batch(
+                                    &runtime,
+                                    &mut iopub_socket,
+                                    &state,
+                                    request_id,
+                                    stream_batches.remove(&request_id),
+                                )?;
+                                finalize_execute_completion(
+                                    &runtime,
+                                    &mut shell_socket,
+                                    &mut iopub_socket,
+                                    &mut state,
+                                    request_id,
+                                    outcome.map_err(KernelError::Worker),
+                                )?;
+                            }
+                        }
                     }
                 }
             }
             flush_execute_stream_batches(&runtime, &mut iopub_socket, &state, stream_batches)?;
 
-            let execute_ready = execute_wake.notified();
+            let kernel_ready = kernel_wake.notified();
             let debug_ready = debug_wake.notified();
             let shutdown_ready = shutdown.wake.notified();
-            tokio::pin!(execute_ready);
+            tokio::pin!(kernel_ready);
             tokio::pin!(debug_ready);
             tokio::pin!(shutdown_ready);
             let next_message = match runtime.block_on(async {
                 tokio::select! {
                     biased;
                     _ = &mut shutdown_ready => Ok(None),
-                    _ = &mut execute_ready => Ok(None),
+                    _ = &mut kernel_ready => Ok(None),
                     _ = &mut debug_ready => Ok(None),
                     next_message = next_channel_message(
                         &mut shell_socket,
@@ -361,12 +411,12 @@ pub(crate) fn spawn_message_loop_thread(
                         &mut stdin_socket,
                         &mut iopub_socket,
                         &mut state,
-                        &execute_tx,
+                        &kernel_event_tx,
                         shutdown.as_ref(),
                     )?;
                 }
                 ChannelKind::Stdin => {
-                    handle_stdin_message(frames, &state)?;
+                    handle_stdin_message(frames, &mut state)?;
                 }
             }
         }

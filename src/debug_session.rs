@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     mpsc,
 };
 use std::thread;
@@ -31,6 +31,7 @@ pub enum DebugTransport {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DebugEventEnvelope {
+    pub debug_epoch: u64,
     pub event: Value,
     pub parent_header: Option<Value>,
 }
@@ -121,6 +122,35 @@ impl DebugStateCache {
         }
     }
 
+    pub fn record_capabilities(&mut self, capabilities: Value) {
+        self.capabilities = Some(capabilities);
+    }
+
+    pub fn update_from_response(&mut self, command: &str, response: &Value) {
+        if !response
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        match command {
+            "attach" => self.attached = true,
+            "configurationDone" => self.configured = true,
+            "threads" => {
+                if let Some(threads) = response.pointer("/body/threads").and_then(Value::as_array) {
+                    self.last_threads = threads.clone();
+                }
+            }
+            "continue" | "next" | "stepIn" | "stepOut" => {
+                self.stopped_threads.clear();
+                self.last_stop_reason = None;
+                self.all_threads_stopped = false;
+            }
+            _ => {}
+        }
+    }
+
     fn load_synthetic_snapshot(&mut self, body: &serde_json::Map<String, Value>) {
         let Some(snapshot) = body.get("rustykernel").and_then(Value::as_object) else {
             return;
@@ -174,12 +204,12 @@ impl DebugStateCache {
 #[derive(Debug)]
 pub struct DebugSession {
     transport: Mutex<DebugTransport>,
-    state: Arc<Mutex<DebugStateCache>>,
     responses: Arc<Mutex<HashMap<i64, mpsc::Sender<Value>>>>,
     event_tx: mpsc::Sender<DebugEventEnvelope>,
     event_rx: Mutex<mpsc::Receiver<DebugEventEnvelope>>,
     notifier: Arc<Notify>,
     writer: Mutex<Option<TcpStream>>,
+    initialized_seen: Arc<AtomicBool>,
     next_seq: AtomicI64,
 }
 
@@ -188,12 +218,12 @@ impl DebugSession {
         let (event_tx, event_rx) = mpsc::channel();
         Self {
             transport: Mutex::new(DebugTransport::Inactive),
-            state: Arc::new(Mutex::new(DebugStateCache::default())),
             responses: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             event_rx: Mutex::new(event_rx),
             notifier: Arc::new(Notify::new()),
             writer: Mutex::new(None),
+            initialized_seen: Arc::new(AtomicBool::new(false)),
             next_seq: AtomicI64::new(1),
         }
     }
@@ -243,7 +273,11 @@ impl DebugSession {
         Ok(())
     }
 
-    pub fn connect(&self, endpoint: DebugListenEndpoint) -> Result<(), KernelError> {
+    pub fn connect(
+        &self,
+        endpoint: DebugListenEndpoint,
+        debug_epoch: u64,
+    ) -> Result<(), KernelError> {
         let stream =
             TcpStream::connect((endpoint.host.as_str(), endpoint.port)).map_err(KernelError::Io)?;
         stream.set_nodelay(true).map_err(KernelError::Io)?;
@@ -254,9 +288,10 @@ impl DebugSession {
             })?;
             *writer = Some(stream);
         }
+        self.initialized_seen.store(false, Ordering::SeqCst);
         self.set_listening(endpoint)?;
         self.set_connected()?;
-        self.spawn_recv_loop(reader);
+        self.spawn_recv_loop(reader, debug_epoch);
         Ok(())
     }
 
@@ -267,20 +302,18 @@ impl DebugSession {
         if let Ok(mut transport) = self.transport.lock() {
             *transport = DebugTransport::Inactive;
         }
-        if let Ok(mut state) = self.state.lock() {
-            *state = DebugStateCache::default();
-        }
         if let Ok(mut responses) = self.responses.lock() {
             responses.clear();
         }
+        self.initialized_seen.store(false, Ordering::SeqCst);
         Ok(())
     }
 
-    fn spawn_recv_loop(&self, mut reader: TcpStream) {
+    fn spawn_recv_loop(&self, mut reader: TcpStream, debug_epoch: u64) {
         let responses = Arc::clone(&self.responses);
-        let state = Arc::clone(&self.state);
         let event_tx = self.event_tx.clone();
         let notifier = Arc::clone(&self.notifier);
+        let initialized_seen = Arc::clone(&self.initialized_seen);
         thread::spawn(move || {
             let mut buffer = Vec::<u8>::new();
             let mut chunk = [0_u8; 4096];
@@ -309,10 +342,11 @@ impl DebugSession {
                             }
                         }
                         "event" => {
-                            if let Ok(mut cache) = state.lock() {
-                                cache.update_from_event(&message);
+                            if message.get("event").and_then(Value::as_str) == Some("initialized") {
+                                initialized_seen.store(true, Ordering::SeqCst);
                             }
                             let _ = event_tx.send(DebugEventEnvelope {
+                                debug_epoch,
                                 event: message,
                                 parent_header: None,
                             });
@@ -323,89 +357,6 @@ impl DebugSession {
                 }
             }
         });
-    }
-
-    pub fn state_snapshot(&self) -> Result<DebugStateCache, KernelError> {
-        self.state
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| KernelError::Worker("debug session state mutex poisoned".to_owned()))
-    }
-
-    pub fn record_capabilities(&self, capabilities: Value) -> Result<(), KernelError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| KernelError::Worker("debug session state mutex poisoned".to_owned()))?;
-        state.capabilities = Some(capabilities);
-        Ok(())
-    }
-
-    pub fn update_from_response(&self, command: &str, response: &Value) -> Result<(), KernelError> {
-        if !response
-            .get("success")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| KernelError::Worker("debug session state mutex poisoned".to_owned()))?;
-        match command {
-            "attach" => {
-                state.attached = true;
-            }
-            "configurationDone" => {
-                state.configured = true;
-            }
-            "threads" => {
-                if let Some(threads) = response.pointer("/body/threads").and_then(Value::as_array) {
-                    state.last_threads = threads.clone();
-                }
-            }
-            "continue" | "next" | "stepIn" | "stepOut" => {
-                state.stopped_threads.clear();
-                state.last_stop_reason = None;
-                state.all_threads_stopped = false;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    pub fn record_source_parent(
-        &self,
-        source_path: impl Into<String>,
-        parent_header: Value,
-    ) -> Result<(), KernelError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| KernelError::Worker("debug session state mutex poisoned".to_owned()))?;
-        state
-            .source_parents
-            .insert(source_path.into(), parent_header);
-        Ok(())
-    }
-
-    pub fn parent_for_source(&self, source_path: &str) -> Result<Option<Value>, KernelError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| KernelError::Worker("debug session state mutex poisoned".to_owned()))?;
-        Ok(state.source_parents.get(source_path).cloned())
-    }
-
-    pub fn apply_event_state(&self, event: &Value) -> Result<(), KernelError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| KernelError::Worker("debug session state mutex poisoned".to_owned()))?;
-        state.update_from_event(event);
-        Ok(())
     }
 
     pub fn register_pending_response(
@@ -486,7 +437,7 @@ impl DebugSession {
     pub fn wait_for_initialized(&self, timeout: Duration) -> Result<(), KernelError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if self.state_snapshot()?.initialized {
+            if self.initialized_seen.load(Ordering::SeqCst) {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -517,14 +468,9 @@ impl DebugSession {
         event: Value,
         parent_header: Option<Value>,
     ) -> Result<(), KernelError> {
-        {
-            let mut state = self.state.lock().map_err(|_| {
-                KernelError::Worker("debug session state mutex poisoned".to_owned())
-            })?;
-            state.update_from_event(&event);
-        }
         self.event_tx
             .send(DebugEventEnvelope {
+                debug_epoch: 0,
                 event,
                 parent_header,
             })
@@ -582,77 +528,62 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{DebugListenEndpoint, DebugSession, DebugTransport};
+    use std::sync::mpsc;
+
+    use super::{DebugListenEndpoint, DebugSession, DebugStateCache, DebugTransport};
+    use crate::kernel::execute::KernelEventSender;
     use crate::worker::PythonWorker;
 
     #[test]
     fn debug_session_updates_stop_state_from_events() {
-        let session = DebugSession::new();
-        session
-            .push_event(
-                json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "body": {"threadId": 7, "reason": "breakpoint", "allThreadsStopped": true}
-                }),
-                None,
-            )
-            .unwrap();
+        let mut state = DebugStateCache::default();
+        state.update_from_event(&json!({
+            "type": "event",
+            "event": "stopped",
+            "body": {"threadId": 7, "reason": "breakpoint", "allThreadsStopped": true}
+        }));
 
-        let state = session.state_snapshot().unwrap();
         assert!(state.stopped_threads.contains(&7));
         assert_eq!(state.last_stop_reason.as_deref(), Some("breakpoint"));
         assert!(state.all_threads_stopped);
 
-        session
-            .push_event(
-                json!({
-                    "type": "event",
-                    "event": "continued",
-                    "body": {"threadId": 7, "allThreadsContinued": false}
-                }),
-                None,
-            )
-            .unwrap();
-        let state = session.state_snapshot().unwrap();
+        state.update_from_event(&json!({
+            "type": "event",
+            "event": "continued",
+            "body": {"threadId": 7, "allThreadsContinued": false}
+        }));
         assert!(state.stopped_threads.is_empty());
         assert_eq!(state.last_stop_reason, None);
     }
 
     #[test]
     fn debug_session_loads_synthetic_snapshot_from_stopped_event() {
-        let session = DebugSession::new();
-        session
-            .push_event(
-                json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "body": {
-                        "threadId": 1,
-                        "reason": "breakpoint",
-                        "allThreadsStopped": true,
-                        "rustykernel": {
-                            "stackFrames": [
-                                {"id": 1, "name": "<module>", "line": 2, "column": 1}
-                            ],
-                            "scopesByFrame": {
-                                "1": [
-                                    {"name": "Locals", "variablesReference": 1000}
-                                ]
-                            },
-                            "variablesByRef": {
-                                "1000": [
-                                    {"name": "x", "value": "1", "variablesReference": 0}
-                                ]
-                            }
-                        }
+        let mut state = DebugStateCache::default();
+        state.update_from_event(&json!({
+            "type": "event",
+            "event": "stopped",
+            "body": {
+                "threadId": 1,
+                "reason": "breakpoint",
+                "allThreadsStopped": true,
+                "rustykernel": {
+                    "stackFrames": [
+                        {"id": 1, "name": "<module>", "line": 2, "column": 1}
+                    ],
+                    "scopesByFrame": {
+                        "1": [
+                            {"name": "Locals", "variablesReference": 1000}
+                        ]
+                    },
+                    "variablesByRef": {
+                        "1000": [
+                            {"name": "x", "value": "1", "variablesReference": 0}
+                        ]
                     }
-                }),
-                None,
-            )
-            .unwrap();
+                }
+            }
+        }));
 
-        let state = session.state_snapshot().unwrap();
         assert_eq!(state.synthetic_stack_frames.len(), 1);
         assert_eq!(state.synthetic_scopes.get(&1).map(Vec::len), Some(1));
         assert_eq!(state.synthetic_variables.get(&1000).map(Vec::len), Some(1));
@@ -660,49 +591,38 @@ mod tests {
 
     #[test]
     fn debug_session_clears_synthetic_snapshot_when_new_stop_has_no_snapshot() {
-        let session = DebugSession::new();
-        session
-            .push_event(
-                json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "body": {
-                        "threadId": 1,
-                        "reason": "breakpoint",
-                        "allThreadsStopped": true,
-                        "rustykernel": {
-                            "stackFrames": [
-                                {"id": 1, "name": "<module>", "line": 6, "column": 1}
-                            ],
-                            "scopesByFrame": {
-                                "1": [
-                                    {"name": "Locals", "variablesReference": 1000}
-                                ]
-                            },
-                            "variablesByRef": {
-                                "1000": [
-                                    {"name": "x", "value": "1", "variablesReference": 0}
-                                ]
-                            }
-                        }
+        let mut state = DebugStateCache::default();
+        state.update_from_event(&json!({
+            "type": "event",
+            "event": "stopped",
+            "body": {
+                "threadId": 1,
+                "reason": "breakpoint",
+                "allThreadsStopped": true,
+                "rustykernel": {
+                    "stackFrames": [
+                        {"id": 1, "name": "<module>", "line": 6, "column": 1}
+                    ],
+                    "scopesByFrame": {
+                        "1": [
+                            {"name": "Locals", "variablesReference": 1000}
+                        ]
+                    },
+                    "variablesByRef": {
+                        "1000": [
+                            {"name": "x", "value": "1", "variablesReference": 0}
+                        ]
                     }
-                }),
-                None,
-            )
-            .unwrap();
+                }
+            }
+        }));
 
-        session
-            .push_event(
-                json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "body": {"threadId": 1, "reason": "step", "allThreadsStopped": true}
-                }),
-                None,
-            )
-            .unwrap();
+        state.update_from_event(&json!({
+            "type": "event",
+            "event": "stopped",
+            "body": {"threadId": 1, "reason": "step", "allThreadsStopped": true}
+        }));
 
-        let state = session.state_snapshot().unwrap();
         assert!(state.synthetic_stack_frames.is_empty());
         assert!(state.synthetic_scopes.is_empty());
         assert!(state.synthetic_variables.is_empty());
@@ -710,52 +630,36 @@ mod tests {
 
     #[test]
     fn debug_session_continue_and_step_responses_clear_stop_state() {
-        let session = DebugSession::new();
-        session
-            .push_event(
-                json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "body": {"threadId": 7, "reason": "breakpoint", "allThreadsStopped": true}
-                }),
-                None,
-            )
-            .unwrap();
+        let mut state = DebugStateCache::default();
+        state.update_from_event(&json!({
+            "type": "event",
+            "event": "stopped",
+            "body": {"threadId": 7, "reason": "breakpoint", "allThreadsStopped": true}
+        }));
 
-        session
-            .update_from_response(
-                "continue",
-                &json!({
-                    "type": "response",
-                    "success": true,
-                    "body": {"allThreadsContinued": true}
-                }),
-            )
-            .unwrap();
-        let state = session.state_snapshot().unwrap();
+        state.update_from_response(
+            "continue",
+            &json!({
+                "type": "response",
+                "success": true,
+                "body": {"allThreadsContinued": true}
+            }),
+        );
         assert!(state.stopped_threads.is_empty());
 
-        session
-            .push_event(
-                json!({
-                    "type": "event",
-                    "event": "stopped",
-                    "body": {"threadId": 8, "reason": "step", "allThreadsStopped": false}
-                }),
-                None,
-            )
-            .unwrap();
-        session
-            .update_from_response(
-                "stepIn",
-                &json!({
-                    "type": "response",
-                    "success": true,
-                    "body": {}
-                }),
-            )
-            .unwrap();
-        let state = session.state_snapshot().unwrap();
+        state.update_from_event(&json!({
+            "type": "event",
+            "event": "stopped",
+            "body": {"threadId": 8, "reason": "step", "allThreadsStopped": false}
+        }));
+        state.update_from_response(
+            "stepIn",
+            &json!({
+                "type": "response",
+                "success": true,
+                "body": {}
+            }),
+        );
         assert!(state.stopped_threads.is_empty());
     }
 
@@ -787,7 +691,9 @@ mod tests {
 
     #[test]
     fn debug_session_can_connect_and_initialize_against_worker_debugpy() {
-        let mut worker = PythonWorker::start().expect("worker should start");
+        let (tx, _rx) = mpsc::channel();
+        let mut worker =
+            PythonWorker::start(KernelEventSender::new(tx), 1).expect("worker should start");
         let endpoint = worker.debug_listen().expect("debug_listen should succeed");
         if !endpoint.available {
             return;
@@ -798,7 +704,7 @@ mod tests {
             .connect(DebugListenEndpoint {
                 host: endpoint.host,
                 port: endpoint.port,
-            })
+            }, 1)
             .expect("debug session should connect");
 
         let reply = session
@@ -819,7 +725,9 @@ mod tests {
 
     #[test]
     fn debug_session_can_attach_and_configure_after_initialize_against_worker_debugpy() {
-        let mut worker = PythonWorker::start().expect("worker should start");
+        let (tx, _rx) = mpsc::channel();
+        let mut worker =
+            PythonWorker::start(KernelEventSender::new(tx), 1).expect("worker should start");
         let endpoint = worker.debug_listen().expect("debug_listen should succeed");
         if !endpoint.available {
             return;
@@ -830,7 +738,7 @@ mod tests {
             .connect(DebugListenEndpoint {
                 host: endpoint.host.clone(),
                 port: endpoint.port,
-            })
+            }, 1)
             .expect("debug session should connect");
 
         session

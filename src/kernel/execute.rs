@@ -1,17 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
-use std::thread;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::JupyterMessage;
-use crate::worker::{
-    ExecutionDisplayEvent, ExecutionOutcome, WorkerCommEvent, WorkerDebugEvent,
-    WorkerExecutionHandle, WorkerExecutionMessage,
-};
+use crate::worker::{ExecutionDisplayEvent, ExecutionOutcome, WorkerCommEvent, WorkerDebugEvent};
 
 use super::KernelError;
 use super::io::{
@@ -19,10 +15,21 @@ use super::io::{
 };
 use super::state::MessageLoopState;
 
+#[allow(dead_code)]
+pub(crate) enum ExecutePhase {
+    Running,
+    WaitingInput { input_request_msg_id: String },
+}
+
 pub(crate) struct PendingExecute {
-    pub(crate) parent_header: Value,
+    pub(crate) request: JupyterMessage,
+    pub(crate) code: String,
+    pub(crate) execution_count: u32,
     pub(crate) silent: bool,
+    pub(crate) store_history: bool,
     pub(crate) subshell_id: Option<String>,
+    pub(crate) allow_stdin: bool,
+    pub(crate) phase: ExecutePhase,
 }
 
 pub(crate) struct StreamBatch {
@@ -56,16 +63,12 @@ impl Default for StreamBatch {
     }
 }
 
-pub(crate) struct ExecuteCompletion {
-    pub(crate) request: JupyterMessage,
-    pub(crate) code: String,
-    pub(crate) execution_count: u32,
-    pub(crate) silent: bool,
-    pub(crate) store_history: bool,
-    pub(crate) outcome: Result<ExecutionOutcome, KernelError>,
-}
-
-pub(crate) enum ExecuteUpdate {
+pub(crate) enum WorkerUpdateEvent {
+    InputRequest {
+        request_id: u64,
+        prompt: String,
+        password: bool,
+    },
     Stream {
         request_id: u64,
         name: String,
@@ -86,26 +89,33 @@ pub(crate) enum ExecuteUpdate {
     },
     Completion {
         request_id: u64,
-        completion: ExecuteCompletion,
+        outcome: Result<ExecutionOutcome, String>,
+    },
+}
+
+pub(crate) enum KernelEvent {
+    WorkerUpdate {
+        worker_epoch: u64,
+        update: WorkerUpdateEvent,
     },
 }
 
 #[derive(Clone)]
-pub(crate) struct ExecuteUpdateSender {
-    tx: mpsc::Sender<ExecuteUpdate>,
+pub(crate) struct KernelEventSender {
+    tx: mpsc::Sender<KernelEvent>,
     wake: Arc<Notify>,
 }
 
-impl ExecuteUpdateSender {
-    pub(crate) fn new(tx: mpsc::Sender<ExecuteUpdate>) -> Self {
+impl KernelEventSender {
+    pub(crate) fn new(tx: mpsc::Sender<KernelEvent>) -> Self {
         Self {
             tx,
             wake: Arc::new(Notify::new()),
         }
     }
 
-    pub(crate) fn send(&self, update: ExecuteUpdate) -> Result<(), mpsc::SendError<ExecuteUpdate>> {
-        self.tx.send(update)?;
+    pub(crate) fn send(&self, event: KernelEvent) -> Result<(), mpsc::SendError<KernelEvent>> {
+        self.tx.send(event)?;
         self.wake.notify_one();
         Ok(())
     }
@@ -115,109 +125,26 @@ impl ExecuteUpdateSender {
     }
 }
 
-pub(crate) fn spawn_execute_request_from_handle(
-    execute_tx: &ExecuteUpdateSender,
-    handle: WorkerExecutionHandle,
-    request: JupyterMessage,
-    code: String,
-    execution_count: u32,
-    silent: bool,
-    store_history: bool,
-) {
-    let execute_tx = execute_tx.clone();
-    thread::spawn(move || {
-        let request_id = handle.request_id;
-        let outcome = loop {
-            match handle.recv() {
-                Ok(WorkerExecutionMessage::InputRequest { .. }) => {
-                    break Err(KernelError::Worker(
-                        "stdin is not enabled for this execute_request".to_owned(),
-                    ));
-                }
-                Ok(WorkerExecutionMessage::Stream { name, text, source }) => {
-                    if execute_tx
-                        .send(ExecuteUpdate::Stream {
-                            request_id,
-                            name,
-                            source,
-                            text,
-                        })
-                        .is_err()
-                    {
-                        break Err(KernelError::Worker(
-                            "failed to send execute stream update".to_owned(),
-                        ));
-                    }
-                }
-                Ok(WorkerExecutionMessage::DisplayEvent(event)) => {
-                    if execute_tx
-                        .send(ExecuteUpdate::DisplayEvent { request_id, event })
-                        .is_err()
-                    {
-                        break Err(KernelError::Worker(
-                            "failed to send execute display event update".to_owned(),
-                        ));
-                    }
-                }
-                Ok(WorkerExecutionMessage::CommEvent(event)) => {
-                    if execute_tx
-                        .send(ExecuteUpdate::CommEvent { request_id, event })
-                        .is_err()
-                    {
-                        break Err(KernelError::Worker(
-                            "failed to send execute comm event update".to_owned(),
-                        ));
-                    }
-                }
-                Ok(WorkerExecutionMessage::DebugEvent(event)) => {
-                    if execute_tx
-                        .send(ExecuteUpdate::DebugEvent { request_id, event })
-                        .is_err()
-                    {
-                        break Err(KernelError::Worker(
-                            "failed to send execute debug event update".to_owned(),
-                        ));
-                    }
-                }
-                Ok(WorkerExecutionMessage::Completion(outcome)) => break Ok(outcome),
-                Ok(WorkerExecutionMessage::Failure(message)) => {
-                    break Err(KernelError::Worker(message));
-                }
-                Err(error) => break Err(error),
-            }
-        };
-        let _ = execute_tx.send(ExecuteUpdate::Completion {
-            request_id,
-            completion: ExecuteCompletion {
-                request,
-                code,
-                execution_count,
-                silent,
-                store_history,
-                outcome,
-            },
-        });
-    });
-}
-
 pub(crate) fn finalize_execute_completion(
     runtime: &Runtime,
     reply_socket: &mut RouterSocket,
     iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request_id: u64,
-    completion: ExecuteCompletion,
+    outcome: Result<ExecutionOutcome, KernelError>,
 ) -> Result<(), KernelError> {
-    state.pending_executes.remove(&request_id);
+    let pending = state.pending_executes.remove(&request_id).ok_or_else(|| {
+        KernelError::Worker("received execute completion without a pending execute".to_owned())
+    })?;
 
-    let ExecuteCompletion {
+    let PendingExecute {
         request,
         code,
         execution_count,
         silent,
         store_history,
-        outcome,
-    } = completion;
+        ..
+    } = pending;
     let outcome = outcome?;
 
     if !silent && store_history {
@@ -327,7 +254,7 @@ pub(crate) fn publish_execute_stream(
         runtime,
         socket,
         state,
-        pending.parent_header.clone(),
+        pending.request.header_value.clone(),
         name,
         text,
     )
@@ -373,7 +300,7 @@ pub(crate) fn flush_execute_stream_batch(
 pub(crate) fn publish_execute_debug_event(
     runtime: &Runtime,
     socket: &mut PubSocket,
-    state: &MessageLoopState,
+    state: &mut MessageLoopState,
     request_id: u64,
     event: &WorkerDebugEvent,
 ) -> Result<(), KernelError> {
@@ -391,7 +318,7 @@ pub(crate) fn publish_execute_debug_event(
         || (event.content.get("event") == Some(&json!("stopped"))
             && event.content.get("seq") == Some(&json!(0)))
     {
-        state.debug_session.apply_event_state(&event.content)?;
+        state.debug_state.update_from_event(&event.content);
     }
 
     let Some(pending) = state.pending_executes.get(&request_id) else {
@@ -408,7 +335,7 @@ pub(crate) fn publish_execute_debug_event(
         runtime,
         socket,
         state,
-        pending.parent_header.clone(),
+        pending.request.header_value.clone(),
         &event.msg_type,
         event.content.clone(),
     )
@@ -436,7 +363,7 @@ pub(crate) fn publish_execute_display_event(
             runtime,
             socket,
             state,
-            pending.parent_header.clone(),
+            pending.request.header_value.clone(),
             &event.msg_type,
             event.content.clone(),
         )
@@ -445,7 +372,7 @@ pub(crate) fn publish_execute_display_event(
             runtime,
             socket,
             state,
-            pending.parent_header.clone(),
+            pending.request.header_value.clone(),
             &event.msg_type,
             event.data.clone(),
             event.metadata.clone(),
@@ -467,10 +394,7 @@ pub(crate) fn publish_execute_comm_event(
         ));
     };
 
-    let silent = pending.silent;
-    let parent_header = pending.parent_header.clone();
-
-    if silent {
+    if pending.silent {
         return Ok(());
     }
 
@@ -478,7 +402,7 @@ pub(crate) fn publish_execute_comm_event(
         runtime,
         socket,
         state,
-        parent_header,
+        pending.request.header_value.clone(),
         &event.msg_type,
         event.content.clone(),
     )?;

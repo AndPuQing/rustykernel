@@ -7,10 +7,10 @@ use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
 use crate::worker::{CommOutcome, WorkerCommEvent};
 
 use super::KernelError;
-use super::runtime::{recv_frames, send_frames};
+use super::runtime::send_frames;
 use super::state::MessageLoopState;
 
-pub(crate) fn request_stdin_input(
+pub(crate) fn send_stdin_input_request(
     runtime: &Runtime,
     stdin_socket: &mut RouterSocket,
     signer: &MessageSigner,
@@ -20,9 +20,11 @@ pub(crate) fn request_stdin_input(
     prompt: &str,
     password: bool,
     allow_stdin: bool,
-) -> Result<String, String> {
+) -> Result<String, KernelError> {
     if !allow_stdin {
-        return Err("stdin is not enabled for this execute_request".to_owned());
+        return Err(KernelError::Worker(
+            "stdin is not enabled for this execute_request".to_owned(),
+        ));
     }
 
     let input_request = JupyterMessage::new(
@@ -35,57 +37,68 @@ pub(crate) fn request_stdin_input(
             "password": password,
         }),
     );
+    let input_request_id = input_request.header.msg_id.clone();
 
-    send_frames(
-        runtime,
-        stdin_socket,
-        signer
-            .encode(&input_request)
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-
-    loop {
-        let frames = recv_frames(runtime, stdin_socket, None)
-            .map_err(|error| error.to_string())?
-            .expect("blocking stdin receive cannot time out");
-        let message = match signer.decode(frames) {
-            Ok(message) => message,
-            Err(_) => continue,
-        };
-
-        if message.header.msg_type != "input_reply" {
-            continue;
-        }
-
-        if let Some(value) = message.content.get("value").and_then(Value::as_str) {
-            return Ok(value.to_owned());
-        }
-
-        return Ok(String::new());
-    }
+    send_frames(runtime, stdin_socket, signer.encode(&input_request)?)?;
+    Ok(input_request_id)
 }
 
 pub(crate) fn handle_stdin_message(
     frames: Vec<Vec<u8>>,
-    state: &MessageLoopState,
+    state: &mut MessageLoopState,
 ) -> Result<(), KernelError> {
     let message = match state.signer.decode(frames) {
         Ok(message) => message,
         Err(_) => return Ok(()),
     };
 
-    if message.header.msg_type == "input_reply" {
+    if message.header.msg_type != "input_reply" {
         return Ok(());
     }
 
+    let input_request_msg_id = message
+        .parent_header
+        .get("msg_id")
+        .and_then(Value::as_str)
+        .filter(|msg_id| !msg_id.is_empty());
+
+    let Some((&request_id, _)) = state
+        .pending_executes
+        .iter()
+        .find(|(_, pending)| match &pending.phase {
+            super::execute::ExecutePhase::WaitingInput {
+                input_request_msg_id: waiting_for,
+            } => {
+                if let Some(msg_id) = input_request_msg_id {
+                    waiting_for == msg_id
+                } else {
+                    pending.request.identities == message.identities
+                }
+            }
+            super::execute::ExecutePhase::Running => false,
+        })
+    else {
+        return Ok(());
+    };
+
+    let value = message
+        .content
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    state.with_worker(|worker| worker.send_input_reply(request_id, value, None))?;
+    if let Some(pending) = state.pending_executes.get_mut(&request_id) {
+        pending.phase = super::execute::ExecutePhase::Running;
+    }
     Ok(())
 }
 
 pub(crate) fn send_reply(
     runtime: &Runtime,
     socket: &mut impl zeromq::SocketSend,
-    state: &MessageLoopState,
+    state: &mut MessageLoopState,
     request: &JupyterMessage,
     msg_type: &str,
     content: Value,
@@ -206,7 +219,7 @@ pub(crate) fn publish_stream(
 pub(crate) fn drain_debug_session_events(
     runtime: &Runtime,
     socket: &mut PubSocket,
-    state: &MessageLoopState,
+    state: &mut MessageLoopState,
 ) -> Result<(), KernelError> {
     while let Some(event) = state.debug_session.try_recv_event()? {
         publish_debug_session_event(runtime, socket, state, event)?;
@@ -217,9 +230,13 @@ pub(crate) fn drain_debug_session_events(
 pub(crate) fn publish_debug_session_event(
     runtime: &Runtime,
     socket: &mut PubSocket,
-    state: &MessageLoopState,
+    state: &mut MessageLoopState,
     event: DebugEventEnvelope,
 ) -> Result<(), KernelError> {
+    if event.debug_epoch != 0 && event.debug_epoch != state.debug_epoch {
+        return Ok(());
+    }
+    state.debug_state.update_from_event(&event.event);
     if matches!(
         state.debug_session.transport()?,
         crate::debug_session::DebugTransport::Inactive
@@ -238,7 +255,7 @@ pub(crate) fn publish_debug_session_event(
         if pending.silent {
             return Ok(());
         }
-        pending.parent_header.clone()
+        pending.request.header_value.clone()
     } else {
         return Ok(());
     };

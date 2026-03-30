@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use sysinfo::{Pid, System};
 
-use crate::debug_session::DebugSession;
+use crate::debug_session::{DebugSession, DebugStateCache};
 use crate::protocol::{
     IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE, MessageHeader, MessageSigner,
 };
 use crate::worker::{ExecutionOutcome, PythonWorker, WorkerInterruptHandle, WorkerKernelInfo};
 
 use super::comms::CommStore;
-use super::execute::PendingExecute;
+use super::execute::{KernelEventSender, PendingExecute};
 use super::history::HistoryStore;
 use super::{ConnectionInfo, KernelError, process_is_kernel_descendant};
 
@@ -23,15 +23,23 @@ pub(crate) struct MessageLoopState {
     pub(crate) history: HistoryStore,
     pub(crate) comms: CommStore,
     pub(crate) worker: Arc<Mutex<Option<PythonWorker>>>,
+    pub(crate) kernel_events: KernelEventSender,
+    pub(crate) worker_epoch: u64,
+    pub(crate) debug_epoch: u64,
     pub(crate) worker_interrupt: Option<WorkerInterruptHandle>,
     pub(crate) worker_kernel_info: WorkerKernelInfo,
     pub(crate) debug_session: DebugSession,
+    pub(crate) debug_state: DebugStateCache,
     pub(crate) pending_executes: HashMap<u64, PendingExecute>,
 }
 
 impl MessageLoopState {
-    pub(crate) fn new(connection: &ConnectionInfo) -> Result<Self, KernelError> {
-        let mut worker = PythonWorker::start()?;
+    pub(crate) fn new(
+        connection: &ConnectionInfo,
+        kernel_events: KernelEventSender,
+    ) -> Result<Self, KernelError> {
+        let worker_epoch = 1;
+        let mut worker = PythonWorker::start(kernel_events.clone(), worker_epoch)?;
         let worker_kernel_info = worker.kernel_info()?;
         let worker_interrupt = worker.interrupt_handle();
         Ok(Self {
@@ -45,9 +53,13 @@ impl MessageLoopState {
             history: HistoryStore::new(),
             comms: CommStore::new(),
             worker: Arc::new(Mutex::new(Some(worker))),
+            kernel_events,
+            worker_epoch,
+            debug_epoch: 1,
             worker_interrupt: Some(worker_interrupt),
             worker_kernel_info,
             debug_session: DebugSession::new(),
+            debug_state: DebugStateCache::default(),
             pending_executes: HashMap::new(),
         })
     }
@@ -57,7 +69,7 @@ impl MessageLoopState {
             return Ok(());
         }
 
-        let worker = PythonWorker::start()?;
+        let worker = PythonWorker::start(self.kernel_events.clone(), self.worker_epoch)?;
         self.worker_interrupt = Some(worker.interrupt_handle());
         self.worker
             .lock()
@@ -255,8 +267,11 @@ impl MessageLoopState {
 
     pub(crate) fn restart(&mut self) -> Result<(), KernelError> {
         if self.worker_interrupt.is_some() {
+            self.worker_epoch += 1;
+            let worker_epoch = self.worker_epoch;
+            let kernel_events = self.kernel_events.clone();
             let worker_kernel_info = self.with_worker(|worker| {
-                worker.restart()?;
+                worker.restart(kernel_events, worker_epoch)?;
                 Ok((worker.kernel_info()?, worker.interrupt_handle()))
             })?;
             self.worker_kernel_info = worker_kernel_info.0;
@@ -266,7 +281,9 @@ impl MessageLoopState {
         self.history.start_new_session();
         self.comms.clear();
         self.pending_executes.clear();
+        self.debug_epoch += 1;
         self.debug_session.reset()?;
+        self.debug_state = DebugStateCache::default();
         Ok(())
     }
 
@@ -287,7 +304,9 @@ impl MessageLoopState {
         if has_subshell_execute {
             if has_live_debug_session {
                 self.worker_interrupt_handle()?.interrupt()?;
+                self.debug_epoch += 1;
                 self.debug_session.reset()?;
+                self.debug_state = DebugStateCache::default();
             } else {
                 self.with_worker(|worker| worker.interrupt_subshells())?;
             }

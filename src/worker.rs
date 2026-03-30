@@ -16,6 +16,7 @@ use std::thread;
 use serde_json::Value;
 
 use crate::kernel::KernelError;
+use crate::kernel::execute::{KernelEvent, KernelEventSender, WorkerUpdateEvent};
 pub use crate::worker_protocol::{
     CommOutcome, CompletionOutcome, ExecutionDisplayEvent, ExecutionOutcome, InspectionOutcome,
     IsCompleteOutcome, WorkerCommEvent, WorkerDebugEvent, WorkerDebugListen, WorkerKernelInfo,
@@ -31,42 +32,8 @@ const WORKER_PROTOCOL_ENV: &str = "RUSTYKERNEL_PROTOCOL_FD";
 #[cfg(unix)]
 const WORKER_PROTOCOL_FD: libc::c_int = 3;
 
-#[derive(Debug)]
-pub enum WorkerExecutionMessage {
-    InputRequest {
-        prompt: String,
-        password: bool,
-    },
-    Stream {
-        name: String,
-        text: String,
-        source: String,
-    },
-    DisplayEvent(ExecutionDisplayEvent),
-    CommEvent(WorkerCommEvent),
-    DebugEvent(WorkerDebugEvent),
-    Completion(ExecutionOutcome),
-    Failure(String),
-}
-
-pub struct WorkerExecutionHandle {
-    pub request_id: u64,
-    rx: mpsc::Receiver<WorkerExecutionMessage>,
-}
-
-impl WorkerExecutionHandle {
-    pub fn recv(&self) -> Result<WorkerExecutionMessage, KernelError> {
-        self.rx.recv().map_err(|error| {
-            KernelError::Worker(format!(
-                "worker execution channel closed unexpectedly for request {}: {error}",
-                self.request_id
-            ))
-        })
-    }
-}
-
 enum PendingRequest {
-    Execute(mpsc::Sender<WorkerExecutionMessage>),
+    Execute,
     Response(mpsc::Sender<Result<WorkerEnvelope<WorkerResponse>, String>>),
 }
 
@@ -128,7 +95,7 @@ pub struct PythonWorker {
 }
 
 impl PythonWorker {
-    pub fn start() -> Result<Self, KernelError> {
+    pub fn start(kernel_events: KernelEventSender, worker_epoch: u64) -> Result<Self, KernelError> {
         #[cfg(not(unix))]
         {
             Err(KernelError::Worker(
@@ -178,7 +145,12 @@ impl PythonWorker {
             })?;
             let interrupt_handle = WorkerInterruptHandle::new(child.id());
             let pending = Arc::new(Mutex::new(HashMap::new()));
-            let protocol_thread = Some(spawn_protocol_reader(protocol_read, Arc::clone(&pending)));
+            let protocol_thread = Some(spawn_protocol_reader(
+                protocol_read,
+                Arc::clone(&pending),
+                kernel_events,
+                worker_epoch,
+            ));
 
             Ok(Self {
                 child,
@@ -203,14 +175,13 @@ impl PythonWorker {
         execution_count: u32,
         silent: bool,
         store_history: bool,
-    ) -> Result<WorkerExecutionHandle, KernelError> {
+    ) -> Result<u64, KernelError> {
         let request_id = self.next_id;
         self.next_id += 1;
-        let (tx, rx) = mpsc::channel();
         self.pending
             .lock()
             .map_err(|_| KernelError::Worker("worker pending map mutex poisoned".to_owned()))?
-            .insert(request_id, PendingRequest::Execute(tx));
+            .insert(request_id, PendingRequest::Execute);
 
         let request = WorkerRequest::Execute {
             code: code.to_owned(),
@@ -228,7 +199,7 @@ impl PythonWorker {
             return Err(error);
         }
 
-        Ok(WorkerExecutionHandle { request_id, rx })
+        Ok(request_id)
     }
 
     pub fn complete(
@@ -421,9 +392,13 @@ impl PythonWorker {
         }
     }
 
-    pub fn restart(&mut self) -> Result<(), KernelError> {
+    pub fn restart(
+        &mut self,
+        kernel_events: KernelEventSender,
+        worker_epoch: u64,
+    ) -> Result<(), KernelError> {
         self.terminate();
-        let replacement = Self::start()?;
+        let replacement = Self::start(kernel_events, worker_epoch)?;
         *self = replacement;
         Ok(())
     }
@@ -503,6 +478,8 @@ fn unexpected_response(expected: &str, response: WorkerResponse) -> KernelError 
 fn spawn_protocol_reader(
     protocol_read: OwnedFd,
     pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
+    kernel_events: KernelEventSender,
+    worker_epoch: u64,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut protocol = BufReader::new(File::from(protocol_read));
@@ -558,15 +535,14 @@ fn spawn_protocol_reader(
             }
 
             let pending_request = if envelope.frame_type == FrameType::Event {
-                pending
-                    .lock()
-                    .ok()
-                    .and_then(|pending_map| match pending_map.get(&request_id) {
-                        Some(PendingRequest::Execute(sender)) => {
-                            Some(PendingRequest::Execute(sender.clone()))
+                pending.lock().ok().and_then(|pending_map| {
+                    pending_map.get(&request_id).map(|request| match request {
+                        PendingRequest::Execute => PendingRequest::Execute,
+                        PendingRequest::Response(sender) => {
+                            PendingRequest::Response(sender.clone())
                         }
-                        _ => None,
                     })
+                })
             } else {
                 pending
                     .lock()
@@ -579,15 +555,24 @@ fn spawn_protocol_reader(
             };
 
             match pending_request {
-                PendingRequest::Execute(sender) => {
-                    let message = match envelope.frame_type {
+                PendingRequest::Execute => {
+                    let update = match envelope.frame_type {
                         FrameType::Event => {
                             match serde_json::from_value::<WorkerEvent>(envelope.body) {
                                 Ok(WorkerEvent::InputRequest { prompt, password }) => {
-                                    WorkerExecutionMessage::InputRequest { prompt, password }
+                                    WorkerUpdateEvent::InputRequest {
+                                        request_id,
+                                        prompt,
+                                        password,
+                                    }
                                 }
                                 Ok(WorkerEvent::Stream { name, text, source }) => {
-                                    WorkerExecutionMessage::Stream { name, text, source }
+                                    WorkerUpdateEvent::Stream {
+                                        request_id,
+                                        name,
+                                        source,
+                                        text,
+                                    }
                                 }
                                 Ok(WorkerEvent::Display {
                                     msg_type,
@@ -595,48 +580,67 @@ fn spawn_protocol_reader(
                                     data,
                                     metadata,
                                     transient,
-                                }) => WorkerExecutionMessage::DisplayEvent(ExecutionDisplayEvent {
-                                    msg_type,
-                                    content,
-                                    data,
-                                    metadata,
-                                    transient,
-                                }),
-                                Ok(WorkerEvent::Comm { msg_type, content }) => {
-                                    WorkerExecutionMessage::CommEvent(WorkerCommEvent {
+                                }) => WorkerUpdateEvent::DisplayEvent {
+                                    request_id,
+                                    event: ExecutionDisplayEvent {
                                         msg_type,
                                         content,
-                                    })
+                                        data,
+                                        metadata,
+                                        transient,
+                                    },
+                                },
+                                Ok(WorkerEvent::Comm { msg_type, content }) => {
+                                    WorkerUpdateEvent::CommEvent {
+                                        request_id,
+                                        event: WorkerCommEvent { msg_type, content },
+                                    }
                                 }
                                 Ok(WorkerEvent::Debug { msg_type, content }) => {
-                                    WorkerExecutionMessage::DebugEvent(WorkerDebugEvent {
-                                        msg_type,
-                                        content,
-                                    })
+                                    WorkerUpdateEvent::DebugEvent {
+                                        request_id,
+                                        event: WorkerDebugEvent { msg_type, content },
+                                    }
                                 }
-                                Err(error) => WorkerExecutionMessage::Failure(format!(
-                                    "failed to decode worker event: {error}"
-                                )),
+                                Err(error) => WorkerUpdateEvent::Completion {
+                                    request_id,
+                                    outcome: Err(format!("failed to decode worker event: {error}")),
+                                },
                             }
                         }
                         FrameType::Response => {
                             match serde_json::from_value::<WorkerResponse>(envelope.body) {
                                 Ok(WorkerResponse::Execute(outcome)) => {
-                                    WorkerExecutionMessage::Completion(outcome)
+                                    WorkerUpdateEvent::Completion {
+                                        request_id,
+                                        outcome: Ok(outcome),
+                                    }
                                 }
-                                Ok(other) => WorkerExecutionMessage::Failure(format!(
-                                    "unexpected worker response for execute request {request_id}: {other:?}"
-                                )),
-                                Err(error) => WorkerExecutionMessage::Failure(format!(
-                                    "failed to decode worker execution response: {error}"
-                                )),
+                                Ok(other) => WorkerUpdateEvent::Completion {
+                                    request_id,
+                                    outcome: Err(format!(
+                                        "unexpected worker response for execute request {request_id}: {other:?}"
+                                    )),
+                                },
+                                Err(error) => WorkerUpdateEvent::Completion {
+                                    request_id,
+                                    outcome: Err(format!(
+                                        "failed to decode worker execution response: {error}"
+                                    )),
+                                },
                             }
                         }
-                        FrameType::Request => WorkerExecutionMessage::Failure(format!(
-                            "unexpected worker request frame for request {request_id}"
-                        )),
+                        FrameType::Request => WorkerUpdateEvent::Completion {
+                            request_id,
+                            outcome: Err(format!(
+                                "unexpected worker request frame for request {request_id}"
+                            )),
+                        },
                     };
-                    let _ = sender.send(message);
+                    let _ = kernel_events.send(KernelEvent::WorkerUpdate {
+                        worker_epoch,
+                        update,
+                    });
                 }
                 PendingRequest::Response(sender) => {
                     let response = match envelope.frame_type {
@@ -666,9 +670,7 @@ fn fail_all_pending(pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>, message:
         .unwrap_or_default();
     for (_, request) in pending_requests {
         match request {
-            PendingRequest::Execute(sender) => {
-                let _ = sender.send(WorkerExecutionMessage::Failure(message.clone()));
-            }
+            PendingRequest::Execute => {}
             PendingRequest::Response(sender) => {
                 let _ = sender.send(Err(message.clone()));
             }
@@ -738,11 +740,17 @@ unsafe fn install_worker_protocol_fd(protocol_write_fd: libc::c_int) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
+    use crate::kernel::execute::KernelEventSender;
+
     use super::PythonWorker;
 
     #[test]
     fn python_worker_can_report_debug_listener_endpoint() {
-        let mut worker = PythonWorker::start().expect("worker should start");
+        let (tx, _rx) = mpsc::channel();
+        let mut worker =
+            PythonWorker::start(KernelEventSender::new(tx), 1).expect("worker should start");
         let listen = worker.debug_listen().expect("debug_listen should succeed");
         if listen.available {
             assert_eq!(listen.host, "127.0.0.1");

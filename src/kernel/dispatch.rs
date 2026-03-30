@@ -3,16 +3,9 @@ use tokio::runtime::Runtime;
 use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::JupyterMessage;
-use crate::worker::WorkerExecutionMessage;
 
-use super::execute::{
-    ExecuteCompletion, ExecuteUpdateSender, finalize_execute_completion,
-    publish_execute_comm_event, publish_execute_debug_event, publish_execute_display_event,
-    publish_execute_stream, spawn_execute_request_from_handle,
-};
-use super::io::{
-    handle_comm_outcome, publish_iopub_message, publish_status, request_stdin_input, send_reply,
-};
+use super::execute::{ExecutePhase, KernelEventSender, PendingExecute};
+use super::io::{handle_comm_outcome, publish_iopub_message, publish_status, send_reply};
 use super::state::MessageLoopState;
 use super::{KernelError, ShutdownSignal};
 
@@ -36,7 +29,7 @@ pub(crate) fn handle_request(
     stdin_socket: &mut RouterSocket,
     iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
-    execute_tx: &ExecuteUpdateSender,
+    _kernel_events: &KernelEventSender,
     shutdown: &ShutdownSignal,
 ) -> Result<(), KernelError> {
     let request = match state.signer.decode(frames) {
@@ -54,7 +47,7 @@ pub(crate) fn handle_request(
             stdin_socket,
             iopub_socket,
             state,
-            execute_tx,
+            _kernel_events,
             &request,
         )?,
         ChannelKind::Control => {
@@ -79,10 +72,10 @@ pub(crate) fn handle_request(
 pub(crate) fn handle_shell_request(
     runtime: &Runtime,
     reply_socket: &mut RouterSocket,
-    stdin_socket: &mut RouterSocket,
+    _stdin_socket: &mut RouterSocket,
     iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
-    execute_tx: &ExecuteUpdateSender,
+    _kernel_events: &KernelEventSender,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
     match request.header.msg_type.as_str() {
@@ -135,7 +128,6 @@ pub(crate) fn handle_shell_request(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let execution_count = state.next_execution_count(&request.content);
-            let code_owned = code.to_owned();
 
             if !silent {
                 publish_iopub_message(
@@ -151,166 +143,39 @@ pub(crate) fn handle_shell_request(
                 )?;
             }
 
-            if allow_stdin {
-                let signer = state.signer.clone();
-                let kernel_session = state.kernel_session.clone();
-                let request_identities = request.identities.clone();
-                let parent_header = request.header_value.clone();
+            let worker_request_id = {
                 state.ensure_worker_started()?;
-                let (worker_request_id, handle) = {
-                    let mut worker = state.worker.lock().map_err(|_| {
-                        KernelError::Worker("python worker mutex poisoned".to_owned())
-                    })?;
-                    let worker = worker.as_mut().ok_or_else(|| {
-                        KernelError::Worker("python worker was not available".to_owned())
-                    })?;
-                    let handle = worker.execute_async(
-                        code,
-                        subshell_id.as_deref(),
-                        user_expressions,
-                        execution_count,
-                        silent,
-                        store_history,
-                    )?;
-                    (handle.request_id, handle)
-                };
-                state.pending_executes.insert(
-                    worker_request_id,
-                    super::execute::PendingExecute {
-                        parent_header: request.header_value.clone(),
-                        silent,
-                        subshell_id: subshell_id.clone(),
-                    },
-                );
-                let outcome = loop {
-                    match handle.recv()? {
-                        WorkerExecutionMessage::InputRequest { prompt, password } => {
-                            let reply = request_stdin_input(
-                                runtime,
-                                stdin_socket,
-                                &signer,
-                                &kernel_session,
-                                &request_identities,
-                                &parent_header,
-                                &prompt,
-                                password,
-                                allow_stdin,
-                            );
-                            let mut worker = state.worker.lock().map_err(|_| {
-                                KernelError::Worker("python worker mutex poisoned".to_owned())
-                            })?;
-                            let worker = worker.as_mut().ok_or_else(|| {
-                                KernelError::Worker("python worker was not available".to_owned())
-                            })?;
-                            match reply {
-                                Ok(value) => {
-                                    worker.send_input_reply(worker_request_id, value, None)?
-                                }
-                                Err(error) => worker.send_input_reply(
-                                    worker_request_id,
-                                    String::new(),
-                                    Some(error),
-                                )?,
-                            }
-                        }
-                        WorkerExecutionMessage::Stream { name, text, .. } => {
-                            publish_execute_stream(
-                                runtime,
-                                iopub_socket,
-                                state,
-                                worker_request_id,
-                                &name,
-                                &text,
-                            )?;
-                        }
-                        WorkerExecutionMessage::DisplayEvent(event) => {
-                            publish_execute_display_event(
-                                runtime,
-                                iopub_socket,
-                                state,
-                                worker_request_id,
-                                &event,
-                            )?;
-                        }
-                        WorkerExecutionMessage::CommEvent(event) => {
-                            publish_execute_comm_event(
-                                runtime,
-                                iopub_socket,
-                                state,
-                                worker_request_id,
-                                &event,
-                            )?;
-                        }
-                        WorkerExecutionMessage::DebugEvent(event) => {
-                            publish_execute_debug_event(
-                                runtime,
-                                iopub_socket,
-                                state,
-                                worker_request_id,
-                                &event,
-                            )?;
-                        }
-                        WorkerExecutionMessage::Completion(outcome) => break outcome,
-                        WorkerExecutionMessage::Failure(message) => {
-                            return Err(KernelError::Worker(message));
-                        }
-                    }
-                };
-
-                finalize_execute_completion(
-                    runtime,
-                    reply_socket,
-                    iopub_socket,
-                    state,
-                    worker_request_id,
-                    ExecuteCompletion {
-                        request: request.clone(),
-                        code: code_owned,
-                        execution_count,
-                        silent,
-                        store_history,
-                        outcome: Ok(outcome),
-                    },
-                )?;
-                Ok(RequestDisposition::Deferred)
-            } else {
-                let (worker_request_id, handle) = {
-                    state.ensure_worker_started()?;
-                    let mut worker = state.worker.lock().map_err(|_| {
-                        KernelError::Worker("python worker mutex poisoned".to_owned())
-                    })?;
-                    let worker = worker.as_mut().ok_or_else(|| {
-                        KernelError::Worker("python worker was not available".to_owned())
-                    })?;
-                    let handle = worker.execute_async(
-                        &code_owned,
-                        subshell_id.as_deref(),
-                        user_expressions,
-                        execution_count,
-                        silent,
-                        store_history,
-                    )?;
-                    (handle.request_id, handle)
-                };
-                state.pending_executes.insert(
-                    worker_request_id,
-                    super::execute::PendingExecute {
-                        parent_header: request.header_value.clone(),
-                        silent,
-                        subshell_id: subshell_id.clone(),
-                    },
-                );
-                spawn_execute_request_from_handle(
-                    execute_tx,
-                    handle,
-                    request.clone(),
-                    code_owned.clone(),
+                let mut worker = state
+                    .worker
+                    .lock()
+                    .map_err(|_| KernelError::Worker("python worker mutex poisoned".to_owned()))?;
+                let worker = worker.as_mut().ok_or_else(|| {
+                    KernelError::Worker("python worker was not available".to_owned())
+                })?;
+                worker.execute_async(
+                    code,
+                    subshell_id.as_deref(),
+                    user_expressions,
                     execution_count,
                     silent,
                     store_history,
-                );
-                Ok(RequestDisposition::Deferred)
-            }
+                )?
+            };
+
+            state.pending_executes.insert(
+                worker_request_id,
+                PendingExecute {
+                    request: request.clone(),
+                    code: code.to_owned(),
+                    execution_count,
+                    silent,
+                    store_history,
+                    subshell_id,
+                    allow_stdin,
+                    phase: ExecutePhase::Running,
+                },
+            );
+            Ok(RequestDisposition::Deferred)
         }
         "is_complete_request" => {
             let code = request

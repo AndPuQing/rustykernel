@@ -63,7 +63,8 @@ impl MessageLoopState {
             self.debug_session.transport()?,
             crate::debug_session::DebugTransport::Connected(_)
         ) {
-            self.debug_session.connect(endpoint.clone())?;
+            self.debug_session
+                .connect(endpoint.clone(), self.debug_epoch)?;
         }
         Ok(endpoint)
     }
@@ -89,7 +90,7 @@ impl MessageLoopState {
                 }
             };
         if let Some(body) = reply.get("body").cloned() {
-            self.debug_session.record_capabilities(body)?;
+            self.debug_state.record_capabilities(body);
         }
         Ok(self.rewrite_debug_command(reply, "initialize", request_seq))
     }
@@ -120,7 +121,7 @@ impl MessageLoopState {
                 return Ok(self.debug_error_reply("attach", request_seq, error.to_string()));
             }
         };
-        self.debug_session.update_from_response("attach", &reply)?;
+        self.debug_state.update_from_response("attach", &reply);
         Ok(self.rewrite_debug_command(reply, "attach", request_seq))
     }
 
@@ -144,8 +145,8 @@ impl MessageLoopState {
                 ));
             }
         };
-        self.debug_session
-            .update_from_response("configurationDone", &reply)?;
+        self.debug_state
+            .update_from_response("configurationDone", &reply);
         Ok(self.rewrite_debug_command(reply, "configurationDone", request_seq))
     }
 
@@ -173,7 +174,7 @@ impl MessageLoopState {
         arguments: Value,
     ) -> Result<Value, KernelError> {
         let _ = self.with_worker(|worker| worker.debug_request(request))?;
-        let state = self.debug_session.state_snapshot()?;
+        let state = self.debug_state.clone();
         if !state.initialized && !state.attached {
             return Ok(self.synthesize_set_breakpoints_reply(request_seq, &arguments));
         }
@@ -249,7 +250,7 @@ impl MessageLoopState {
                 );
             }
         };
-        self.debug_session.update_from_response(command, &reply)?;
+        self.debug_state.update_from_response(command, &reply);
         let reply = self.rewrite_debug_command(reply, command, request_seq);
         if !reply
             .get("success")
@@ -372,7 +373,7 @@ impl MessageLoopState {
             attached,
             stopped_threads,
             ..
-        } = self.debug_session.state_snapshot()?;
+        } = self.debug_state.clone();
         let rust_is_authoritative = !matches!(
             self.debug_session.transport()?,
             crate::debug_session::DebugTransport::Inactive
@@ -394,7 +395,7 @@ impl MessageLoopState {
         command: &str,
         request_seq: i64,
     ) -> Result<Value, KernelError> {
-        let state = self.debug_session.state_snapshot()?;
+        let state = self.debug_state.clone();
         let mut threads = if !state.last_threads.is_empty() {
             state.last_threads
         } else {
@@ -426,7 +427,7 @@ impl MessageLoopState {
         command: &str,
         request_seq: i64,
     ) -> Result<Value, KernelError> {
-        let state = self.debug_session.state_snapshot()?;
+        let state = self.debug_state.clone();
         let stack_frames = state.synthetic_stack_frames;
         Ok(json!({
             "type": "response",
@@ -446,7 +447,7 @@ impl MessageLoopState {
         request_seq: i64,
         frame_id: i64,
     ) -> Result<Value, KernelError> {
-        let state = self.debug_session.state_snapshot()?;
+        let state = self.debug_state.clone();
         let scopes = state
             .synthetic_scopes
             .get(&frame_id)
@@ -469,7 +470,7 @@ impl MessageLoopState {
         request_seq: i64,
         variables_reference: i64,
     ) -> Result<Value, KernelError> {
-        let state = self.debug_session.state_snapshot()?;
+        let state = self.debug_state.clone();
         let variables = state
             .synthetic_variables
             .get(&variables_reference)
