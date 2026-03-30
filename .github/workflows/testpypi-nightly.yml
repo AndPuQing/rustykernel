@@ -20,7 +20,7 @@ jobs:
       should_build: ${{ steps.check.outputs.should_build }}
       head_commit: ${{ steps.check.outputs.head_commit }}
       previous_commit: ${{ steps.check.outputs.previous_commit }}
-      package_name: ${{ steps.meta.outputs.package_name }}
+      version: ${{ steps.meta.outputs.version }}
       artifact_suffix: ${{ steps.meta.outputs.artifact_suffix }}
     steps:
       - uses: actions/checkout@v6
@@ -54,10 +54,11 @@ jobs:
         if: steps.check.outputs.should_build == 'true'
         shell: bash
         run: |
-          PACKAGE_NAME="rustykernel-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          BASE_VERSION=$(grep -m1 '^version = "' Cargo.toml | cut -d '"' -f2)
+          VERSION="${BASE_VERSION}-dev.${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
           ARTIFACT_SUFFIX="testpypi-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-          echo "package_name=${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "artifact_suffix=${ARTIFACT_SUFFIX}" >> "$GITHUB_OUTPUT"
 
   linux:
@@ -79,10 +80,10 @@ jobs:
         with:
           python-version: 3.x
 
-      - name: Set TestPyPI package name
+      - name: Set TestPyPI version
         shell: bash
         run: |
-          sed -i 's/^name = "rustykernel"$/name = "${{ needs.check.outputs.package_name }}"/' pyproject.toml
+          sed -i 's/^version = ".*"$/version = "${{ needs.check.outputs.version }}"/' Cargo.toml
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -106,10 +107,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set TestPyPI package name
+      - name: Set TestPyPI version
         shell: bash
         run: |
-          sed -i 's/^name = "rustykernel"$/name = "${{ needs.check.outputs.package_name }}"/' pyproject.toml
+          sed -i 's/^version = ".*"$/version = "${{ needs.check.outputs.version }}"/' Cargo.toml
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
