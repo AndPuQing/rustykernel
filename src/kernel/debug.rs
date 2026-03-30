@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::debug_session::{DebugListenEndpoint, DebugStateCache};
-use crate::worker::{WorkerDebugEvent, WorkerDebugListen};
+use crate::worker::WorkerDebugListen;
 
 use super::{KernelError, state::MessageLoopState};
 
@@ -485,35 +485,4 @@ impl MessageLoopState {
             },
         }))
     }
-}
-
-pub(crate) fn filter_worker_debug_events_for_publish(
-    state: &MessageLoopState,
-    events: &[WorkerDebugEvent],
-) -> Result<Vec<WorkerDebugEvent>, KernelError> {
-    let rust_session_connected = matches!(
-        state.debug_session.transport()?,
-        crate::debug_session::DebugTransport::Connected(_)
-    );
-    if !rust_session_connected {
-        return Ok(events
-            .iter()
-            .map(|event| WorkerDebugEvent {
-                msg_type: event.msg_type.clone(),
-                content: event.content.clone(),
-            })
-            .collect());
-    }
-
-    Ok(events
-        .iter()
-        .filter(|event| {
-            event.content.get("event") == Some(&json!("stopped"))
-                && event.content.get("seq") == Some(&json!(0))
-        })
-        .map(|event| WorkerDebugEvent {
-            msg_type: event.msg_type.clone(),
-            content: event.content.clone(),
-        })
-        .collect())
 }

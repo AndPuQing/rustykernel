@@ -3,14 +3,15 @@ use tokio::runtime::Runtime;
 use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::JupyterMessage;
+use crate::worker::WorkerExecutionMessage;
 
 use super::execute::{
     ExecuteCompletion, ExecuteUpdateSender, finalize_execute_completion,
-    spawn_execute_request_from_handle,
+    publish_execute_comm_event, publish_execute_debug_event, publish_execute_display_event,
+    publish_execute_stream, spawn_execute_request_from_handle,
 };
 use super::io::{
-    handle_comm_outcome, publish_iopub_message, publish_status, publish_stream,
-    request_stdin_input, send_reply,
+    handle_comm_outcome, publish_iopub_message, publish_status, request_stdin_input, send_reply,
 };
 use super::state::MessageLoopState;
 use super::{KernelError, ShutdownSignal};
@@ -156,48 +157,104 @@ pub(crate) fn handle_shell_request(
                 let request_identities = request.identities.clone();
                 let parent_header = request.header_value.clone();
                 state.ensure_worker_started()?;
-                let outcome = {
+                let (worker_request_id, handle) = {
                     let mut worker = state.worker.lock().map_err(|_| {
                         KernelError::Worker("python worker mutex poisoned".to_owned())
                     })?;
                     let worker = worker.as_mut().ok_or_else(|| {
                         KernelError::Worker("python worker was not available".to_owned())
                     })?;
-                    worker.execute(
+                    let handle = worker.execute_async(
                         code,
                         subshell_id.as_deref(),
                         user_expressions,
                         execution_count,
                         silent,
                         store_history,
-                        |prompt, password| {
-                            request_stdin_input(
+                    )?;
+                    (handle.request_id, handle)
+                };
+                state.pending_executes.insert(
+                    worker_request_id,
+                    super::execute::PendingExecute {
+                        parent_header: request.header_value.clone(),
+                        silent,
+                        subshell_id: subshell_id.clone(),
+                    },
+                );
+                let outcome = loop {
+                    match handle.recv()? {
+                        WorkerExecutionMessage::InputRequest { prompt, password } => {
+                            let reply = request_stdin_input(
                                 runtime,
                                 stdin_socket,
                                 &signer,
                                 &kernel_session,
                                 &request_identities,
                                 &parent_header,
-                                prompt,
+                                &prompt,
                                 password,
                                 allow_stdin,
-                            )
-                        },
-                        |name, text| {
-                            if !silent {
-                                publish_stream(
-                                    runtime,
-                                    iopub_socket,
-                                    state,
-                                    request.header_value.clone(),
-                                    name,
-                                    text,
-                                )?;
+                            );
+                            let mut worker = state.worker.lock().map_err(|_| {
+                                KernelError::Worker("python worker mutex poisoned".to_owned())
+                            })?;
+                            let worker = worker.as_mut().ok_or_else(|| {
+                                KernelError::Worker("python worker was not available".to_owned())
+                            })?;
+                            match reply {
+                                Ok(value) => {
+                                    worker.send_input_reply(worker_request_id, value, None)?
+                                }
+                                Err(error) => worker.send_input_reply(
+                                    worker_request_id,
+                                    String::new(),
+                                    Some(error),
+                                )?,
                             }
-                            Ok(())
-                        },
-                        |_event| Ok(()),
-                    )?
+                        }
+                        WorkerExecutionMessage::Stream { name, text, .. } => {
+                            publish_execute_stream(
+                                runtime,
+                                iopub_socket,
+                                state,
+                                worker_request_id,
+                                &name,
+                                &text,
+                            )?;
+                        }
+                        WorkerExecutionMessage::DisplayEvent(event) => {
+                            publish_execute_display_event(
+                                runtime,
+                                iopub_socket,
+                                state,
+                                worker_request_id,
+                                &event,
+                            )?;
+                        }
+                        WorkerExecutionMessage::CommEvent(event) => {
+                            publish_execute_comm_event(
+                                runtime,
+                                iopub_socket,
+                                state,
+                                worker_request_id,
+                                &event,
+                            )?;
+                        }
+                        WorkerExecutionMessage::DebugEvent(event) => {
+                            publish_execute_debug_event(
+                                runtime,
+                                iopub_socket,
+                                state,
+                                worker_request_id,
+                                &event,
+                            )?;
+                        }
+                        WorkerExecutionMessage::Completion(outcome) => break outcome,
+                        WorkerExecutionMessage::Failure(message) => {
+                            return Err(KernelError::Worker(message));
+                        }
+                    }
                 };
 
                 finalize_execute_completion(
@@ -205,7 +262,7 @@ pub(crate) fn handle_shell_request(
                     reply_socket,
                     iopub_socket,
                     state,
-                    0,
+                    worker_request_id,
                     ExecuteCompletion {
                         request: request.clone(),
                         code: code_owned,

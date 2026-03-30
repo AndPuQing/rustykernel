@@ -15,7 +15,8 @@ use zeromq::{PubSocket, RepSocket, RouterSocket, ZmqError, ZmqMessage};
 use super::dispatch::{ChannelKind, handle_request};
 use super::execute::{
     ExecuteUpdate, ExecuteUpdateSender, StreamBatch, finalize_execute_completion,
-    flush_execute_stream_batch, flush_execute_stream_batches, publish_execute_debug_event,
+    flush_execute_stream_batch, flush_execute_stream_batches, publish_execute_comm_event,
+    publish_execute_debug_event, publish_execute_display_event,
 };
 use super::io::{drain_debug_session_events, handle_stdin_message, publish_status};
 use super::state::MessageLoopState;
@@ -258,6 +259,38 @@ pub(crate) fn spawn_message_loop_thread(
                             &runtime,
                             &mut iopub_socket,
                             &state,
+                            request_id,
+                            &event,
+                        )?;
+                    }
+                    ExecuteUpdate::DisplayEvent { request_id, event } => {
+                        flush_execute_stream_batch(
+                            &runtime,
+                            &mut iopub_socket,
+                            &state,
+                            request_id,
+                            stream_batches.remove(&request_id),
+                        )?;
+                        publish_execute_display_event(
+                            &runtime,
+                            &mut iopub_socket,
+                            &state,
+                            request_id,
+                            &event,
+                        )?;
+                    }
+                    ExecuteUpdate::CommEvent { request_id, event } => {
+                        flush_execute_stream_batch(
+                            &runtime,
+                            &mut iopub_socket,
+                            &state,
+                            request_id,
+                            stream_batches.remove(&request_id),
+                        )?;
+                        publish_execute_comm_event(
+                            &runtime,
+                            &mut iopub_socket,
+                            &mut state,
                             request_id,
                             &event,
                         )?;

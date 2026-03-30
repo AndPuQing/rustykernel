@@ -37,6 +37,14 @@ from IPython.core.displaypub import DisplayPublisher as IPythonDisplayPublisher
 from IPython.core.error import UsageError
 from IPython.core.interactiveshell import InteractiveShell
 from IPython.core.payload import PayloadManager as IPythonPayloadManager
+from rustykernel.worker_protocol import (
+    ProtocolError,
+    decode_envelope,
+    event_body,
+    event_envelope,
+    response_body,
+    response_envelope,
+)
 
 try:
     import jedi
@@ -84,7 +92,7 @@ SubshellId = str | None
 class RequestContext:
     request_id: int
     subshell_id: SubshellId
-    display_events: list[dict[str, object]] = dataclasses.field(default_factory=list)
+    next_event_seq: int = 1
     comm_events: list[dict[str, object]] = dataclasses.field(default_factory=list)
     payloads: list[dict[str, object]] = dataclasses.field(default_factory=list)
     execute_result: dict[str, object] | None = None
@@ -119,29 +127,36 @@ def record_stream_chunk(name: str, text: str) -> None:
     context.stream_chunks[name].append(text)
 
 
+def emit_request_event(
+    body: dict[str, object],
+    *,
+    context: RequestContext | None = None,
+    request_id: int | None = None,
+) -> None:
+    if context is None:
+        context = try_current_request_context()
+    if context is None:
+        return
+
+    request_id = context.request_id if request_id is None else request_id
+    if request_id <= 0:
+        return
+
+    seq = context.next_event_seq
+    context.next_event_seq += 1
+    emit_protocol_message(event_envelope(request_id, seq, body))
+
+
 def emit_live_stream(
     name: str,
     text: str,
-    request_id: int | None = None,
+    context: RequestContext | None = None,
     *,
     source: str = "python",
 ) -> None:
-    if request_id is None:
-        context = try_current_request_context()
-        if context is None:
-            return
-        request_id = context.request_id
-
-    if request_id <= 0:
-        return
-    emit_protocol_message(
-        {
-            "id": request_id,
-            "event": "stream",
-            "name": name,
-            "text": text,
-            "source": source,
-        }
+    emit_request_event(
+        event_body("stream", name=name, text=text, source=source),
+        context=context,
     )
 
 
@@ -166,7 +181,7 @@ def take_stream_chunks(
 def flush_pending_streams(context: RequestContext) -> None:
     for name in STREAM_FDS:
         for chunk in take_stream_chunks(context.stream_pending, name, "", final=True):
-            emit_live_stream(name, chunk, context.request_id, source="python")
+            emit_live_stream(name, chunk, context=context, source="python")
 
 
 @contextlib.contextmanager
@@ -234,6 +249,12 @@ def emit_protocol_message(message: object) -> None:
         stream = protocol_stdout()
         stream.write(json.dumps(message) + "\n")
         stream.flush()
+
+
+def emit_response(request_id: int, response_type: str, **fields: object) -> None:
+    emit_protocol_message(
+        response_envelope(request_id, response_body(response_type, **fields))
+    )
 
 
 def flush_standard_streams() -> None:
@@ -322,7 +343,7 @@ class WorkerStream(io.TextIOBase):
             for chunk in take_stream_chunks(
                 context.stream_pending, self._name, data, final=False
             ):
-                emit_live_stream(self._name, chunk, context.request_id, source="python")
+                emit_live_stream(self._name, chunk, context=context, source="python")
             return len(data)
 
         write_all(self._fd, data.encode(self.encoding, self.errors))
@@ -405,7 +426,7 @@ class FdCapture:
 
         for chunk in emit_chunks:
             with self._emit_lock:
-                emit_live_stream(name, chunk, self._request_id, source="fd")
+                emit_live_stream(name, chunk, context=self._context, source="fd")
 
 
 def install_streams() -> None:
@@ -895,21 +916,26 @@ class RustyDisplayPublisher(IPythonDisplayPublisher):
         update=False,
         **kwargs,
     ) -> None:
-        current_request_context().display_events.append(
-            {
-                "msg_type": "update_display_data" if update else "display_data",
-                "data": dict(data),
-                "metadata": dict(metadata or {}),
-                "transient": dict(transient or {}),
-            }
+        emit_request_event(
+            event_body(
+                "display",
+                msg_type="update_display_data" if update else "display_data",
+                data=dict(data),
+                metadata=dict(metadata or {}),
+                transient=dict(transient or {}),
+            )
         )
 
     def clear_output(self, wait: bool = False) -> None:
-        current_request_context().display_events.append(
-            {
-                "msg_type": "clear_output",
-                "content": {"wait": bool(wait)},
-            }
+        emit_request_event(
+            event_body(
+                "display",
+                msg_type="clear_output",
+                content={"wait": bool(wait)},
+                data={},
+                metadata={},
+                transient={},
+            )
         )
 
 
@@ -1018,19 +1044,31 @@ def publish_display_event(
     content: Optional[dict[str, object]] = None,
 ) -> None:
     if content is not None:
-        current_request_context().display_events.append(
-            {"msg_type": msg_type, "content": content}
+        context = current_request_context()
+        emit_request_event(
+            event_body(
+                "display",
+                msg_type=msg_type,
+                content=content,
+                data={},
+                metadata={},
+                transient={},
+            ),
+            context=context,
         )
         return
 
     data, metadata = rich_display_data(value)
-    current_request_context().display_events.append(
-        {
-            "msg_type": msg_type,
-            "data": data,
-            "metadata": metadata,
-            "transient": transient or {},
-        }
+    context = current_request_context()
+    emit_request_event(
+        event_body(
+            "display",
+            msg_type=msg_type,
+            data=data,
+            metadata=metadata,
+            transient=transient or {},
+        ),
+        context=context,
     )
 
 
@@ -1049,9 +1087,24 @@ def publish_comm_event(
     }
     if target_name is not None:
         content["target_name"] = target_name
-    current_request_context().comm_events.append(
-        {"msg_type": msg_type, "content": content}
+    context = current_request_context()
+    context.comm_events.append({"msg_type": msg_type, "content": content})
+    emit_request_event(
+        event_body("comm", msg_type=msg_type, content=content),
+        context=context,
     )
+
+
+def publish_debug_protocol_event(
+    msg_type: str,
+    content: dict[str, object],
+    *,
+    context: RequestContext | None = None,
+) -> None:
+    if context is None:
+        context = current_request_context()
+    event = {"msg_type": msg_type, "content": content}
+    emit_request_event(event_body("debug", **event), context=context)
 
 
 class DisplayHandle:
@@ -1155,13 +1208,14 @@ def _publish_display_bundle(
     msg_type: str,
     transient: Optional[dict[str, object]] = None,
 ) -> None:
-    current_request_context().display_events.append(
-        {
-            "msg_type": msg_type,
-            "data": data,
-            "metadata": metadata,
-            "transient": transient or {},
-        }
+    emit_request_event(
+        event_body(
+            "display",
+            msg_type=msg_type,
+            data=data,
+            metadata=metadata,
+            transient=transient or {},
+        )
     )
 
 
@@ -1229,13 +1283,13 @@ def clear_output(wait: bool = False) -> None:
 def request_input(prompt: object = "", *, password: bool = False) -> str:
     context = current_request_context()
 
-    emit_protocol_message(
-        {
-            "id": context.request_id,
-            "event": "input_request",
-            "prompt": str(prompt),
-            "password": password,
-        }
+    emit_request_event(
+        event_body(
+            "input_request",
+            prompt=str(prompt),
+            password=password,
+        ),
+        context=context,
     )
 
     if threading.get_ident() == _MAIN_THREAD_ID:
@@ -1246,16 +1300,21 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
             if not raw_line.strip():
                 continue
 
-            response = json.loads(raw_line)
-            if response.get("kind") != "input_reply":
+            try:
+                response = decode_envelope(raw_line)
+            except ProtocolError:
                 continue
-            if int(response.get("id", -1)) != context.request_id:
+            if response.frame_type != "request":
+                continue
+            if response.request_id != context.request_id:
+                continue
+            if response.body.get("request_type") != "input_reply":
                 continue
 
-            error = response.get("error")
+            error = response.body.get("error")
             if error:
                 raise EOFError(str(error))
-            return str(response.get("value", ""))
+            return str(response.body.get("value", ""))
 
     while True:
         response = context.input_queue.get()
@@ -1649,9 +1708,6 @@ def execute(
         "status": "ok",
         "stdout": "",
         "stderr": "",
-        "displays": [],
-        "comm_events": [],
-        "debug_events": [],
         "payload": [],
         "result": None,
         "user_expressions": {},
@@ -1709,9 +1765,13 @@ def execute(
     flush_pending_streams(context)
     payload["stdout"] = "".join(context.stream_chunks["stdout"])
     payload["stderr"] = "".join(context.stream_chunks["stderr"])
-    payload["displays"] = list(context.display_events)
-    payload["comm_events"] = list(context.comm_events)
-    payload["debug_events"] = DEBUG_STATE.capture_breakpoint_stop(code)
+    for event in DEBUG_STATE.capture_breakpoint_stop(code):
+        if isinstance(event, dict):
+            publish_debug_protocol_event(
+                str(event.get("msg_type", "debug_event")),
+                dict(event.get("content", {})),
+                context=context,
+            )
     payload["payload"] = list(context.payloads)
     clear_interrupt(subshell_id)
     context.payloads.clear()
@@ -1942,7 +2002,7 @@ def kernel_info_payload() -> dict[str, object]:
 class ExecutionLane:
     def __init__(self, subshell_id: SubshellId) -> None:
         self.subshell_id = subshell_id
-        self.requests: queue.Queue[dict[str, object] | None] = queue.Queue()
+        self.requests: queue.Queue[tuple[int, dict[str, object]] | None] = queue.Queue()
         self._active_lock = threading.Lock()
         self._active_request_id: int | None = None
         self.thread = threading.Thread(
@@ -1952,8 +2012,8 @@ class ExecutionLane:
         )
         self.thread.start()
 
-    def submit(self, request: dict[str, object]) -> None:
-        self.requests.put(request)
+    def submit(self, request_id: int, request: dict[str, object]) -> None:
+        self.requests.put((request_id, request))
 
     def stop(self) -> None:
         self.requests.put(None)
@@ -1975,34 +2035,27 @@ class ExecutionLane:
 
     def _run(self) -> None:
         while True:
-            request = self.requests.get()
-            if request is None:
+            queued = self.requests.get()
+            if queued is None:
                 return
-            request_id = int(request["id"])
+            request_id, request = queued
             with self._active_lock:
                 self._active_request_id = request_id
             try:
-                response = {
-                    "id": request_id,
-                    **execute(
-                        str(request.get("code", "")),
-                        request_id,
-                        self.subshell_id,
-                        request.get("user_expressions", {}),
-                        execution_count=int(request.get("execution_count", 0)),
-                        silent=bool(request.get("silent", False)),
-                        store_history=bool(request.get("store_history", True)),
-                    ),
-                }
+                response = execute(
+                    str(request.get("code", "")),
+                    request_id,
+                    self.subshell_id,
+                    request.get("user_expressions", {}),
+                    execution_count=int(request.get("execution_count", 0)),
+                    silent=bool(request.get("silent", False)),
+                    store_history=bool(request.get("store_history", True)),
+                )
             except BaseException as exc:
                 response = {
-                    "id": request_id,
                     "status": "error",
                     "stdout": "",
                     "stderr": "",
-                    "displays": [],
-                    "comm_events": [],
-                    "debug_events": [],
                     "payload": [],
                     "result": None,
                     "user_expressions": {},
@@ -2015,7 +2068,7 @@ class ExecutionLane:
             finally:
                 with self._active_lock:
                     self._active_request_id = None
-            emit_protocol_message(response)
+            emit_response(request_id, "execute", **response)
 
 
 class SubshellManager:
@@ -2043,13 +2096,13 @@ class SubshellManager:
             )
 
     def submit_execute(
-        self, request: dict[str, object], subshell_id: SubshellId
+        self, request_id: int, request: dict[str, object], subshell_id: SubshellId
     ) -> bool:
         with self._lock:
             lane = self._lanes.get(subshell_id)
         if lane is None:
             return False
-        lane.submit(request)
+        lane.submit(request_id, request)
         return True
 
     def interrupt_all(self) -> None:
@@ -2358,13 +2411,9 @@ SUBSHELL_MANAGER = SubshellManager()
 
 def invalid_subshell_reply(request_id: int, subshell_id: object) -> dict[str, object]:
     return {
-        "id": request_id,
         "status": "error",
         "stdout": "",
         "stderr": "",
-        "displays": [],
-        "comm_events": [],
-        "debug_events": [],
         "payload": [],
         "result": None,
         "user_expressions": {},
@@ -2387,72 +2436,75 @@ while True:
     if not raw_line.strip():
         continue
 
-    request = json.loads(raw_line)
-    kind = request.get("kind", "execute")
+    try:
+        envelope = decode_envelope(raw_line)
+    except ProtocolError as exc:
+        emit_response(
+            0,
+            "interrupt",
+            status="error",
+            evalue=str(exc),
+        )
+        continue
+
+    if envelope.frame_type != "request":
+        emit_response(
+            envelope.request_id,
+            "interrupt",
+            status="error",
+            evalue=f"unexpected frame_type: {envelope.frame_type}",
+        )
+        continue
+
+    request_id = envelope.request_id
+    request = envelope.body
+    kind = str(request.get("request_type", "execute"))
+
     if kind == "complete":
-        response = {
-            "id": request["id"],
-            **complete(request.get("code", ""), int(request.get("cursor_pos", 0))),
-        }
+        response_type = "complete"
+        response = complete(request.get("code", ""), int(request.get("cursor_pos", 0)))
     elif kind == "is_complete":
-        response = {
-            "id": request["id"],
-            **is_complete(request.get("code", "")),
-        }
+        response_type = "is_complete"
+        response = is_complete(request.get("code", ""))
     elif kind == "inspect":
-        response = {
-            "id": request["id"],
-            **inspect_symbol(
-                request.get("code", ""),
-                int(request.get("cursor_pos", 0)),
-                int(request.get("detail_level", 0)),
-            ),
-        }
+        response_type = "inspect"
+        response = inspect_symbol(
+            request.get("code", ""),
+            int(request.get("cursor_pos", 0)),
+            int(request.get("detail_level", 0)),
+        )
     elif kind == "kernel_info":
-        response = {
-            "id": request["id"],
-            **kernel_info_payload(),
-        }
+        response_type = "kernel_info"
+        response = kernel_info_payload()
     elif kind == "debug_listen":
-        response = {
-            "id": request["id"],
-            **DEBUG_STATE.listen_endpoint(),
-        }
+        response_type = "debug_listen"
+        response = DEBUG_STATE.listen_endpoint()
     elif kind == "debug":
-        response = {
-            "id": request["id"],
-            **DEBUG_STATE.handle(request.get("message", {})),
-        }
+        response_type = "debug"
+        response = DEBUG_STATE.handle(request.get("message", {}))
     elif kind == "comm_open":
-        response = {
-            "id": request["id"],
-            **handle_comm_open(
-                str(request.get("comm_id", "")),
-                str(request.get("target_name", "")),
-                request.get("data", {}),
-                request.get("metadata", {}),
-            ),
-        }
+        response_type = "comm"
+        response = handle_comm_open(
+            str(request.get("comm_id", "")),
+            str(request.get("target_name", "")),
+            request.get("data", {}),
+            request.get("metadata", {}),
+        )
     elif kind == "comm_msg":
-        response = {
-            "id": request["id"],
-            **handle_comm_msg(
-                str(request.get("comm_id", "")),
-                request.get("data", {}),
-                request.get("metadata", {}),
-            ),
-        }
+        response_type = "comm"
+        response = handle_comm_msg(
+            str(request.get("comm_id", "")),
+            request.get("data", {}),
+            request.get("metadata", {}),
+        )
     elif kind == "comm_close":
-        response = {
-            "id": request["id"],
-            **handle_comm_close(
-                str(request.get("comm_id", "")),
-                request.get("data", {}),
-                request.get("metadata", {}),
-            ),
-        }
+        response_type = "comm"
+        response = handle_comm_close(
+            str(request.get("comm_id", "")),
+            request.get("data", {}),
+            request.get("metadata", {}),
+        )
     elif kind == "input_reply":
-        request_id = int(request.get("id", -1))
         with _INPUT_WAITERS_LOCK:
             waiter = _INPUT_WAITERS.get(request_id)
         if waiter is not None:
@@ -2464,60 +2516,53 @@ while True:
             )
         continue
     elif kind == "create_subshell":
-        response = {
-            "id": request["id"],
-            "status": "ok",
-            "subshell_id": SUBSHELL_MANAGER.create_subshell(),
-        }
+        response_type = "create_subshell"
+        response = {"status": "ok", "subshell_id": SUBSHELL_MANAGER.create_subshell()}
     elif kind == "delete_subshell":
         subshell_id = str(request.get("subshell_id", ""))
         try:
             SUBSHELL_MANAGER.delete_subshell(subshell_id)
-            response = {
-                "id": request["id"],
-                "status": "ok",
-            }
+            response_type = "delete_subshell"
+            response = {"status": "ok"}
         except KeyError:
+            response_type = "delete_subshell"
             response = {
-                "id": request["id"],
                 "status": "error",
                 "evalue": f"unknown subshell_id: {subshell_id}",
             }
     elif kind == "list_subshell":
-        response = {
-            "id": request["id"],
-            "status": "ok",
-            "subshell_id": SUBSHELL_MANAGER.list_subshells(),
-        }
+        response_type = "list_subshell"
+        response = {"status": "ok", "subshell_id": SUBSHELL_MANAGER.list_subshells()}
     elif kind == "interrupt":
         SUBSHELL_MANAGER.interrupt_subshells()
-        response = {"id": request["id"], "status": "ok"}
+        response_type = "interrupt"
+        response = {"status": "ok"}
     elif kind == "execute":
         subshell_id = request.get("subshell_id")
         normalized_subshell_id = None if subshell_id is None else str(subshell_id)
         if normalized_subshell_id is None:
-            response = {
-                "id": request["id"],
-                **execute(
-                    request.get("code", ""),
-                    int(request["id"]),
-                    None,
-                    request.get("user_expressions", {}),
-                    execution_count=int(request.get("execution_count", 0)),
-                    silent=bool(request.get("silent", False)),
-                    store_history=bool(request.get("store_history", True)),
-                ),
-            }
-        elif not SUBSHELL_MANAGER.submit_execute(request, normalized_subshell_id):
-            response = invalid_subshell_reply(
-                int(request["id"]), normalized_subshell_id
+            response_type = "execute"
+            response = execute(
+                request.get("code", ""),
+                request_id,
+                None,
+                request.get("user_expressions", {}),
+                execution_count=int(request.get("execution_count", 0)),
+                silent=bool(request.get("silent", False)),
+                store_history=bool(request.get("store_history", True)),
             )
+        elif not SUBSHELL_MANAGER.submit_execute(
+            request_id, request, normalized_subshell_id
+        ):
+            response_type = "execute"
+            response = invalid_subshell_reply(request_id, normalized_subshell_id)
         else:
             continue
     else:
+        response_type = "interrupt"
         response = {
-            "id": request["id"],
             "status": "error",
             "evalue": f"unknown worker request kind: {kind}",
         }
-    emit_protocol_message(response)
+
+    emit_response(request_id, response_type, **response)

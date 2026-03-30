@@ -9,14 +9,13 @@ use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::JupyterMessage;
 use crate::worker::{
-    ExecutionOutcome, WorkerDebugEvent, WorkerExecutionHandle, WorkerExecutionMessage,
+    ExecutionDisplayEvent, ExecutionOutcome, WorkerCommEvent, WorkerDebugEvent,
+    WorkerExecutionHandle, WorkerExecutionMessage,
 };
 
 use super::KernelError;
-use super::debug::filter_worker_debug_events_for_publish;
 use super::io::{
-    publish_comm_events, publish_debug_events, publish_display_event, publish_iopub_message,
-    publish_status, publish_stream, send_reply,
+    publish_display_event, publish_iopub_message, publish_status, publish_stream, send_reply,
 };
 use super::state::MessageLoopState;
 
@@ -76,6 +75,14 @@ pub(crate) enum ExecuteUpdate {
     DebugEvent {
         request_id: u64,
         event: WorkerDebugEvent,
+    },
+    DisplayEvent {
+        request_id: u64,
+        event: ExecutionDisplayEvent,
+    },
+    CommEvent {
+        request_id: u64,
+        event: WorkerCommEvent,
     },
     Completion {
         request_id: u64,
@@ -142,6 +149,26 @@ pub(crate) fn spawn_execute_request_from_handle(
                         ));
                     }
                 }
+                Ok(WorkerExecutionMessage::DisplayEvent(event)) => {
+                    if execute_tx
+                        .send(ExecuteUpdate::DisplayEvent { request_id, event })
+                        .is_err()
+                    {
+                        break Err(KernelError::Worker(
+                            "failed to send execute display event update".to_owned(),
+                        ));
+                    }
+                }
+                Ok(WorkerExecutionMessage::CommEvent(event)) => {
+                    if execute_tx
+                        .send(ExecuteUpdate::CommEvent { request_id, event })
+                        .is_err()
+                    {
+                        break Err(KernelError::Worker(
+                            "failed to send execute comm event update".to_owned(),
+                        ));
+                    }
+                }
                 Ok(WorkerExecutionMessage::DebugEvent(event)) => {
                     if execute_tx
                         .send(ExecuteUpdate::DebugEvent { request_id, event })
@@ -193,54 +220,12 @@ pub(crate) fn finalize_execute_completion(
     } = completion;
     let outcome = outcome?;
 
-    if !silent {
-        publish_comm_events(
-            runtime,
-            iopub_socket,
-            state,
-            request.header_value.clone(),
-            &outcome.comm_events,
-        )?;
-        let debug_events = filter_worker_debug_events_for_publish(state, &outcome.debug_events)?;
-        publish_debug_events(
-            runtime,
-            iopub_socket,
-            state,
-            request.header_value.clone(),
-            &debug_events,
-        )?;
-    }
-
     if !silent && store_history {
         state.record_history(execution_count, &code, &outcome);
     }
 
     if outcome.status == "ok" {
         if !silent {
-            for display in outcome.displays {
-                if !display.content.is_null() {
-                    publish_iopub_message(
-                        runtime,
-                        iopub_socket,
-                        state,
-                        request.header_value.clone(),
-                        &display.msg_type,
-                        display.content,
-                    )?;
-                } else {
-                    publish_display_event(
-                        runtime,
-                        iopub_socket,
-                        state,
-                        request.header_value.clone(),
-                        &display.msg_type,
-                        display.data,
-                        display.metadata,
-                        display.transient,
-                    )?;
-                }
-            }
-
             if let Some(result) = outcome.result {
                 publish_iopub_message(
                     runtime,
@@ -427,4 +412,76 @@ pub(crate) fn publish_execute_debug_event(
         &event.msg_type,
         event.content.clone(),
     )
+}
+
+pub(crate) fn publish_execute_display_event(
+    runtime: &Runtime,
+    socket: &mut PubSocket,
+    state: &MessageLoopState,
+    request_id: u64,
+    event: &ExecutionDisplayEvent,
+) -> Result<(), KernelError> {
+    let Some(pending) = state.pending_executes.get(&request_id) else {
+        return Err(KernelError::Worker(
+            "received execute display event update without a pending execute".to_owned(),
+        ));
+    };
+
+    if pending.silent {
+        return Ok(());
+    }
+
+    if !event.content.is_null() {
+        publish_iopub_message(
+            runtime,
+            socket,
+            state,
+            pending.parent_header.clone(),
+            &event.msg_type,
+            event.content.clone(),
+        )
+    } else {
+        publish_display_event(
+            runtime,
+            socket,
+            state,
+            pending.parent_header.clone(),
+            &event.msg_type,
+            event.data.clone(),
+            event.metadata.clone(),
+            event.transient.clone(),
+        )
+    }
+}
+
+pub(crate) fn publish_execute_comm_event(
+    runtime: &Runtime,
+    socket: &mut PubSocket,
+    state: &mut MessageLoopState,
+    request_id: u64,
+    event: &WorkerCommEvent,
+) -> Result<(), KernelError> {
+    let Some(pending) = state.pending_executes.get(&request_id) else {
+        return Err(KernelError::Worker(
+            "received execute comm event update without a pending execute".to_owned(),
+        ));
+    };
+
+    let silent = pending.silent;
+    let parent_header = pending.parent_header.clone();
+
+    if silent {
+        return Ok(());
+    }
+
+    publish_iopub_message(
+        runtime,
+        socket,
+        state,
+        parent_header,
+        &event.msg_type,
+        event.content.clone(),
+    )?;
+    state.comms.apply_event(event);
+    Ok(())
 }

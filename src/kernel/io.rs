@@ -4,7 +4,7 @@ use zeromq::{PubSocket, RouterSocket};
 
 use crate::debug_session::DebugEventEnvelope;
 use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
-use crate::worker::{CommOutcome, WorkerCommEvent, WorkerDebugEvent};
+use crate::worker::{CommOutcome, WorkerCommEvent};
 
 use super::KernelError;
 use super::runtime::{recv_frames, send_frames};
@@ -178,31 +178,6 @@ pub(crate) fn publish_comm_events(
             event.content.clone(),
         )?;
         state.comms.apply_event(event);
-    }
-    Ok(())
-}
-
-pub(crate) fn publish_debug_events(
-    runtime: &Runtime,
-    socket: &mut PubSocket,
-    state: &MessageLoopState,
-    parent_header: Value,
-    events: &[WorkerDebugEvent],
-) -> Result<(), KernelError> {
-    for event in events {
-        if event.content.get("event") == Some(&json!("stopped"))
-            && event.content.get("seq") == Some(&json!(0))
-        {
-            state.debug_session.apply_event_state(&event.content)?;
-        }
-        publish_iopub_message(
-            runtime,
-            socket,
-            state,
-            parent_header.clone(),
-            &event.msg_type,
-            event.content.clone(),
-        )?;
     }
     Ok(())
 }
