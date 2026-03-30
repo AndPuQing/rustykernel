@@ -1537,18 +1537,29 @@ def execute_with_ipython(
             preprocessing_exc_tuple=preprocessing_exc_tuple,
         )
     )
+
+    def run_cell_async_with_post_events() -> object:
+        result = None
+        try:
+            result = asyncio.run(
+                INTERACTIVE_SHELL.run_cell_async(
+                    code,
+                    store_history=store_history,
+                    silent=silent,
+                    transformed_cell=transformed_cell,
+                    preprocessing_exc_tuple=preprocessing_exc_tuple,
+                )
+            )
+            return result
+        finally:
+            INTERACTIVE_SHELL.events.trigger("post_execute")
+            if not silent:
+                INTERACTIVE_SHELL.events.trigger("post_run_cell", result)
+
     if source_path is not None:
         with override_cell_filename(source_path):
             if should_run_async:
-                return asyncio.run(
-                    INTERACTIVE_SHELL.run_cell_async(
-                        code,
-                        store_history=store_history,
-                        silent=silent,
-                        transformed_cell=transformed_cell,
-                        preprocessing_exc_tuple=preprocessing_exc_tuple,
-                    )
-                )
+                return run_cell_async_with_post_events()
 
             return INTERACTIVE_SHELL.run_cell(
                 code,
@@ -1557,15 +1568,7 @@ def execute_with_ipython(
             )
 
     if should_run_async:
-        return asyncio.run(
-            INTERACTIVE_SHELL.run_cell_async(
-                code,
-                store_history=store_history,
-                silent=silent,
-                transformed_cell=transformed_cell,
-                preprocessing_exc_tuple=preprocessing_exc_tuple,
-            )
-        )
+        return run_cell_async_with_post_events()
 
     return INTERACTIVE_SHELL.run_cell(
         code,
