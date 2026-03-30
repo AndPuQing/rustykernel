@@ -1,0 +1,144 @@
+name: TestPyPI Nightly
+
+on:
+  schedule:
+    # Daily at UTC 00:00
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: testpypi-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      head_commit: ${{ steps.check.outputs.head_commit }}
+      previous_commit: ${{ steps.check.outputs.previous_commit }}
+      package_name: ${{ steps.meta.outputs.package_name }}
+      artifact_suffix: ${{ steps.meta.outputs.artifact_suffix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compare today's commit with yesterday's commit
+        id: check
+        shell: bash
+        run: |
+          HEAD_COMMIT=$(git rev-parse HEAD)
+          PREVIOUS_COMMIT=$(git rev-list -1 --before="24 hours ago" HEAD || true)
+
+          echo "head_commit=${HEAD_COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "previous_commit=${PREVIOUS_COMMIT}" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$PREVIOUS_COMMIT" ] || [ "$HEAD_COMMIT" != "$PREVIOUS_COMMIT" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "HEAD matches the latest commit from at least 24 hours ago, skipping build"
+          fi
+
+      - name: Generate TestPyPI package metadata
+        id: meta
+        if: steps.check.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          PACKAGE_NAME="rustykernel-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ARTIFACT_SUFFIX="testpypi-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "package_name=${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "artifact_suffix=${ARTIFACT_SUFFIX}" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Set TestPyPI package name
+        shell: bash
+        run: |
+          sed -i 's/^name = "rustykernel"$/name = "${{ needs.check.outputs.package_name }}"/' pyproject.toml
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          sccache: true
+          manylinux: auto
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}-${{ needs.check.outputs.artifact_suffix }}
+          path: dist
+
+  sdist:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set TestPyPI package name
+        shell: bash
+        run: |
+          sed -i 's/^name = "rustykernel"$/name = "${{ needs.check.outputs.package_name }}"/' pyproject.toml
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist-${{ needs.check.outputs.artifact_suffix }}
+          path: dist
+
+  publish:
+    name: Publish to TestPyPI
+    needs: [check, linux, sdist]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Publish to TestPyPI
+        run: uv publish 'wheels-*/*' --publish-url https://test.pypi.org/legacy/
