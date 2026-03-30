@@ -148,12 +148,10 @@ impl DapClient {
                         "response" => {
                             if let Some(request_seq) =
                                 message.get("request_seq").and_then(Value::as_i64)
+                                && let Ok(mut response_map) = responses.lock()
+                                && let Some(sender) = response_map.remove(&request_seq)
                             {
-                                if let Ok(mut response_map) = responses.lock() {
-                                    if let Some(sender) = response_map.remove(&request_seq) {
-                                        let _ = sender.send(message);
-                                    }
-                                }
+                                let _ = sender.send(message);
                             }
                         }
                         "event" => {

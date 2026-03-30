@@ -9,27 +9,38 @@ use super::KernelError;
 use super::runtime::send_frames;
 use super::state::MessageLoopState;
 
+pub(crate) struct StdinRequestContext<'a> {
+    pub(crate) signer: &'a MessageSigner,
+    pub(crate) kernel_session: &'a str,
+    pub(crate) identities: &'a [Vec<u8>],
+    pub(crate) parent_header: &'a Value,
+    pub(crate) allow_stdin: bool,
+}
+
+pub(crate) struct DisplayMessage<'a> {
+    pub(crate) msg_type: &'a str,
+    pub(crate) data: Value,
+    pub(crate) metadata: Value,
+    pub(crate) transient: Value,
+}
+
 pub(crate) fn send_stdin_input_request(
     runtime: &Runtime,
     stdin_socket: &mut RouterSocket,
-    signer: &MessageSigner,
-    kernel_session: &str,
-    identities: &[Vec<u8>],
-    parent_header: &Value,
+    request: StdinRequestContext<'_>,
     prompt: &str,
     password: bool,
-    allow_stdin: bool,
 ) -> Result<String, KernelError> {
-    if !allow_stdin {
+    if !request.allow_stdin {
         return Err(KernelError::Worker(
             "stdin is not enabled for this execute_request".to_owned(),
         ));
     }
 
     let input_request = JupyterMessage::new(
-        identities.to_vec(),
-        MessageHeader::new("input_request", kernel_session),
-        parent_header.clone(),
+        request.identities.to_vec(),
+        MessageHeader::new("input_request", request.kernel_session),
+        request.parent_header.clone(),
         json!({}),
         json!({
             "prompt": prompt,
@@ -38,7 +49,11 @@ pub(crate) fn send_stdin_input_request(
     );
     let input_request_id = input_request.header.msg_id.clone();
 
-    send_frames(runtime, stdin_socket, signer.encode(&input_request)?)?;
+    send_frames(
+        runtime,
+        stdin_socket,
+        request.signer.encode(&input_request)?,
+    )?;
     Ok(input_request_id)
 }
 
@@ -154,21 +169,18 @@ pub(crate) fn publish_display_event(
     socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
-    msg_type: &str,
-    data: Value,
-    metadata: Value,
-    transient: Value,
+    message: DisplayMessage<'_>,
 ) -> Result<(), KernelError> {
     publish_iopub_message(
         runtime,
         socket,
         state,
         parent_header,
-        msg_type,
+        message.msg_type,
         json!({
-            "data": data,
-            "metadata": metadata,
-            "transient": transient,
+            "data": message.data,
+            "metadata": message.metadata,
+            "transient": message.transient,
         }),
     )
 }

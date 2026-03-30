@@ -71,9 +71,9 @@ impl WorkerInterruptHandle {
                 return Ok(());
             }
 
-            return Err(KernelError::Worker(format!(
+            Err(KernelError::Worker(format!(
                 "failed to interrupt python worker {pid}: {error}"
-            )));
+            )))
         }
 
         #[cfg(not(unix))]

@@ -12,17 +12,20 @@ use zeromq::SocketRecv as _;
 use zeromq::SocketSend as _;
 use zeromq::{PubSocket, RepSocket, RouterSocket, ZmqError, ZmqMessage};
 
-use super::dispatch::{ChannelKind, handle_request};
+use super::dispatch::{ChannelKind, RequestSockets, handle_request};
 use super::execute::{
     KernelEvent, KernelEventSender, StreamBatch, WorkerUpdateEvent, finalize_execute_completion,
     flush_execute_stream_batch, flush_execute_stream_batches, publish_execute_comm_event,
     publish_execute_debug_event, publish_execute_display_event,
 };
 use super::io::{
-    drain_debug_session_events, handle_stdin_message, publish_status, send_stdin_input_request,
+    StdinRequestContext, drain_debug_session_events, handle_stdin_message, publish_status,
+    send_stdin_input_request,
 };
 use super::state::MessageLoopState;
 use super::{ChannelEndpoints, ConnectionInfo, KernelError, ShutdownSignal};
+
+type SpawnedThread<E> = (JoinHandle<Result<(), E>>, mpsc::Receiver<Result<(), E>>);
 
 pub struct KernelRuntime {
     connection: ConnectionInfo,
@@ -207,10 +210,7 @@ pub(crate) fn spawn_message_loop_thread(
     connection: ConnectionInfo,
     endpoints: ChannelEndpoints,
     shutdown: Arc<ShutdownSignal>,
-) -> (
-    JoinHandle<Result<(), KernelError>>,
-    mpsc::Receiver<Result<(), KernelError>>,
-) {
+) -> SpawnedThread<KernelError> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let handle = thread::spawn(move || {
         let runtime = build_transport_runtime();
@@ -274,13 +274,15 @@ pub(crate) fn spawn_message_loop_thread(
                                 let input_request_id = send_stdin_input_request(
                                     &runtime,
                                     &mut stdin_socket,
-                                    &state.signer,
-                                    &state.kernel_session,
-                                    &pending.request.identities,
-                                    &pending.request.header_value,
+                                    StdinRequestContext {
+                                        signer: &state.signer,
+                                        kernel_session: &state.kernel_session,
+                                        identities: &pending.request.identities,
+                                        parent_header: &pending.request.header_value,
+                                        allow_stdin: pending.allow_stdin,
+                                    },
                                     &prompt,
                                     password,
-                                    pending.allow_stdin,
                                 )?;
                                 pending.phase = super::execute::ExecutePhase::WaitingInput {
                                     input_request_msg_id: input_request_id,
@@ -322,7 +324,7 @@ pub(crate) fn spawn_message_loop_thread(
                                 publish_execute_display_event(
                                     &runtime,
                                     &mut iopub_socket,
-                                    &mut state,
+                                    &state,
                                     request_id,
                                     &event,
                                 )?;
@@ -403,15 +405,16 @@ pub(crate) fn spawn_message_loop_thread(
                     } else {
                         &mut control_socket
                     };
+                    let mut sockets = RequestSockets {
+                        reply: reply_socket,
+                        iopub: &mut iopub_socket,
+                    };
                     handle_request(
                         &runtime,
                         channel,
                         frames,
-                        reply_socket,
-                        &mut stdin_socket,
-                        &mut iopub_socket,
+                        &mut sockets,
                         &mut state,
-                        &kernel_event_tx,
                         shutdown.as_ref(),
                     )?;
                 }
@@ -428,10 +431,7 @@ pub(crate) fn spawn_message_loop_thread(
 pub(crate) fn spawn_heartbeat_thread(
     endpoint: String,
     shutdown: Arc<ShutdownSignal>,
-) -> (
-    JoinHandle<Result<(), ZmqError>>,
-    mpsc::Receiver<Result<(), ZmqError>>,
-) {
+) -> SpawnedThread<ZmqError> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let handle = thread::spawn(move || {
         let runtime = build_transport_runtime();

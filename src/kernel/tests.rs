@@ -1817,7 +1817,7 @@ fn execute_request_publishes_debug_event_and_exposes_stacktrace_variables() {
         .expect("dumpCell sourcePath missing")
         .to_owned();
 
-    for request in [client_request(
+    let request = client_request(
         "client-session",
         "debug_request",
         json!({
@@ -1830,17 +1830,16 @@ fn execute_request_publishes_debug_event_and_exposes_stacktrace_variables() {
                 "sourceModified": false,
             },
         }),
-    )] {
-        send_client_message(&control, &signer, &request);
-        let reply = recv_message(&control, &signer);
-        assert_eq!(reply.header.msg_type, "debug_reply");
-        assert_eq!(
-            reply.content.get("success"),
-            Some(&json!(true)),
-            "unexpected debug reply: {:?}",
-            reply.content
-        );
-    }
+    );
+    send_client_message(&control, &signer, &request);
+    let reply = recv_message(&control, &signer);
+    assert_eq!(reply.header.msg_type, "debug_reply");
+    assert_eq!(
+        reply.content.get("success"),
+        Some(&json!(true)),
+        "unexpected debug reply: {:?}",
+        reply.content
+    );
 
     let execute = client_request(
         "client-session",

@@ -4,7 +4,7 @@ use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::JupyterMessage;
 
-use super::execute::{ExecutePhase, KernelEventSender, PendingExecute};
+use super::execute::{ExecutePhase, PendingExecute};
 use super::io::{handle_comm_outcome, publish_iopub_message, publish_status, send_reply};
 use super::state::MessageLoopState;
 use super::{KernelError, ShutdownSignal};
@@ -21,15 +21,17 @@ pub(crate) enum RequestDisposition {
     Deferred,
 }
 
+pub(crate) struct RequestSockets<'a> {
+    pub(crate) reply: &'a mut RouterSocket,
+    pub(crate) iopub: &'a mut PubSocket,
+}
+
 pub(crate) fn handle_request(
     runtime: &Runtime,
     channel: ChannelKind,
     frames: Vec<Vec<u8>>,
-    reply_socket: &mut RouterSocket,
-    stdin_socket: &mut RouterSocket,
-    iopub_socket: &mut PubSocket,
+    sockets: &mut RequestSockets<'_>,
     state: &mut MessageLoopState,
-    _kernel_events: &KernelEventSender,
     shutdown: &ShutdownSignal,
 ) -> Result<(), KernelError> {
     let request = match state.signer.decode(frames) {
@@ -38,27 +40,19 @@ pub(crate) fn handle_request(
     };
 
     let parent_header = request.header_value.clone();
-    publish_status(runtime, iopub_socket, state, parent_header.clone(), "busy")?;
+    publish_status(runtime, sockets.iopub, state, parent_header.clone(), "busy")?;
 
     let disposition = match channel {
-        ChannelKind::Shell => handle_shell_request(
-            runtime,
-            reply_socket,
-            stdin_socket,
-            iopub_socket,
-            state,
-            _kernel_events,
-            &request,
-        )?,
+        ChannelKind::Shell => handle_shell_request(runtime, sockets, state, &request)?,
         ChannelKind::Control => {
-            handle_control_request(runtime, reply_socket, iopub_socket, state, &request)?
+            handle_control_request(runtime, sockets.reply, sockets.iopub, state, &request)?
         }
         ChannelKind::Stdin => unreachable!("stdin messages are handled before request dispatch"),
     };
 
     match disposition {
         RequestDisposition::Complete { should_stop } => {
-            publish_status(runtime, iopub_socket, state, parent_header, "idle")?;
+            publish_status(runtime, sockets.iopub, state, parent_header, "idle")?;
             if should_stop {
                 shutdown.request_stop();
             }
@@ -71,18 +65,15 @@ pub(crate) fn handle_request(
 
 pub(crate) fn handle_shell_request(
     runtime: &Runtime,
-    reply_socket: &mut RouterSocket,
-    _stdin_socket: &mut RouterSocket,
-    iopub_socket: &mut PubSocket,
+    sockets: &mut RequestSockets<'_>,
     state: &mut MessageLoopState,
-    _kernel_events: &KernelEventSender,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
     match request.header.msg_type.as_str() {
         "kernel_info_request" => {
             send_reply(
                 runtime,
-                reply_socket,
+                sockets.reply,
                 state,
                 request,
                 "kernel_info_reply",
@@ -93,7 +84,7 @@ pub(crate) fn handle_shell_request(
         "connect_request" => {
             send_reply(
                 runtime,
-                reply_socket,
+                sockets.reply,
                 state,
                 request,
                 "connect_reply",
@@ -132,7 +123,7 @@ pub(crate) fn handle_shell_request(
             if !silent {
                 publish_iopub_message(
                     runtime,
-                    iopub_socket,
+                    sockets.iopub,
                     state,
                     request.header_value.clone(),
                     "execute_input",
@@ -144,14 +135,14 @@ pub(crate) fn handle_shell_request(
             }
 
             let worker_request_id = state.with_worker(|worker| {
-                Ok(worker.execute_async(
+                worker.execute_async(
                     code,
                     subshell_id.as_deref(),
                     user_expressions,
                     execution_count,
                     silent,
                     store_history,
-                )?)
+                )
             })?;
 
             state.pending_executes.insert(
@@ -179,7 +170,7 @@ pub(crate) fn handle_shell_request(
             let outcome = state.with_worker(|worker| worker.is_complete(code))?;
             send_reply(
                 runtime,
-                reply_socket,
+                sockets.reply,
                 state,
                 request,
                 "is_complete_reply",
@@ -205,7 +196,7 @@ pub(crate) fn handle_shell_request(
                 state.with_worker(|worker| worker.complete(code, cursor_pos.max(0) as usize))?;
             send_reply(
                 runtime,
-                reply_socket,
+                sockets.reply,
                 state,
                 request,
                 "complete_reply",
@@ -240,7 +231,7 @@ pub(crate) fn handle_shell_request(
             })?;
             send_reply(
                 runtime,
-                reply_socket,
+                sockets.reply,
                 state,
                 request,
                 "inspect_reply",
@@ -256,7 +247,7 @@ pub(crate) fn handle_shell_request(
         "history_request" => {
             send_reply(
                 runtime,
-                reply_socket,
+                sockets.reply,
                 state,
                 request,
                 "history_reply",
@@ -279,7 +270,7 @@ pub(crate) fn handle_shell_request(
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
             let outcome = state
                 .with_worker(|worker| worker.comm_open(comm_id, target_name, data, metadata))?;
-            handle_comm_outcome(runtime, iopub_socket, state, request, &outcome)?;
+            handle_comm_outcome(runtime, sockets.iopub, state, request, &outcome)?;
             if outcome.registered {
                 state.register_comm(&request.content);
             } else {
@@ -296,7 +287,7 @@ pub(crate) fn handle_shell_request(
             let data = request.content.get("data").unwrap_or(&Value::Null);
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
             let outcome = state.with_worker(|worker| worker.comm_msg(comm_id, data, metadata))?;
-            handle_comm_outcome(runtime, iopub_socket, state, request, &outcome)?;
+            handle_comm_outcome(runtime, sockets.iopub, state, request, &outcome)?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "comm_close" => {
@@ -308,14 +299,14 @@ pub(crate) fn handle_shell_request(
             let data = request.content.get("data").unwrap_or(&Value::Null);
             let metadata = request.content.get("metadata").unwrap_or(&Value::Null);
             let outcome = state.with_worker(|worker| worker.comm_close(comm_id, data, metadata))?;
-            handle_comm_outcome(runtime, iopub_socket, state, request, &outcome)?;
+            handle_comm_outcome(runtime, sockets.iopub, state, request, &outcome)?;
             state.close_comm(&request.content);
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "comm_info_request" => {
             send_reply(
                 runtime,
-                reply_socket,
+                sockets.reply,
                 state,
                 request,
                 "comm_info_reply",
@@ -324,9 +315,9 @@ pub(crate) fn handle_shell_request(
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "shutdown_request" => {
-            handle_shutdown_request(runtime, reply_socket, iopub_socket, state, request)
+            handle_shutdown_request(runtime, sockets.reply, sockets.iopub, state, request)
         }
-        _ => send_unsupported_reply(runtime, reply_socket, state, request),
+        _ => send_unsupported_reply(runtime, sockets.reply, state, request),
     }
 }
 

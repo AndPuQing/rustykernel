@@ -11,7 +11,8 @@ use crate::worker::{ExecutionDisplayEvent, ExecutionOutcome, WorkerCommEvent, Wo
 
 use super::KernelError;
 use super::io::{
-    publish_display_event, publish_iopub_message, publish_status, publish_stream, send_reply,
+    DisplayMessage, publish_display_event, publish_iopub_message, publish_status, publish_stream,
+    send_reply,
 };
 use super::state::MessageLoopState;
 
@@ -32,6 +33,7 @@ pub(crate) struct PendingExecute {
     pub(crate) phase: ExecutePhase,
 }
 
+#[derive(Default)]
 pub(crate) struct StreamBatch {
     segments: Vec<StreamSegment>,
 }
@@ -44,22 +46,15 @@ struct StreamSegment {
 
 impl StreamBatch {
     pub(crate) fn push(&mut self, name: String, source: String, text: String) {
-        if let Some(segment) = self.segments.last_mut() {
-            if segment.name == name && segment.source == source {
-                segment.text.push_str(&text);
-                return;
-            }
+        if let Some(segment) = self.segments.last_mut()
+            && segment.name == name
+            && segment.source == source
+        {
+            segment.text.push_str(&text);
+            return;
         }
 
         self.segments.push(StreamSegment { name, source, text });
-    }
-}
-
-impl Default for StreamBatch {
-    fn default() -> Self {
-        Self {
-            segments: Vec::new(),
-        }
     }
 }
 
@@ -114,8 +109,10 @@ impl KernelEventSender {
         }
     }
 
-    pub(crate) fn send(&self, event: KernelEvent) -> Result<(), mpsc::SendError<KernelEvent>> {
-        self.tx.send(event)?;
+    pub(crate) fn send(&self, event: KernelEvent) -> Result<(), KernelError> {
+        self.tx
+            .send(event)
+            .map_err(|_| KernelError::Worker("kernel event channel is closed".to_owned()))?;
         self.wake.notify_one();
         Ok(())
     }
@@ -153,21 +150,19 @@ pub(crate) fn finalize_execute_completion(
     }
 
     if outcome.status == "ok" {
-        if !silent {
-            if let Some(result) = outcome.result {
-                publish_iopub_message(
-                    runtime,
-                    iopub_socket,
-                    state,
-                    request.header_value.clone(),
-                    "execute_result",
-                    json!({
-                        "execution_count": execution_count,
-                        "data": result.data,
-                        "metadata": result.metadata,
-                    }),
-                )?;
-            }
+        if !silent && let Some(result) = outcome.result {
+            publish_iopub_message(
+                runtime,
+                iopub_socket,
+                state,
+                request.header_value.clone(),
+                "execute_result",
+                json!({
+                    "execution_count": execution_count,
+                    "data": result.data,
+                    "metadata": result.metadata,
+                }),
+            )?;
         }
 
         send_reply(
@@ -361,10 +356,12 @@ pub(crate) fn publish_execute_display_event(
             socket,
             state,
             pending.request.header_value.clone(),
-            &event.msg_type,
-            event.data.clone(),
-            event.metadata.clone(),
-            event.transient.clone(),
+            DisplayMessage {
+                msg_type: &event.msg_type,
+                data: event.data.clone(),
+                metadata: event.metadata.clone(),
+                transient: event.transient.clone(),
+            },
         )
     }
 }
