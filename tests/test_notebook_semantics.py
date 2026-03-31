@@ -555,3 +555,33 @@ update_display({"text/plain": "after", "text/html": "<b>after</b>"}, raw=True, d
         "text/plain": "after",
         "text/html": "<b>after</b>",
     }
+
+
+def test_oversized_display_payload_is_published(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        reply, published = client.request(
+            "shell",
+            "execute_request",
+            execute_request(
+                """
+from IPython.display import display
+
+display({"image/png": "A" * 120000, "text/plain": "demo"}, raw=True)
+"done"
+"""
+            ),
+        )
+
+    assert reply["content"]["status"] == "ok"
+    assert [message["header"]["msg_type"] for message in published] == [
+        "status",
+        "execute_input",
+        "display_data",
+        "execute_result",
+        "status",
+    ]
+    display_data = published[2]["content"]["data"]
+    assert display_data["text/plain"] == "demo"
+    assert len(display_data["image/png"]) == 120000

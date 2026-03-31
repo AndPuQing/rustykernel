@@ -4,7 +4,7 @@ use std::sync::{Arc, mpsc};
 use serde_json::json;
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
-use zeromq::{PubSocket, RouterSocket};
+use zeromq::RouterSocket;
 
 use crate::protocol::JupyterMessage;
 use crate::worker::{ExecutionDisplayEvent, ExecutionOutcome, WorkerCommEvent, WorkerDebugEvent};
@@ -14,6 +14,7 @@ use super::io::{
     DisplayMessage, publish_display_event, publish_iopub_message, publish_status, publish_stream,
     send_reply,
 };
+use super::runtime::IopubSocket;
 use super::state::MessageLoopState;
 
 #[allow(dead_code)]
@@ -125,7 +126,7 @@ impl KernelEventSender {
 pub(crate) fn finalize_execute_completion(
     runtime: &Runtime,
     reply_socket: &mut RouterSocket,
-    iopub_socket: &mut PubSocket,
+    iopub_socket: &mut IopubSocket,
     state: &mut MessageLoopState,
     request_id: u64,
     outcome: Result<ExecutionOutcome, KernelError>,
@@ -230,7 +231,7 @@ pub(crate) fn finalize_execute_completion(
 
 pub(crate) fn publish_execute_stream(
     runtime: &Runtime,
-    socket: &mut PubSocket,
+    socket: &mut IopubSocket,
     state: &MessageLoopState,
     request_id: u64,
     name: &str,
@@ -258,7 +259,7 @@ pub(crate) fn publish_execute_stream(
 
 pub(crate) fn flush_execute_stream_batches(
     runtime: &Runtime,
-    socket: &mut PubSocket,
+    socket: &mut IopubSocket,
     state: &MessageLoopState,
     stream_batches: HashMap<u64, StreamBatch>,
 ) -> Result<(), KernelError> {
@@ -270,7 +271,7 @@ pub(crate) fn flush_execute_stream_batches(
 
 pub(crate) fn flush_execute_stream_batch(
     runtime: &Runtime,
-    socket: &mut PubSocket,
+    socket: &mut IopubSocket,
     state: &MessageLoopState,
     request_id: u64,
     batch: Option<StreamBatch>,
@@ -295,7 +296,7 @@ pub(crate) fn flush_execute_stream_batch(
 
 pub(crate) fn publish_execute_debug_event(
     runtime: &Runtime,
-    socket: &mut PubSocket,
+    socket: &mut IopubSocket,
     state: &mut MessageLoopState,
     request_id: u64,
     event: &WorkerDebugEvent,
@@ -326,7 +327,7 @@ pub(crate) fn publish_execute_debug_event(
 
 pub(crate) fn publish_execute_display_event(
     runtime: &Runtime,
-    socket: &mut PubSocket,
+    socket: &mut IopubSocket,
     state: &MessageLoopState,
     request_id: u64,
     event: &ExecutionDisplayEvent,
@@ -368,7 +369,7 @@ pub(crate) fn publish_execute_display_event(
 
 pub(crate) fn publish_execute_comm_event(
     runtime: &Runtime,
-    socket: &mut PubSocket,
+    socket: &mut IopubSocket,
     state: &mut MessageLoopState,
     request_id: u64,
     event: &WorkerCommEvent,

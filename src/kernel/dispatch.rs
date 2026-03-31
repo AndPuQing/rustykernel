@@ -1,12 +1,13 @@
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tracing::warn;
-use zeromq::{PubSocket, RouterSocket};
+use zeromq::RouterSocket;
 
 use crate::protocol::JupyterMessage;
 
 use super::execute::{ExecutePhase, PendingExecute};
 use super::io::{handle_comm_outcome, publish_iopub_message, publish_status, send_reply};
+use super::runtime::IopubSocket;
 use super::state::MessageLoopState;
 use super::{KernelError, ShutdownSignal};
 
@@ -24,7 +25,7 @@ pub(crate) enum RequestDisposition {
 
 pub(crate) struct RequestSockets<'a> {
     pub(crate) reply: &'a mut RouterSocket,
-    pub(crate) iopub: &'a mut PubSocket,
+    pub(crate) iopub: &'a mut IopubSocket,
 }
 
 pub(crate) fn handle_request(
@@ -328,7 +329,7 @@ pub(crate) fn handle_shell_request(
 pub(crate) fn handle_control_request(
     runtime: &Runtime,
     reply_socket: &mut RouterSocket,
-    iopub_socket: &mut PubSocket,
+    iopub_socket: &mut IopubSocket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
@@ -438,7 +439,7 @@ pub(crate) fn handle_control_request(
 pub(crate) fn handle_shutdown_request(
     runtime: &Runtime,
     reply_socket: &mut RouterSocket,
-    iopub_socket: &mut PubSocket,
+    iopub_socket: &mut IopubSocket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
 ) -> Result<RequestDisposition, KernelError> {
