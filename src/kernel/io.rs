@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
+use tracing::warn;
 use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
@@ -63,7 +64,10 @@ pub(crate) fn handle_stdin_message(
 ) -> Result<(), KernelError> {
     let message = match state.signer.decode(frames) {
         Ok(message) => message,
-        Err(_) => return Ok(()),
+        Err(err) => {
+            warn!(%err, "failed to decode stdin message, dropping");
+            return Ok(());
+        }
     };
 
     if message.header.msg_type != "input_reply" {

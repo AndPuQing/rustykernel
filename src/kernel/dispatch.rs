@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
+use tracing::warn;
 use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::JupyterMessage;
@@ -36,7 +37,10 @@ pub(crate) fn handle_request(
 ) -> Result<(), KernelError> {
     let request = match state.signer.decode(frames) {
         Ok(request) => request,
-        Err(_) => return Ok(()),
+        Err(err) => {
+            warn!(%err, "failed to decode Jupyter message, dropping");
+            return Ok(());
+        }
     };
 
     let parent_header = request.header_value.clone();
