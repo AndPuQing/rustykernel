@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

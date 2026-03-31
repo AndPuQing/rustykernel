@@ -330,7 +330,7 @@ pub(crate) fn spawn_message_loop_thread(
                                     &mut iopub_socket,
                                     &mut state,
                                     request_id,
-                                    &event,
+                                    event,
                                 )?;
                             }
                             WorkerUpdateEvent::DisplayEvent { request_id, event } => {
@@ -346,7 +346,7 @@ pub(crate) fn spawn_message_loop_thread(
                                     &mut iopub_socket,
                                     &state,
                                     request_id,
-                                    &event,
+                                    event,
                                 )?;
                             }
                             WorkerUpdateEvent::CommEvent { request_id, event } => {
@@ -362,7 +362,7 @@ pub(crate) fn spawn_message_loop_thread(
                                     &mut iopub_socket,
                                     &mut state,
                                     request_id,
-                                    &event,
+                                    event,
                                 )?;
                             }
                             WorkerUpdateEvent::Completion {

@@ -298,9 +298,9 @@ pub(crate) fn publish_execute_debug_event(
     socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request_id: u64,
-    event: &WorkerDebugEvent,
+    event: WorkerDebugEvent,
 ) -> Result<(), KernelError> {
-    let Some(content) = state.debug.accept_worker_event(event)? else {
+    let Some(content) = state.debug.accept_worker_event(&event)? else {
         return Ok(());
     };
 
@@ -329,7 +329,7 @@ pub(crate) fn publish_execute_display_event(
     socket: &mut PubSocket,
     state: &MessageLoopState,
     request_id: u64,
-    event: &ExecutionDisplayEvent,
+    event: ExecutionDisplayEvent,
 ) -> Result<(), KernelError> {
     let Some(pending) = state.pending_executes.get(&request_id) else {
         return Err(KernelError::Worker(
@@ -341,14 +341,22 @@ pub(crate) fn publish_execute_display_event(
         return Ok(());
     }
 
-    if !event.content.is_null() {
+    let ExecutionDisplayEvent {
+        msg_type,
+        content,
+        data,
+        metadata,
+        transient,
+    } = event;
+
+    if !content.is_null() {
         publish_iopub_message(
             runtime,
             socket,
             state,
             pending.request.header_value.clone(),
-            &event.msg_type,
-            event.content.clone(),
+            &msg_type,
+            content,
         )
     } else {
         publish_display_event(
@@ -357,10 +365,10 @@ pub(crate) fn publish_execute_display_event(
             state,
             pending.request.header_value.clone(),
             DisplayMessage {
-                msg_type: &event.msg_type,
-                data: event.data.clone(),
-                metadata: event.metadata.clone(),
-                transient: event.transient.clone(),
+                msg_type: &msg_type,
+                data,
+                metadata,
+                transient,
             },
         )
     }
@@ -371,7 +379,7 @@ pub(crate) fn publish_execute_comm_event(
     socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request_id: u64,
-    event: &WorkerCommEvent,
+    event: WorkerCommEvent,
 ) -> Result<(), KernelError> {
     let Some(pending) = state.pending_executes.get(&request_id) else {
         return Err(KernelError::Worker(
@@ -383,14 +391,15 @@ pub(crate) fn publish_execute_comm_event(
         return Ok(());
     }
 
+    state.comms.apply_event(&event);
+    let WorkerCommEvent { msg_type, content } = event;
     publish_iopub_message(
         runtime,
         socket,
         state,
         pending.request.header_value.clone(),
-        &event.msg_type,
-        event.content.clone(),
+        &msg_type,
+        content,
     )?;
-    state.comms.apply_event(event);
     Ok(())
 }

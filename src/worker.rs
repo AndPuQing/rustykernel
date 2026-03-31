@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(unix)]
@@ -13,6 +13,9 @@ use std::sync::{
 };
 use std::thread;
 
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use serde_json::Value;
 
 use crate::kernel::KernelError;
@@ -31,6 +34,10 @@ pub const WORKER_PYTHON_EXECUTABLE_ENV: &str = "RUSTYKERNEL_PYTHON_EXECUTABLE";
 const WORKER_PROTOCOL_ENV: &str = "RUSTYKERNEL_PROTOCOL_FD";
 #[cfg(unix)]
 const WORKER_PROTOCOL_FD: libc::c_int = 3;
+const WORKER_PROTOCOL_COMPRESSED_FLAG: u8 = 1 << 0;
+const WORKER_PROTOCOL_HEADER_LEN: usize = 9;
+const WORKER_PROTOCOL_COMPRESSION_THRESHOLD: usize = 128 * 1024;
+const WORKER_PROTOCOL_MIN_COMPRESSION_SAVINGS: usize = 256;
 
 enum PendingRequest {
     Execute,
@@ -457,12 +464,11 @@ impl PythonWorker {
         request_id: u64,
         request: &WorkerRequest,
     ) -> Result<(), KernelError> {
-        let payload =
-            serde_json::to_vec(&WorkerEnvelope::request(request_id, request)).map_err(|error| {
+        let payload = encode_protocol_frame(&WorkerEnvelope::request(request_id, request))
+            .map_err(|error| {
                 KernelError::Worker(format!("failed to encode worker request: {error}"))
             })?;
         self.stdin.write_all(&payload).map_err(KernelError::Io)?;
-        self.stdin.write_all(b"\n").map_err(KernelError::Io)?;
         self.stdin.flush().map_err(KernelError::Io)?;
         Ok(())
     }
@@ -484,9 +490,15 @@ fn spawn_protocol_reader(
     thread::spawn(move || {
         let mut protocol = BufReader::new(File::from(protocol_read));
         loop {
-            let mut line = String::new();
-            let bytes_read = match protocol.read_line(&mut line) {
-                Ok(bytes_read) => bytes_read,
+            let payload = match read_protocol_frame(&mut protocol) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => {
+                    fail_all_pending(
+                        &pending,
+                        "python worker closed its protocol channel unexpectedly".to_owned(),
+                    );
+                    return;
+                }
                 Err(error) => {
                     fail_all_pending(
                         &pending,
@@ -495,15 +507,8 @@ fn spawn_protocol_reader(
                     return;
                 }
             };
-            if bytes_read == 0 {
-                fail_all_pending(
-                    &pending,
-                    "python worker closed its protocol channel unexpectedly".to_owned(),
-                );
-                return;
-            }
 
-            let envelope = match serde_json::from_str::<RawWorkerEnvelope>(&line) {
+            let envelope = match serde_json::from_slice::<RawWorkerEnvelope>(&payload) {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     fail_all_pending(
@@ -678,6 +683,86 @@ fn fail_all_pending(pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>, message:
     }
 }
 
+fn encode_protocol_frame<T: serde::Serialize>(message: &T) -> Result<Vec<u8>, serde_json::Error> {
+    let payload = serde_json::to_vec(message)?;
+    let (flags, payload) = maybe_compress_protocol_payload(payload);
+
+    let mut frame = Vec::with_capacity(WORKER_PROTOCOL_HEADER_LEN + payload.len());
+    frame.push(flags);
+    frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+fn maybe_compress_protocol_payload(payload: Vec<u8>) -> (u8, Vec<u8>) {
+    if payload.len() < WORKER_PROTOCOL_COMPRESSION_THRESHOLD {
+        return (0, payload);
+    }
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    if encoder.write_all(&payload).is_err() {
+        return (0, payload);
+    }
+
+    let Ok(compressed) = encoder.finish() else {
+        return (0, payload);
+    };
+
+    let savings = payload.len().saturating_sub(compressed.len());
+    if savings < WORKER_PROTOCOL_MIN_COMPRESSION_SAVINGS
+        || compressed.len() * 10 > payload.len() * 7
+    {
+        return (0, payload);
+    }
+
+    (WORKER_PROTOCOL_COMPRESSED_FLAG, compressed)
+}
+
+fn read_protocol_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>, std::io::Error> {
+    let mut header = [0_u8; WORKER_PROTOCOL_HEADER_LEN];
+    let mut read = 0;
+    while read < header.len() {
+        let bytes_read = reader.read(&mut header[read..])?;
+        if bytes_read == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated worker protocol header",
+            ));
+        }
+        read += bytes_read;
+    }
+
+    let flags = header[0];
+    if flags & !WORKER_PROTOCOL_COMPRESSED_FLAG != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown worker protocol flags: {flags}"),
+        ));
+    }
+
+    let payload_len = u64::from_be_bytes(header[1..].try_into().unwrap());
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "worker protocol payload length exceeded usize",
+        )
+    })?;
+    let mut payload = vec![0_u8; payload_len];
+    reader.read_exact(&mut payload)?;
+
+    if flags & WORKER_PROTOCOL_COMPRESSED_FLAG == 0 {
+        return Ok(Some(payload));
+    }
+
+    let mut decoder = ZlibDecoder::new(payload.as_slice());
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(Some(decompressed))
+}
+
 fn python_supports_ipython(program: &str, prefix_args: &[&str]) -> bool {
     Command::new(program)
         .args(prefix_args)
@@ -740,11 +825,15 @@ unsafe fn install_worker_protocol_fd(protocol_write_fd: libc::c_int) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::sync::mpsc;
 
-    use crate::kernel::execute::KernelEventSender;
+    use serde_json::json;
 
-    use super::PythonWorker;
+    use crate::kernel::execute::KernelEventSender;
+    use crate::worker_protocol::{FrameType, RawWorkerEnvelope, WorkerEnvelope, WorkerRequest};
+
+    use super::{PythonWorker, encode_protocol_frame, read_protocol_frame};
 
     #[test]
     fn python_worker_can_report_debug_listener_endpoint() {
@@ -759,5 +848,52 @@ mod tests {
             assert_eq!(listen.host, "");
             assert_eq!(listen.port, 0);
         }
+    }
+
+    #[test]
+    fn worker_protocol_frame_roundtrips_small_payload() {
+        let frame =
+            encode_protocol_frame(&WorkerEnvelope::request(7, WorkerRequest::KernelInfo)).unwrap();
+        let decoded = read_protocol_frame(&mut Cursor::new(frame))
+            .unwrap()
+            .expect("frame should be present");
+        let envelope: RawWorkerEnvelope = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(
+            envelope.protocol_version,
+            crate::worker_protocol::WORKER_PROTOCOL_VERSION
+        );
+        assert_eq!(envelope.frame_type, FrameType::Request);
+        assert_eq!(envelope.request_id, 7);
+        assert_eq!(envelope.body, json!({"request_type": "kernel_info"}));
+    }
+
+    #[test]
+    fn worker_protocol_frame_roundtrips_compressed_payload() {
+        let code = format!(
+            "display({{\"image/png\": \"{}\"}}, raw=True)",
+            "A".repeat(400_000)
+        );
+        let frame = encode_protocol_frame(&WorkerEnvelope::request(
+            9,
+            WorkerRequest::Execute {
+                code: code.clone(),
+                subshell_id: None,
+                user_expressions: json!({}),
+                execution_count: 1,
+                silent: false,
+                store_history: true,
+            },
+        ))
+        .unwrap();
+        assert_ne!(frame[0], 0, "large payload should be compressed");
+
+        let decoded = read_protocol_frame(&mut Cursor::new(frame))
+            .unwrap()
+            .expect("frame should be present");
+        let envelope: RawWorkerEnvelope = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(envelope.frame_type, FrameType::Request);
+        assert_eq!(envelope.request_id, 9);
+        assert_eq!(envelope.body["request_type"], json!("execute"),);
+        assert_eq!(envelope.body["code"], json!(code));
     }
 }

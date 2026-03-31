@@ -11,7 +11,6 @@ import html
 import hashlib
 import inspect
 import io
-import json
 import keyword
 import linecache
 import os
@@ -42,8 +41,10 @@ from rustykernel.worker_protocol import (
     decode_envelope,
     event_body,
     event_envelope,
+    read_framed_message,
     response_body,
     response_envelope,
+    write_framed_message,
 )
 
 try:
@@ -59,7 +60,7 @@ COMM_TARGETS: dict[str, object] = {}
 COMMS: dict[str, "Comm"] = {}
 AUTOAWAIT_ENABLED = True
 AUTOAWAIT_RUNNER = "asyncio"
-_PROTOCOL_STREAM: io.TextIOBase | None = None
+_PROTOCOL_STREAM: io.BufferedWriter | io.FileIO | None = None
 _PROTOCOL_LOCK = threading.Lock()
 _FD_CAPTURE_LOCK = threading.Lock()
 _REQUEST_CONTEXT = threading.local()
@@ -220,7 +221,7 @@ def clear_interrupt(subshell_id: SubshellId) -> None:
         _INTERRUPT_FLAGS.discard(subshell_id)
 
 
-def protocol_stdout() -> io.TextIOBase:
+def protocol_stdout() -> io.BufferedWriter | io.FileIO:
     global _PROTOCOL_STREAM
 
     if _PROTOCOL_STREAM is not None:
@@ -228,27 +229,32 @@ def protocol_stdout() -> io.TextIOBase:
 
     protocol_fd = os.environ.get("RUSTYKERNEL_PROTOCOL_FD")
     if protocol_fd is None:
-        return sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
+        stream = (
+            sys.__stdout__.buffer
+            if sys.__stdout__ is not None and hasattr(sys.__stdout__, "buffer")
+            else sys.stdout.buffer
+        )
+        return stream
 
     _PROTOCOL_STREAM = os.fdopen(
         int(protocol_fd),
-        "w",
-        buffering=1,
-        encoding="utf-8",
+        "wb",
+        buffering=io.DEFAULT_BUFFER_SIZE,
         closefd=False,
     )
     return _PROTOCOL_STREAM
 
 
-def protocol_stdin() -> io.TextIOBase:
-    return sys.__stdin__ if sys.__stdin__ is not None else sys.stdin
+def protocol_stdin() -> io.BufferedReader:
+    stream = sys.__stdin__ if sys.__stdin__ is not None else sys.stdin
+    if hasattr(stream, "buffer"):
+        return stream.buffer
+    raise RuntimeError("stdin binary buffer is not available")
 
 
 def emit_protocol_message(message: object) -> None:
     with _PROTOCOL_LOCK:
-        stream = protocol_stdout()
-        stream.write(json.dumps(message) + "\n")
-        stream.flush()
+        write_framed_message(protocol_stdout(), dict(message))
 
 
 def emit_response(request_id: int, response_type: str, **fields: object) -> None:
@@ -1294,11 +1300,9 @@ def request_input(prompt: object = "", *, password: bool = False) -> str:
 
     if threading.get_ident() == _MAIN_THREAD_ID:
         while True:
-            raw_line = protocol_stdin().readline()
-            if not raw_line:
+            raw_line = read_framed_message(protocol_stdin())
+            if raw_line is None:
                 raise EOFError("stdin channel closed")
-            if not raw_line.strip():
-                continue
 
             try:
                 response = decode_envelope(raw_line)
@@ -2429,15 +2433,13 @@ def invalid_subshell_reply(request_id: int, subshell_id: object) -> dict[str, ob
 stdin = protocol_stdin()
 while True:
     try:
-        raw_line = stdin.readline()
+        raw_line = read_framed_message(stdin)
     except KeyboardInterrupt:
         SUBSHELL_MANAGER.interrupt_all()
         continue
 
-    if raw_line == "":
+    if raw_line is None:
         break
-    if not raw_line.strip():
-        continue
 
     try:
         envelope = decode_envelope(raw_line)

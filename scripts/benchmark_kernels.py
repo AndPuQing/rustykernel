@@ -43,6 +43,8 @@ METRICS: list[MetricDefinition] = [
     MetricDefinition("exception_execute", "ms"),
     MetricDefinition("syntax_error_execute", "ms"),
     MetricDefinition("matplotlib_execute", "ms"),
+    MetricDefinition("large_raw_display_execute", "ms"),
+    MetricDefinition("large_matplotlib_execute", "ms"),
     MetricDefinition("complete_request", "ms"),
     MetricDefinition("inspect_request", "ms"),
     MetricDefinition("history_request", "ms"),
@@ -128,6 +130,21 @@ def execute_and_count_streams(kernel, code: str) -> tuple[float, int]:
     return elapsed_ms, count
 
 
+def large_matplotlib_code() -> str:
+    return (
+        "%matplotlib inline\n"
+        "import numpy as np\n"
+        "import matplotlib.pyplot as plt\n"
+        "plt.rcParams['figure.figsize'] = (8, 6)\n"
+        "plt.rcParams['figure.dpi'] = 300\n"
+        "rng = np.random.default_rng(0)\n"
+        "plt.imshow(rng.random((300, 400)), cmap='viridis')\n"
+        "plt.colorbar()\n"
+        "plt.title('large inline payload')\n"
+        "plt.show()"
+    )
+
+
 def interrupt_latency_ms(kernel) -> float:
     execute_header, execute_frames = client_request(
         "bench-session",
@@ -182,6 +199,7 @@ def benchmark_kernel(
     iterations: int,
     stream_lines: int,
     large_result_bytes: int,
+    large_display_bytes: int,
 ) -> dict[str, float]:
     connection_file = temp_dir / f"{command.name}-connection.json"
     metrics: dict[str, float] = {}
@@ -239,6 +257,19 @@ def benchmark_kernel(
             "plt.plot([1, 2, 3], [1, 4, 9])\n"
             "plt.title('bench')\n"
             "plt.show()",
+            execute_repeat,
+            warmup=execute_warmup,
+        )
+        metrics["large_raw_display_execute"] = execute_roundtrip_ms(
+            kernel,
+            "from IPython.display import display\n"
+            f"display({{'image/png': 'A' * {large_display_bytes}, 'text/plain': 'demo'}}, raw=True)",
+            execute_repeat,
+            warmup=execute_warmup,
+        )
+        metrics["large_matplotlib_execute"] = execute_roundtrip_ms(
+            kernel,
+            large_matplotlib_code(),
             execute_repeat,
             warmup=execute_warmup,
         )
@@ -372,6 +403,7 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--stream-lines", type=int, default=200)
     parser.add_argument("--large-result-bytes", type=int, default=20000)
+    parser.add_argument("--large-display-bytes", type=int, default=600000)
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
@@ -392,6 +424,7 @@ def main() -> int:
                 iterations=args.iterations,
                 stream_lines=args.stream_lines,
                 large_result_bytes=args.large_result_bytes,
+                large_display_bytes=args.large_display_bytes,
             )
             ipy = benchmark_kernel(
                 ipy_command,
@@ -404,6 +437,7 @@ def main() -> int:
                 iterations=args.iterations,
                 stream_lines=args.stream_lines,
                 large_result_bytes=args.large_result_bytes,
+                large_display_bytes=args.large_display_bytes,
             )
         finally:
             zmq_context.term()
@@ -418,6 +452,7 @@ def main() -> int:
             "iterations": args.iterations,
             "stream_lines": args.stream_lines,
             "large_result_bytes": args.large_result_bytes,
+            "large_display_bytes": args.large_display_bytes,
         },
         "rustykernel": rusty,
         "ipykernel": ipy,
