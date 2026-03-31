@@ -562,59 +562,57 @@ fn spawn_protocol_reader(
             match pending_request {
                 PendingRequest::Execute => {
                     let update = match envelope.frame_type {
-                        FrameType::Event => {
-                            match serde_json::from_value::<WorkerEvent>(envelope.body) {
-                                Ok(WorkerEvent::InputRequest { prompt, password }) => {
-                                    WorkerUpdateEvent::InputRequest {
-                                        request_id,
-                                        prompt,
-                                        password,
-                                    }
+                        FrameType::Event => match envelope.deserialize_body::<WorkerEvent>() {
+                            Ok(WorkerEvent::InputRequest { prompt, password }) => {
+                                WorkerUpdateEvent::InputRequest {
+                                    request_id,
+                                    prompt,
+                                    password,
                                 }
-                                Ok(WorkerEvent::Stream { name, text, source }) => {
-                                    WorkerUpdateEvent::Stream {
-                                        request_id,
-                                        name,
-                                        source,
-                                        text,
-                                    }
+                            }
+                            Ok(WorkerEvent::Stream { name, text, source }) => {
+                                WorkerUpdateEvent::Stream {
+                                    request_id,
+                                    name,
+                                    source,
+                                    text,
                                 }
-                                Ok(WorkerEvent::Display {
+                            }
+                            Ok(WorkerEvent::Display {
+                                msg_type,
+                                content,
+                                data,
+                                metadata,
+                                transient,
+                            }) => WorkerUpdateEvent::DisplayEvent {
+                                request_id,
+                                event: ExecutionDisplayEvent {
                                     msg_type,
                                     content,
                                     data,
                                     metadata,
                                     transient,
-                                }) => WorkerUpdateEvent::DisplayEvent {
-                                    request_id,
-                                    event: ExecutionDisplayEvent {
-                                        msg_type,
-                                        content,
-                                        data,
-                                        metadata,
-                                        transient,
-                                    },
                                 },
-                                Ok(WorkerEvent::Comm { msg_type, content }) => {
-                                    WorkerUpdateEvent::CommEvent {
-                                        request_id,
-                                        event: WorkerCommEvent { msg_type, content },
-                                    }
-                                }
-                                Ok(WorkerEvent::Debug { msg_type, content }) => {
-                                    WorkerUpdateEvent::DebugEvent {
-                                        request_id,
-                                        event: WorkerDebugEvent { msg_type, content },
-                                    }
-                                }
-                                Err(error) => WorkerUpdateEvent::Completion {
+                            },
+                            Ok(WorkerEvent::Comm { msg_type, content }) => {
+                                WorkerUpdateEvent::CommEvent {
                                     request_id,
-                                    outcome: Err(format!("failed to decode worker event: {error}")),
-                                },
+                                    event: WorkerCommEvent { msg_type, content },
+                                }
                             }
-                        }
+                            Ok(WorkerEvent::Debug { msg_type, content }) => {
+                                WorkerUpdateEvent::DebugEvent {
+                                    request_id,
+                                    event: WorkerDebugEvent { msg_type, content },
+                                }
+                            }
+                            Err(error) => WorkerUpdateEvent::Completion {
+                                request_id,
+                                outcome: Err(format!("failed to decode worker event: {error}")),
+                            },
+                        },
                         FrameType::Response => {
-                            match serde_json::from_value::<WorkerResponse>(envelope.body) {
+                            match envelope.deserialize_body::<WorkerResponse>() {
                                 Ok(WorkerResponse::Execute(outcome)) => {
                                     WorkerUpdateEvent::Completion {
                                         request_id,
@@ -650,7 +648,7 @@ fn spawn_protocol_reader(
                 PendingRequest::Response(sender) => {
                     let response = match envelope.frame_type {
                         FrameType::Response => {
-                            match serde_json::from_value::<WorkerResponse>(envelope.body) {
+                            match envelope.deserialize_body::<WorkerResponse>() {
                                 Ok(body) => Ok(WorkerEnvelope::response(request_id, body)),
                                 Err(error) => {
                                     Err(format!("failed to decode worker response: {error}"))
@@ -864,7 +862,10 @@ mod tests {
         );
         assert_eq!(envelope.frame_type, FrameType::Request);
         assert_eq!(envelope.request_id, 7);
-        assert_eq!(envelope.body, json!({"request_type": "kernel_info"}));
+        assert_eq!(
+            envelope.deserialize_body::<serde_json::Value>().unwrap(),
+            json!({"request_type": "kernel_info"})
+        );
     }
 
     #[test]
@@ -893,7 +894,8 @@ mod tests {
         let envelope: RawWorkerEnvelope = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(envelope.frame_type, FrameType::Request);
         assert_eq!(envelope.request_id, 9);
-        assert_eq!(envelope.body["request_type"], json!("execute"),);
-        assert_eq!(envelope.body["code"], json!(code));
+        let body = envelope.deserialize_body::<serde_json::Value>().unwrap();
+        assert_eq!(body["request_type"], json!("execute"),);
+        assert_eq!(body["code"], json!(code));
     }
 }

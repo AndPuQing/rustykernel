@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, value::RawValue};
 
 pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
@@ -50,7 +50,13 @@ pub struct RawWorkerEnvelope {
     pub request_id: u64,
     #[serde(default)]
     pub seq: Option<u64>,
-    pub body: Value,
+    pub body: Box<RawValue>,
+}
+
+impl RawWorkerEnvelope {
+    pub fn deserialize_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_str(self.body.get())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

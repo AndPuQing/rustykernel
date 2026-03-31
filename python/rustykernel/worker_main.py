@@ -76,6 +76,7 @@ _PY_ASYNC_EXC = ctypes.pythonapi.PyThreadState_SetAsyncExc
 _PY_ASYNC_EXC.argtypes = [ctypes.c_ulong, ctypes.py_object]
 _PY_ASYNC_EXC.restype = ctypes.c_int
 STREAM_FDS = {"stdout": 1, "stderr": 2}
+STREAM_EVENT_CHUNK_SIZE = 8 * 1024
 
 try:
     import debugpy
@@ -162,19 +163,29 @@ def emit_live_stream(
 
 
 def take_stream_chunks(
-    pending: dict[str, str], name: str, text: str, *, final: bool
+    pending: dict[str, str],
+    name: str,
+    text: str,
+    *,
+    final: bool,
+    flush: bool = False,
 ) -> list[str]:
     combined = pending[name] + text
     chunks: list[str] = []
-    while True:
-        newline = combined.find("\n")
-        if newline == -1:
-            break
-        chunks.append(combined[: newline + 1])
-        combined = combined[newline + 1 :]
-    if final and combined:
+
+    while len(combined) >= STREAM_EVENT_CHUNK_SIZE:
+        boundary = combined.rfind("\n", 0, STREAM_EVENT_CHUNK_SIZE + 1)
+        if boundary >= 0:
+            boundary += 1
+        else:
+            boundary = STREAM_EVENT_CHUNK_SIZE
+        chunks.append(combined[:boundary])
+        combined = combined[boundary:]
+
+    if (final or flush) and combined:
         chunks.append(combined)
         combined = ""
+
     pending[name] = combined
     return chunks
 
@@ -183,6 +194,13 @@ def flush_pending_streams(context: RequestContext) -> None:
     for name in STREAM_FDS:
         for chunk in take_stream_chunks(context.stream_pending, name, "", final=True):
             emit_live_stream(name, chunk, context=context, source="python")
+
+
+def flush_stream(name: str, context: RequestContext, *, source: str) -> None:
+    for chunk in take_stream_chunks(
+        context.stream_pending, name, "", final=False, flush=True
+    ):
+        emit_live_stream(name, chunk, context=context, source=source)
 
 
 @contextlib.contextmanager
@@ -335,6 +353,9 @@ class WorkerStream(io.TextIOBase):
 
     def flush(self) -> None:
         flush_standard_streams()
+        context = try_current_request_context()
+        if context is not None and context.request_id > 0:
+            flush_stream(self._name, context, source="python")
 
     def write(self, data: str) -> int:
         if not isinstance(data, str):
@@ -432,6 +453,8 @@ class FdCapture:
 
         for chunk in emit_chunks:
             with self._emit_lock:
+                if self._context is not None:
+                    flush_stream(name, self._context, source="python")
                 emit_live_stream(name, chunk, context=self._context, source="fd")
 
 
