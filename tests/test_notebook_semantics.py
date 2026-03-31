@@ -265,6 +265,53 @@ await asyncio.sleep(0)
     )
 
 
+def test_large_matplotlib_inline_payload_keeps_iopub_tail(
+    tmp_path: Path, zmq_context: zmq.Context
+) -> None:
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("numpy")
+
+    with running_kernel_client(tmp_path, zmq_context) as client:
+        reply, published = client.request(
+            "shell",
+            "execute_request",
+            execute_request(
+                """
+%matplotlib inline
+import numpy as np
+import matplotlib.pyplot as plt
+plt.rcParams["figure.figsize"] = (8, 6)
+plt.rcParams["figure.dpi"] = 300
+rng = np.random.default_rng(0)
+plt.imshow(rng.random((300, 400)), cmap="viridis")
+plt.colorbar()
+plt.title("large inline payload")
+plt.show()
+"done"
+"""
+            ),
+        )
+
+    assert reply["content"]["status"] == "ok"
+    assert published[0]["header"]["msg_type"] == "status"
+    assert published[1]["header"]["msg_type"] == "execute_input"
+    assert published[-2]["header"]["msg_type"] == "execute_result"
+    assert published[-2]["content"]["data"]["text/plain"] == "'done'"
+    assert published[-1]["header"]["msg_type"] == "status"
+    assert published[-1]["content"]["execution_state"] == "idle"
+
+    display_messages = [
+        message
+        for message in published[2:-2]
+        if message["header"]["msg_type"] == "display_data"
+    ]
+    assert len(display_messages) == 1
+
+    png = display_messages[0]["content"]["data"].get("image/png")
+    assert isinstance(png, str)
+    assert len(png) > 120_000
+
+
 def test_cell_magic_time_executes_cell_and_emits_timing(
     tmp_path: Path, zmq_context: zmq.Context
 ) -> None:

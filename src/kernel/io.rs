@@ -1,13 +1,13 @@
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tracing::warn;
-use zeromq::RouterSocket;
+use zeromq::{PubSocket, RouterSocket};
 
 use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
 use crate::worker::{CommOutcome, WorkerCommEvent};
 
 use super::KernelError;
-use super::runtime::{IopubSocket, send_frames};
+use super::runtime::send_frames;
 use super::state::MessageLoopState;
 
 pub(crate) struct StdinRequestContext<'a> {
@@ -134,7 +134,7 @@ pub(crate) fn send_reply(
 
 pub(crate) fn publish_status(
     runtime: &Runtime,
-    socket: &mut IopubSocket,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     execution_state: &str,
@@ -150,8 +150,8 @@ pub(crate) fn publish_status(
 }
 
 pub(crate) fn publish_iopub_message(
-    _runtime: &Runtime,
-    socket: &mut IopubSocket,
+    runtime: &Runtime,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     msg_type: &str,
@@ -164,13 +164,13 @@ pub(crate) fn publish_iopub_message(
         json!({}),
         content,
     );
-    socket.send(state.signer.encode(&message)?)?;
+    send_frames(runtime, socket, state.signer.encode(&message)?)?;
     Ok(())
 }
 
 pub(crate) fn publish_display_event(
     runtime: &Runtime,
-    socket: &mut IopubSocket,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     message: DisplayMessage<'_>,
@@ -191,7 +191,7 @@ pub(crate) fn publish_display_event(
 
 pub(crate) fn publish_comm_events(
     runtime: &Runtime,
-    socket: &mut IopubSocket,
+    socket: &mut PubSocket,
     state: &mut MessageLoopState,
     parent_header: Value,
     events: &[WorkerCommEvent],
@@ -212,7 +212,7 @@ pub(crate) fn publish_comm_events(
 
 pub(crate) fn publish_stream(
     runtime: &Runtime,
-    socket: &mut IopubSocket,
+    socket: &mut PubSocket,
     state: &MessageLoopState,
     parent_header: Value,
     name: &str,
@@ -233,7 +233,7 @@ pub(crate) fn publish_stream(
 
 pub(crate) fn drain_debug_session_events(
     runtime: &Runtime,
-    socket: &mut IopubSocket,
+    socket: &mut PubSocket,
     state: &mut MessageLoopState,
 ) -> Result<(), KernelError> {
     while let Some(event) = state.debug.drain_event()? {
@@ -244,7 +244,7 @@ pub(crate) fn drain_debug_session_events(
 
 pub(crate) fn publish_debug_session_event(
     runtime: &Runtime,
-    socket: &mut IopubSocket,
+    socket: &mut PubSocket,
     state: &mut MessageLoopState,
     event: crate::debug::DebugEventEnvelope,
 ) -> Result<(), KernelError> {
@@ -275,7 +275,7 @@ pub(crate) fn publish_debug_session_event(
 
 pub(crate) fn handle_comm_outcome(
     runtime: &Runtime,
-    iopub_socket: &mut IopubSocket,
+    iopub_socket: &mut PubSocket,
     state: &mut MessageLoopState,
     request: &JupyterMessage,
     outcome: &CommOutcome,

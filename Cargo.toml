@@ -26,5 +26,4 @@ tokio = { version = "1.48", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["v4"] }
-zmq = "0.10"
-zeromq = { version = "0.6.0-pre.1", default-features = true }
+zeromq = { git = "https://github.com/AndPuQing/zmq.rs.git", rev = "5f57e70b6d3cf181b08ba085aa1d915fa6a8fda1", default-features = true }

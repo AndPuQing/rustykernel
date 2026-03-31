@@ -10,7 +10,7 @@ use tokio::time;
 use zeromq::Socket as _;
 use zeromq::SocketRecv as _;
 use zeromq::SocketSend as _;
-use zeromq::{RepSocket, RouterSocket, ZmqError, ZmqMessage};
+use zeromq::{PubSocket, RepSocket, RouterSocket, ZmqError, ZmqMessage};
 
 use super::dispatch::{ChannelKind, RequestSockets, handle_request};
 use super::execute::{
@@ -26,34 +26,6 @@ use super::state::MessageLoopState;
 use super::{ChannelEndpoints, ConnectionInfo, InterruptSignal, KernelError, ShutdownSignal};
 
 type SpawnedThread<E> = (JoinHandle<Result<(), E>>, mpsc::Receiver<Result<(), E>>);
-
-pub(crate) struct IopubSocket {
-    socket: zmq::Socket,
-    _context: zmq::Context,
-}
-
-impl IopubSocket {
-    pub(crate) fn new() -> Result<Self, KernelError> {
-        let context = zmq::Context::new();
-        let socket = context.socket(zmq::PUB)?;
-        socket.set_linger(0)?;
-        Ok(Self {
-            socket,
-            _context: context,
-        })
-    }
-
-    pub(crate) fn bind(&mut self, endpoint: &str) -> Result<(), KernelError> {
-        self.socket.bind(endpoint)?;
-        Ok(())
-    }
-
-    pub(crate) fn send(&mut self, frames: Vec<Vec<u8>>) -> Result<(), KernelError> {
-        let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        self.socket.send_multipart(frame_refs, 0)?;
-        Ok(())
-    }
-}
 
 pub struct KernelRuntime {
     connection: ConnectionInfo,
@@ -260,8 +232,8 @@ pub(crate) fn spawn_message_loop_thread(
         let runtime = build_transport_runtime();
         let mut shell_socket = RouterSocket::new();
         bind_socket(&runtime, &mut shell_socket, &endpoints.shell)?;
-        let mut iopub_socket = IopubSocket::new()?;
-        iopub_socket.bind(&endpoints.iopub)?;
+        let mut iopub_socket = PubSocket::new();
+        bind_socket(&runtime, &mut iopub_socket, &endpoints.iopub)?;
         let mut stdin_socket = RouterSocket::new();
         bind_socket(&runtime, &mut stdin_socket, &endpoints.stdin)?;
         let mut control_socket = RouterSocket::new();

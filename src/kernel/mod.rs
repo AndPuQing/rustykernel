@@ -7,7 +7,6 @@ use std::sync::{
 
 use serde::Deserialize;
 use zeromq::ZmqError;
-use zmq::Error as CompatZmqError;
 
 use crate::protocol::{IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE, ProtocolError};
 
@@ -81,7 +80,6 @@ pub enum KernelError {
     Worker(String),
     Protocol(ProtocolError),
     Zmq(ZmqError),
-    CompatZmq(CompatZmqError),
     HeartbeatThreadPanicked,
     MessageLoopThreadPanicked,
 }
@@ -97,7 +95,6 @@ impl std::fmt::Display for KernelError {
             Self::Worker(message) => f.write_str(message),
             Self::Protocol(error) => write!(f, "{error}"),
             Self::Zmq(error) => write!(f, "{error}"),
-            Self::CompatZmq(error) => write!(f, "{error}"),
             Self::HeartbeatThreadPanicked => f.write_str("heartbeat thread panicked"),
             Self::MessageLoopThreadPanicked => f.write_str("message loop thread panicked"),
         }
@@ -115,12 +112,6 @@ impl From<ProtocolError> for KernelError {
 impl From<ZmqError> for KernelError {
     fn from(error: ZmqError) -> Self {
         Self::Zmq(error)
-    }
-}
-
-impl From<CompatZmqError> for KernelError {
-    fn from(error: CompatZmqError) -> Self {
-        Self::CompatZmq(error)
     }
 }
 
