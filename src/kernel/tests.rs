@@ -3017,7 +3017,6 @@ fn client_request(session: &str, msg_type: &str, content: Value) -> JupyterMessa
 fn subshell_execute_request(subshell_id: &str, content: Value) -> JupyterMessage {
     let mut request = client_request("client-session", "execute_request", content);
     request.header.subshell_id = Some(subshell_id.to_owned());
-    request.header_value = serde_json::to_value(&request.header).unwrap();
     request
 }
 

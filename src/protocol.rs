@@ -2,10 +2,12 @@ pub const IMPLEMENTATION: &str = "rustykernel";
 pub const LANGUAGE: &str = "python";
 pub const JUPYTER_PROTOCOL_VERSION: &str = "5.3";
 
+use std::borrow::Cow;
+
 use chrono::{SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::Sha256;
 use uuid::Uuid;
 
@@ -26,15 +28,32 @@ pub struct MessageHeader {
     pub subshell_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct JupyterMessage {
     pub identities: Vec<Vec<u8>>,
     pub header: MessageHeader,
-    pub header_value: Value,
+    header_bytes: Vec<u8>,
     pub parent_header: Value,
     pub metadata: Value,
     pub content: Value,
     pub buffers: Vec<Vec<u8>>,
+}
+
+impl PartialEq for JupyterMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.identities == other.identities
+            && self.header == other.header
+            && self.parent_header == other.parent_header
+            && self.metadata == other.metadata
+            && self.content == other.content
+            && self.buffers == other.buffers
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ParentHeader<'a> {
+    Message(&'a JupyterMessage),
+    Value(&'a Value),
 }
 
 #[derive(Debug)]
@@ -98,6 +117,7 @@ impl MessageHeader {
 }
 
 impl JupyterMessage {
+    #[allow(dead_code)]
     pub fn new(
         identities: Vec<Vec<u8>>,
         header: MessageHeader,
@@ -105,15 +125,44 @@ impl JupyterMessage {
         metadata: Value,
         content: Value,
     ) -> Self {
-        let header_value = serde_json::to_value(&header).unwrap_or_else(|_| json!({}));
         Self {
             identities,
             header,
-            header_value,
+            header_bytes: Vec::new(),
             parent_header,
             metadata,
             content,
             buffers: Vec::new(),
+        }
+    }
+
+    fn decoded(
+        identities: Vec<Vec<u8>>,
+        header: MessageHeader,
+        header_bytes: Vec<u8>,
+        parent_header: Value,
+        metadata: Value,
+        content: Value,
+        buffers: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            identities,
+            header,
+            header_bytes,
+            parent_header,
+            metadata,
+            content,
+            buffers,
+        }
+    }
+
+    fn header_bytes(&self) -> Result<Cow<'_, [u8]>, ProtocolError> {
+        if self.header_bytes.is_empty() {
+            Ok(Cow::Owned(
+                serde_json::to_vec(&self.header).map_err(ProtocolError::Serialization)?,
+            ))
+        } else {
+            Ok(Cow::Borrowed(&self.header_bytes))
         }
     }
 }
@@ -170,8 +219,6 @@ impl MessageSigner {
 
         let header: MessageHeader =
             serde_json::from_slice(header_frame).map_err(ProtocolError::InvalidHeader)?;
-        let header_value =
-            serde_json::from_slice(header_frame).map_err(ProtocolError::InvalidHeader)?;
         let parent_header = serde_json::from_slice(parent_header_frame)
             .map_err(ProtocolError::InvalidParentHeader)?;
         let metadata =
@@ -179,35 +226,58 @@ impl MessageSigner {
         let content =
             serde_json::from_slice(content_frame).map_err(ProtocolError::InvalidContent)?;
 
-        Ok(JupyterMessage {
+        Ok(JupyterMessage::decoded(
             identities,
             header,
-            header_value,
+            header_frame.clone(),
             parent_header,
             metadata,
             content,
             buffers,
-        })
+        ))
     }
 
+    #[allow(dead_code)]
     pub fn encode(&self, message: &JupyterMessage) -> Result<Vec<Vec<u8>>, ProtocolError> {
-        let header = serde_json::to_vec(&message.header).map_err(ProtocolError::Serialization)?;
-        let parent_header =
-            serde_json::to_vec(&message.parent_header).map_err(ProtocolError::Serialization)?;
-        let metadata =
-            serde_json::to_vec(&message.metadata).map_err(ProtocolError::Serialization)?;
-        let content = serde_json::to_vec(&message.content).map_err(ProtocolError::Serialization)?;
+        self.encode_with_parts(
+            &message.identities,
+            &message.header,
+            ParentHeader::Value(&message.parent_header),
+            &message.metadata,
+            &message.content,
+            &message.buffers,
+        )
+    }
+
+    pub fn encode_with_parts(
+        &self,
+        identities: &[Vec<u8>],
+        header: &MessageHeader,
+        parent_header: ParentHeader<'_>,
+        metadata: &Value,
+        content: &Value,
+        buffers: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, ProtocolError> {
+        let header = serde_json::to_vec(header).map_err(ProtocolError::Serialization)?;
+        let parent_header = match parent_header {
+            ParentHeader::Message(message) => message.header_bytes()?,
+            ParentHeader::Value(value) => {
+                Cow::Owned(serde_json::to_vec(value).map_err(ProtocolError::Serialization)?)
+            }
+        };
+        let metadata = serde_json::to_vec(metadata).map_err(ProtocolError::Serialization)?;
+        let content = serde_json::to_vec(content).map_err(ProtocolError::Serialization)?;
         let signature = self.sign([&header, &parent_header, &metadata, &content]);
 
-        let mut frames = Vec::with_capacity(message.identities.len() + message.buffers.len() + 6);
-        frames.extend(message.identities.iter().cloned());
+        let mut frames = Vec::with_capacity(identities.len() + buffers.len() + 6);
+        frames.extend(identities.iter().cloned());
         frames.push(DELIMITER.to_vec());
         frames.push(signature.into_bytes());
         frames.push(header);
-        frames.push(parent_header);
+        frames.push(parent_header.into_owned());
         frames.push(metadata);
         frames.push(content);
-        frames.extend(message.buffers.iter().cloned());
+        frames.extend(buffers.iter().cloned());
         Ok(frames)
     }
 
@@ -255,7 +325,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{JupyterMessage, MessageHeader, MessageSigner};
+    use super::{DELIMITER, JupyterMessage, MessageHeader, MessageSigner, ParentHeader};
 
     #[test]
     fn round_trips_signed_messages() {
@@ -292,5 +362,54 @@ mod tests {
 
         let error = signer.decode(encoded).unwrap_err();
         assert!(matches!(error, super::ProtocolError::InvalidSignature));
+    }
+
+    #[test]
+    fn preserves_unknown_header_fields_in_parent_header() {
+        let signer = MessageSigner::new("hmac-sha256", "secret").unwrap();
+        let header = br#"{
+            "msg_id":"request-1",
+            "session":"session-1",
+            "username":"test-client",
+            "date":"2026-04-01T00:00:00Z",
+            "msg_type":"kernel_info_request",
+            "version":"5.3",
+            "extra":"preserve-me"
+        }"#
+        .to_vec();
+        let parent_header = br#"{}"#.to_vec();
+        let metadata = br#"{}"#.to_vec();
+        let content = br#"{}"#.to_vec();
+        let signature = signer.sign([&header, &parent_header, &metadata, &content]);
+
+        let decoded = signer
+            .decode(vec![
+                b"client".to_vec(),
+                DELIMITER.to_vec(),
+                signature.into_bytes(),
+                header,
+                parent_header,
+                metadata,
+                content,
+            ])
+            .unwrap();
+
+        let reply_header = MessageHeader::new("kernel_info_reply", "session-1");
+        let reply = signer
+            .encode_with_parts(
+                &decoded.identities,
+                &reply_header,
+                ParentHeader::Message(&decoded),
+                &json!({}),
+                &json!({}),
+                &[],
+            )
+            .unwrap();
+        let decoded_reply = signer.decode(reply).unwrap();
+
+        assert_eq!(
+            decoded_reply.parent_header.get("extra"),
+            Some(&json!("preserve-me"))
+        );
     }
 }

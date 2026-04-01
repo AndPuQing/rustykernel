@@ -3,7 +3,7 @@ use tokio::runtime::Runtime;
 use tracing::warn;
 use zeromq::{PubSocket, RouterSocket};
 
-use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner};
+use crate::protocol::{JupyterMessage, MessageHeader, MessageSigner, ParentHeader};
 use crate::worker::{CommOutcome, WorkerCommEvent};
 
 use super::KernelError;
@@ -14,7 +14,7 @@ pub(crate) struct StdinRequestContext<'a> {
     pub(crate) signer: &'a MessageSigner,
     pub(crate) kernel_session: &'a str,
     pub(crate) identities: &'a [Vec<u8>],
-    pub(crate) parent_header: &'a Value,
+    pub(crate) parent_header: ParentHeader<'a>,
     pub(crate) allow_stdin: bool,
 }
 
@@ -38,22 +38,25 @@ pub(crate) fn send_stdin_input_request(
         ));
     }
 
-    let input_request = JupyterMessage::new(
-        request.identities.to_vec(),
-        MessageHeader::new("input_request", request.kernel_session),
-        request.parent_header.clone(),
-        json!({}),
-        json!({
-            "prompt": prompt,
-            "password": password,
-        }),
-    );
-    let input_request_id = input_request.header.msg_id.clone();
+    let header = MessageHeader::new("input_request", request.kernel_session);
+    let input_request_id = header.msg_id.clone();
+    let metadata = json!({});
+    let content = json!({
+        "prompt": prompt,
+        "password": password,
+    });
 
     send_frames(
         runtime,
         stdin_socket,
-        request.signer.encode(&input_request)?,
+        request.signer.encode_with_parts(
+            request.identities,
+            &header,
+            request.parent_header,
+            &metadata,
+            &content,
+            &[],
+        )?,
     )?;
     Ok(input_request_id)
 }
@@ -121,14 +124,20 @@ pub(crate) fn send_reply(
     msg_type: &str,
     content: Value,
 ) -> Result<(), KernelError> {
-    let reply = JupyterMessage::new(
-        request.identities.clone(),
-        state.new_header(msg_type),
-        request.header_value.clone(),
-        json!({}),
-        content,
-    );
-    send_frames(runtime, socket, state.signer.encode(&reply)?)?;
+    let header = state.new_header(msg_type);
+    let metadata = json!({});
+    send_frames(
+        runtime,
+        socket,
+        state.signer.encode_with_parts(
+            &request.identities,
+            &header,
+            ParentHeader::Message(request),
+            &metadata,
+            &content,
+            &[],
+        )?,
+    )?;
     Ok(())
 }
 
@@ -136,7 +145,7 @@ pub(crate) fn publish_status(
     runtime: &Runtime,
     socket: &mut PubSocket,
     state: &MessageLoopState,
-    parent_header: Value,
+    parent_header: ParentHeader<'_>,
     execution_state: &str,
 ) -> Result<(), KernelError> {
     publish_iopub_message(
@@ -153,18 +162,25 @@ pub(crate) fn publish_iopub_message(
     runtime: &Runtime,
     socket: &mut PubSocket,
     state: &MessageLoopState,
-    parent_header: Value,
+    parent_header: ParentHeader<'_>,
     msg_type: &str,
     content: Value,
 ) -> Result<(), KernelError> {
-    let message = JupyterMessage::new(
-        vec![msg_type.as_bytes().to_vec()],
-        state.new_header(msg_type),
-        parent_header,
-        json!({}),
-        content,
-    );
-    send_frames(runtime, socket, state.signer.encode(&message)?)?;
+    let identities = [msg_type.as_bytes().to_vec()];
+    let header = state.new_header(msg_type);
+    let metadata = json!({});
+    send_frames(
+        runtime,
+        socket,
+        state.signer.encode_with_parts(
+            &identities,
+            &header,
+            parent_header,
+            &metadata,
+            &content,
+            &[],
+        )?,
+    )?;
     Ok(())
 }
 
@@ -172,7 +188,7 @@ pub(crate) fn publish_display_event(
     runtime: &Runtime,
     socket: &mut PubSocket,
     state: &MessageLoopState,
-    parent_header: Value,
+    parent_header: ParentHeader<'_>,
     message: DisplayMessage<'_>,
 ) -> Result<(), KernelError> {
     publish_iopub_message(
@@ -193,7 +209,7 @@ pub(crate) fn publish_comm_events(
     runtime: &Runtime,
     socket: &mut PubSocket,
     state: &mut MessageLoopState,
-    parent_header: Value,
+    parent_header: ParentHeader<'_>,
     events: &[WorkerCommEvent],
 ) -> Result<(), KernelError> {
     for event in events {
@@ -201,7 +217,7 @@ pub(crate) fn publish_comm_events(
             runtime,
             socket,
             state,
-            parent_header.clone(),
+            parent_header,
             &event.msg_type,
             event.content.clone(),
         )?;
@@ -214,7 +230,7 @@ pub(crate) fn publish_stream(
     runtime: &Runtime,
     socket: &mut PubSocket,
     state: &MessageLoopState,
-    parent_header: Value,
+    parent_header: ParentHeader<'_>,
     name: &str,
     text: &str,
 ) -> Result<(), KernelError> {
@@ -248,8 +264,13 @@ pub(crate) fn publish_debug_session_event(
     state: &mut MessageLoopState,
     event: crate::debug::DebugEventEnvelope,
 ) -> Result<(), KernelError> {
-    let parent_header = if let Some(parent_header) = event.parent_header {
-        parent_header
+    let crate::debug::DebugEventEnvelope {
+        event,
+        parent_header,
+        ..
+    } = event;
+    let parent_header = if let Some(parent_header) = parent_header.as_ref() {
+        ParentHeader::Value(parent_header)
     } else if let Some(pending) = state
         .pending_executes
         .values()
@@ -258,19 +279,12 @@ pub(crate) fn publish_debug_session_event(
         if pending.silent {
             return Ok(());
         }
-        pending.request.header_value.clone()
+        ParentHeader::Message(&pending.request)
     } else {
         return Ok(());
     };
 
-    publish_iopub_message(
-        runtime,
-        socket,
-        state,
-        parent_header,
-        "debug_event",
-        event.event,
-    )
+    publish_iopub_message(runtime, socket, state, parent_header, "debug_event", event)
 }
 
 pub(crate) fn handle_comm_outcome(
@@ -285,7 +299,7 @@ pub(crate) fn handle_comm_outcome(
             runtime,
             iopub_socket,
             state,
-            request.header_value.clone(),
+            ParentHeader::Message(request),
             "stdout",
             &outcome.stdout,
         )?;
@@ -295,7 +309,7 @@ pub(crate) fn handle_comm_outcome(
             runtime,
             iopub_socket,
             state,
-            request.header_value.clone(),
+            ParentHeader::Message(request),
             "stderr",
             &outcome.stderr,
         )?;
@@ -304,7 +318,7 @@ pub(crate) fn handle_comm_outcome(
         runtime,
         iopub_socket,
         state,
-        request.header_value.clone(),
+        ParentHeader::Message(request),
         &outcome.events,
     )?;
     Ok(())

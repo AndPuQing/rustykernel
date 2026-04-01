@@ -6,7 +6,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use zeromq::{PubSocket, RouterSocket};
 
-use crate::protocol::JupyterMessage;
+use crate::protocol::{JupyterMessage, ParentHeader};
 use crate::worker::{ExecutionDisplayEvent, ExecutionOutcome, WorkerCommEvent, WorkerDebugEvent};
 
 use super::KernelError;
@@ -155,7 +155,7 @@ pub(crate) fn finalize_execute_completion(
                 runtime,
                 iopub_socket,
                 state,
-                request.header_value.clone(),
+                ParentHeader::Message(&request),
                 "execute_result",
                 json!({
                     "execution_count": execution_count,
@@ -190,7 +190,7 @@ pub(crate) fn finalize_execute_completion(
                 runtime,
                 iopub_socket,
                 state,
-                request.header_value.clone(),
+                ParentHeader::Message(&request),
                 "error",
                 json!({
                     "ename": ename,
@@ -222,7 +222,7 @@ pub(crate) fn finalize_execute_completion(
         runtime,
         iopub_socket,
         state,
-        request.header_value.clone(),
+        ParentHeader::Message(&request),
         "idle",
     )?;
     Ok(())
@@ -250,7 +250,7 @@ pub(crate) fn publish_execute_stream(
         runtime,
         socket,
         state,
-        pending.request.header_value.clone(),
+        ParentHeader::Message(&pending.request),
         name,
         text,
     )
@@ -318,7 +318,7 @@ pub(crate) fn publish_execute_debug_event(
         runtime,
         socket,
         state,
-        pending.request.header_value.clone(),
+        ParentHeader::Message(&pending.request),
         &event.msg_type,
         content,
     )
@@ -354,7 +354,7 @@ pub(crate) fn publish_execute_display_event(
             runtime,
             socket,
             state,
-            pending.request.header_value.clone(),
+            ParentHeader::Message(&pending.request),
             &msg_type,
             content,
         )
@@ -363,7 +363,7 @@ pub(crate) fn publish_execute_display_event(
             runtime,
             socket,
             state,
-            pending.request.header_value.clone(),
+            ParentHeader::Message(&pending.request),
             DisplayMessage {
                 msg_type: &msg_type,
                 data,
@@ -397,7 +397,7 @@ pub(crate) fn publish_execute_comm_event(
         runtime,
         socket,
         state,
-        pending.request.header_value.clone(),
+        ParentHeader::Message(&pending.request),
         &msg_type,
         content,
     )?;

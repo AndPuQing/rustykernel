@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sysinfo::{
     CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
 };
 
 use crate::debug::DebugBridge;
 use crate::protocol::{
-    MessageHeader, MessageSigner, IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE,
+    IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE, MessageHeader, MessageSigner,
 };
 use crate::worker::{ExecutionOutcome, PythonWorker, WorkerInterruptHandle, WorkerKernelInfo};
 

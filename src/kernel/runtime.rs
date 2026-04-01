@@ -12,6 +12,8 @@ use zeromq::SocketRecv as _;
 use zeromq::SocketSend as _;
 use zeromq::{PubSocket, RepSocket, RouterSocket, ZmqError, ZmqMessage};
 
+use crate::protocol::ParentHeader;
+
 use super::dispatch::{ChannelKind, RequestSockets, handle_request};
 use super::execute::{
     KernelEvent, KernelEventSender, StreamBatch, WorkerUpdateEvent, finalize_execute_completion,
@@ -248,7 +250,14 @@ pub(crate) fn spawn_message_loop_thread(
         let mut state = MessageLoopState::new(&connection, kernel_event_tx.clone())?;
         let debug_wake = state.debug.notifier();
 
-        publish_status(&runtime, &mut iopub_socket, &state, json!({}), "starting")?;
+        let empty_parent_header = json!({});
+        publish_status(
+            &runtime,
+            &mut iopub_socket,
+            &state,
+            ParentHeader::Value(&empty_parent_header),
+            "starting",
+        )?;
         let _ = ready_tx.send(Ok(()));
 
         loop {
@@ -302,7 +311,7 @@ pub(crate) fn spawn_message_loop_thread(
                                         signer: &state.signer,
                                         kernel_session: &state.kernel_session,
                                         identities: &pending.request.identities,
-                                        parent_header: &pending.request.header_value,
+                                        parent_header: ParentHeader::Message(&pending.request),
                                         allow_stdin: pending.allow_stdin,
                                     },
                                     &prompt,

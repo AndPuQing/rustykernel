@@ -1,9 +1,9 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tracing::warn;
 use zeromq::{PubSocket, RouterSocket};
 
-use crate::protocol::JupyterMessage;
+use crate::protocol::{JupyterMessage, ParentHeader};
 
 use super::execute::{ExecutePhase, PendingExecute};
 use super::io::{handle_comm_outcome, publish_iopub_message, publish_status, send_reply};
@@ -43,8 +43,8 @@ pub(crate) fn handle_request(
         }
     };
 
-    let parent_header = request.header_value.clone();
-    publish_status(runtime, sockets.iopub, state, parent_header.clone(), "busy")?;
+    let parent_header = ParentHeader::Message(&request);
+    publish_status(runtime, sockets.iopub, state, parent_header, "busy")?;
 
     let disposition = match channel {
         ChannelKind::Shell => handle_shell_request(runtime, sockets, state, &request)?,
@@ -129,7 +129,7 @@ pub(crate) fn handle_shell_request(
                     runtime,
                     sockets.iopub,
                     state,
-                    request.header_value.clone(),
+                    ParentHeader::Message(request),
                     "execute_input",
                     json!({
                         "code": code,
@@ -468,7 +468,7 @@ pub(crate) fn handle_shutdown_request(
         runtime,
         iopub_socket,
         state,
-        request.header_value.clone(),
+        ParentHeader::Message(request),
         "shutdown_reply",
         json!({
             "status": "ok",
