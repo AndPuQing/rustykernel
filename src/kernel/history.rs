@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use serde_json::{Value, json};
 
@@ -271,37 +271,50 @@ impl HistoryStore {
     }
 
     fn search_entries_unique(&self, pattern: &str, n: Option<usize>) -> Vec<HistoryReplyEntry> {
-        struct LatestMatch<'a> {
-            ordinal: usize,
-            session_id: u32,
-            entry: &'a HistoryEntry,
+        let Some(limit) = n else {
+            let mut seen = HashSet::new();
+            let mut matches = Vec::new();
+
+            for (session_id, entry) in self.entry_refs().rev() {
+                if !matches_history_pattern(&entry.input, pattern) {
+                    continue;
+                }
+                if !seen.insert(entry.input.as_str()) {
+                    continue;
+                }
+                matches.push((session_id, entry));
+            }
+
+            matches.reverse();
+            return matches
+                .into_iter()
+                .map(|(session_id, entry)| HistoryReplyEntry::from_entry(session_id, entry))
+                .collect();
+        };
+
+        if limit == 0 {
+            return Vec::new();
         }
 
-        let mut latest_matches = HashMap::new();
-        let mut ordinal = 0usize;
-        for (session_id, entry) in self.entry_refs() {
+        let mut seen = HashSet::with_capacity(limit);
+        let mut matches = Vec::with_capacity(limit);
+        for (session_id, entry) in self.entry_refs().rev() {
             if !matches_history_pattern(&entry.input, pattern) {
                 continue;
             }
-            latest_matches.insert(
-                entry.input.as_str(),
-                LatestMatch {
-                    ordinal,
-                    session_id,
-                    entry,
-                },
-            );
-            ordinal = ordinal.saturating_add(1);
+            if !seen.insert(entry.input.as_str()) {
+                continue;
+            }
+            matches.push((session_id, entry));
+            if matches.len() == limit {
+                break;
+            }
         }
 
-        let mut matches = latest_matches.into_values().collect::<Vec<_>>();
-        matches.sort_unstable_by_key(|entry| entry.ordinal);
-        if let Some(limit) = n {
-            keep_last_entries(&mut matches, limit);
-        }
+        matches.reverse();
         matches
             .into_iter()
-            .map(|entry| HistoryReplyEntry::from_entry(entry.session_id, entry.entry))
+            .map(|(session_id, entry)| HistoryReplyEntry::from_entry(session_id, entry))
             .collect()
     }
 }
@@ -383,13 +396,6 @@ fn matches_history_pattern(input: &str, pattern: &str) -> bool {
     }
 
     true
-}
-
-fn keep_last_entries<T>(entries: &mut Vec<T>, limit: usize) {
-    if entries.len() > limit {
-        let drop_count = entries.len() - limit;
-        entries.drain(0..drop_count);
-    }
 }
 
 fn normalize_history_index(index: i32, line_count: i32) -> i32 {
@@ -477,6 +483,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(2, 2, "gamma".to_owned()), (2, 3, "beta".to_owned()),]
         );
+    }
+
+    #[test]
+    fn search_entries_unique_returns_no_entries_for_zero_limit() {
+        let store = store_with_inputs(&[&["alpha", "beta"], &["alpha", "gamma", "beta"]]);
+
+        let entries = store.search_entries("*", Some(0), true);
+
+        assert!(entries.is_empty());
     }
 
     #[test]
