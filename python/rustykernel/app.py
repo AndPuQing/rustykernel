@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -49,14 +48,13 @@ class KernelApp:
             )
             return 0
 
-        parse_connection_file(self.connection_file)
         os.environ["RUSTYKERNEL_PYTHON_EXECUTABLE"] = sys.executable
         kernel = start_kernel(self.connection_file)
 
         try:
             while kernel.is_running:
                 try:
-                    time.sleep(0.25)
+                    kernel.wait_for_shutdown()
                 except KeyboardInterrupt:
                     kernel.interrupt()
         finally:

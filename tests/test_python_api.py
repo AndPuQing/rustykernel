@@ -203,6 +203,22 @@ def test_start_kernel_exposes_running_kernel_lifecycle(tmp_path: Path) -> None:
     assert kernel.is_running is False
 
 
+def test_running_kernel_wait_for_shutdown_returns_immediately_after_stop(
+    tmp_path: Path,
+) -> None:
+    payload = connection_payload()
+    path = write_connection_file(tmp_path, payload)
+
+    kernel = rustykernel.start_kernel(str(path))
+    kernel.stop()
+
+    started = time.monotonic()
+    kernel.wait_for_shutdown()
+
+    assert time.monotonic() - started < 0.1
+    assert kernel.is_running is False
+
+
 def test_module_cli_prints_json_description() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "rustykernel", "--json"],

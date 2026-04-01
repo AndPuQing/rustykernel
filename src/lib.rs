@@ -4,6 +4,9 @@ mod protocol;
 mod worker;
 mod worker_protocol;
 
+#[cfg(feature = "python")]
+use std::time::Duration;
+
 pub use crate::kernel::{
     ChannelEndpoints, ConnectionInfo, KernelError, KernelRuntime, KernelRuntimeInfo, healthcheck,
     parse_connection_file, runtime_info, start_kernel, start_kernel_from_connection_file,
@@ -72,6 +75,23 @@ impl RunningKernel {
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.interrupt();
         }
+    }
+
+    fn wait_for_shutdown(&self, py: Python<'_>) -> PyResult<()> {
+        const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(());
+        };
+
+        while runtime.is_running() {
+            if py.detach(|| runtime.wait_for_shutdown_timeout(SIGNAL_POLL_INTERVAL)) {
+                break;
+            }
+            py.check_signals()?;
+        }
+
+        Ok(())
     }
 }
 

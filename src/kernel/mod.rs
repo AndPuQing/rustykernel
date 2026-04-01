@@ -4,6 +4,7 @@ use std::sync::{
     Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 
 use serde::Deserialize;
 use zeromq::ZmqError;
@@ -200,6 +201,19 @@ impl ShutdownSignal {
                 .wait(stopped)
                 .expect("shutdown condvar wait poisoned");
         }
+    }
+
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let stopped = self.lock.lock().expect("shutdown mutex poisoned");
+        if *stopped {
+            return true;
+        }
+
+        let (stopped, _) = self
+            .cvar
+            .wait_timeout_while(stopped, timeout, |stopped| !*stopped)
+            .expect("shutdown condvar wait poisoned");
+        *stopped
     }
 }
 

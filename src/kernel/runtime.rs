@@ -105,6 +105,10 @@ impl KernelRuntime {
         self.shutdown.wait();
     }
 
+    pub fn wait_for_shutdown_timeout(&self, timeout: Duration) -> bool {
+        self.shutdown.wait_timeout(timeout)
+    }
+
     pub fn interrupt(&self) {
         if self.shutdown.is_stopped() {
             return;
