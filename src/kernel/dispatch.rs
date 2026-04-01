@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::runtime::Runtime;
 use tracing::warn;
 use zeromq::{PubSocket, RouterSocket};
@@ -373,13 +373,14 @@ pub(crate) fn handle_control_request(
             Ok(RequestDisposition::Complete { should_stop: false })
         }
         "usage_request" => {
+            let content = state.usage_reply_content();
             send_reply(
                 runtime,
                 reply_socket,
                 state,
                 request,
                 "usage_reply",
-                state.usage_reply_content(),
+                content,
             )?;
             Ok(RequestDisposition::Complete { should_stop: false })
         }

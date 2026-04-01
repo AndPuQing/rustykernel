@@ -256,24 +256,5 @@ pub fn runtime_info() -> KernelRuntimeInfo {
     }
 }
 
-pub(crate) fn process_is_kernel_descendant(
-    system: &sysinfo::System,
-    pid: sysinfo::Pid,
-    kernel_pid: sysinfo::Pid,
-) -> bool {
-    let mut current_pid = Some(pid);
-    while let Some(candidate) = current_pid {
-        if candidate == kernel_pid {
-            return true;
-        }
-
-        current_pid = system
-            .process(candidate)
-            .and_then(|process| process.parent());
-    }
-
-    false
-}
-
 #[cfg(test)]
 mod tests;

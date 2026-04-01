@@ -1,19 +1,54 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Value, json};
-use sysinfo::{Pid, System};
+use serde_json::{json, Value};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System,
+};
 
 use crate::debug::DebugBridge;
 use crate::protocol::{
-    IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE, MessageHeader, MessageSigner,
+    MessageHeader, MessageSigner, IMPLEMENTATION, JUPYTER_PROTOCOL_VERSION, LANGUAGE,
 };
 use crate::worker::{ExecutionOutcome, PythonWorker, WorkerInterruptHandle, WorkerKernelInfo};
 
 use super::comms::CommStore;
 use super::execute::{KernelEventSender, PendingExecute};
 use super::history::HistoryStore;
-use super::{ConnectionInfo, KernelError, process_is_kernel_descendant};
+use super::{ConnectionInfo, KernelError};
+
+fn kernel_descendant_pids(system: &System, kernel_pid: Pid) -> Vec<Pid> {
+    fn is_kernel_descendant(
+        system: &System,
+        pid: Pid,
+        kernel_pid: Pid,
+        descendants: &mut HashMap<Pid, bool>,
+    ) -> bool {
+        if let Some(&is_descendant) = descendants.get(&pid) {
+            return is_descendant;
+        }
+
+        let is_descendant = if pid == kernel_pid {
+            true
+        } else {
+            system
+                .process(pid)
+                .and_then(|process| process.parent())
+                .is_some_and(|parent| is_kernel_descendant(system, parent, kernel_pid, descendants))
+        };
+
+        descendants.insert(pid, is_descendant);
+        is_descendant
+    }
+
+    let mut descendants = HashMap::new();
+    system
+        .processes()
+        .keys()
+        .copied()
+        .filter(|pid| is_kernel_descendant(system, *pid, kernel_pid, &mut descendants))
+        .collect()
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +263,7 @@ pub(crate) struct MessageLoopState {
     pub(crate) kernel_events: KernelEventSender,
     pub(crate) debug: DebugBridge,
     pub(crate) pending_executes: HashMap<u64, PendingExecute>,
+    usage_system: System,
 }
 
 impl MessageLoopState {
@@ -249,6 +285,7 @@ impl MessageLoopState {
             kernel_events,
             debug: DebugBridge::new(),
             pending_executes: HashMap::new(),
+            usage_system: System::new(),
         })
     }
 
@@ -312,45 +349,60 @@ impl MessageLoopState {
         })
     }
 
-    pub(crate) fn usage_reply_content(&self) -> Value {
-        let mut system = System::new_all();
-        system.refresh_all();
-
+    pub(crate) fn usage_reply_content(&mut self) -> Value {
         let kernel_pid = Pid::from_u32(std::process::id());
-        let kernel_processes = system
-            .processes()
-            .keys()
-            .copied()
-            .filter(|pid| process_is_kernel_descendant(&system, *pid, kernel_pid));
 
-        let kernel_cpu = kernel_processes
-            .clone()
-            .filter_map(|pid| system.process(pid))
-            .map(|process| f64::from(process.cpu_usage()))
-            .sum::<f64>();
-        let kernel_memory = kernel_processes
-            .filter_map(|pid| system.process(pid))
-            .map(|process| process.memory())
-            .sum::<u64>();
+        self.usage_system
+            .refresh_memory_specifics(MemoryRefreshKind::everything());
+        if self.usage_system.cpus().is_empty() {
+            self.usage_system
+                .refresh_cpu_list(CpuRefreshKind::nothing());
+        }
+        self.usage_system.refresh_cpu_usage();
+        self.usage_system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().without_tasks(),
+        );
+
+        let kernel_processes = kernel_descendant_pids(&self.usage_system, kernel_pid);
+        self.usage_system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&kernel_processes),
+            true,
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .without_tasks(),
+        );
+
+        let (kernel_cpu, kernel_memory) = kernel_processes
+            .into_iter()
+            .filter_map(|pid| self.usage_system.process(pid))
+            .fold((0.0, 0_u64), |(cpu, memory), process| {
+                (
+                    cpu + f64::from(process.cpu_usage()),
+                    memory + process.memory(),
+                )
+            });
 
         let mut content = json!({
             "hostname": System::host_name().unwrap_or_default(),
             "pid": std::process::id(),
             "kernel_cpu": kernel_cpu,
             "kernel_memory": kernel_memory,
-            "cpu_count": system.cpus().len(),
+            "cpu_count": self.usage_system.cpus().len(),
             "host_virtual_memory": {
-                "total": system.total_memory(),
-                "available": system.available_memory(),
-                "used": system.used_memory(),
-                "free": system.free_memory(),
-                "total_swap": system.total_swap(),
-                "used_swap": system.used_swap(),
-                "free_swap": system.free_swap(),
+                "total": self.usage_system.total_memory(),
+                "available": self.usage_system.available_memory(),
+                "used": self.usage_system.used_memory(),
+                "free": self.usage_system.free_memory(),
+                "total_swap": self.usage_system.total_swap(),
+                "used_swap": self.usage_system.used_swap(),
+                "free_swap": self.usage_system.free_swap(),
             },
         });
 
-        let host_cpu_percent = f64::from(system.global_cpu_usage());
+        let host_cpu_percent = f64::from(self.usage_system.global_cpu_usage());
         if host_cpu_percent > 0.0 {
             content["host_cpu_percent"] = json!(host_cpu_percent);
         }
