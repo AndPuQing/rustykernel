@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
@@ -130,6 +130,12 @@ impl HistoryStore {
         self.current_session().id
     }
 
+    fn entry_refs(&self) -> impl DoubleEndedIterator<Item = (u32, &HistoryEntry)> + '_ {
+        self.sessions
+            .iter()
+            .flat_map(|session| session.entries.iter().map(move |entry| (session.id, entry)))
+    }
+
     fn resolve_session(&self, requested_session: i32) -> Option<&HistorySession> {
         let current_session = i32::try_from(self.current_session_id()).ok()?;
         let target_session = if requested_session <= 0 {
@@ -149,8 +155,13 @@ impl HistoryStore {
     }
 
     fn tail_entries(&self, n: usize) -> Vec<HistoryReplyEntry> {
-        let mut entries = self.all_entries();
-        keep_last_entries(&mut entries, n);
+        let mut entries = self
+            .entry_refs()
+            .rev()
+            .take(n)
+            .map(|(session_id, entry)| HistoryReplyEntry::from_entry(session_id, entry))
+            .collect::<Vec<_>>();
+        entries.reverse();
         entries
     }
 
@@ -229,41 +240,68 @@ impl HistoryStore {
         n: Option<usize>,
         unique: bool,
     ) -> Vec<HistoryReplyEntry> {
-        let mut matches = self
-            .all_entries()
-            .into_iter()
-            .filter(|entry| matches_history_pattern(&entry.input, pattern))
-            .collect::<Vec<_>>();
-
         if unique {
-            let mut latest_indices = HashMap::new();
-            for (index, entry) in matches.iter().enumerate() {
-                latest_indices.insert(entry.input.clone(), index);
-            }
-            matches = matches
-                .into_iter()
-                .enumerate()
-                .filter(|(index, entry)| latest_indices.get(&entry.input) == Some(index))
-                .map(|(_, entry)| entry)
-                .collect();
+            return self.search_entries_unique(pattern, n);
         }
 
+        let Some(limit) = n else {
+            return self
+                .entry_refs()
+                .filter(|(_, entry)| matches_history_pattern(&entry.input, pattern))
+                .map(|(session_id, entry)| HistoryReplyEntry::from_entry(session_id, entry))
+                .collect();
+        };
+
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut matches = VecDeque::with_capacity(limit);
+        for (session_id, entry) in self.entry_refs() {
+            if !matches_history_pattern(&entry.input, pattern) {
+                continue;
+            }
+            if matches.len() == limit {
+                let _ = matches.pop_front();
+            }
+            matches.push_back(HistoryReplyEntry::from_entry(session_id, entry));
+        }
+
+        matches.into_iter().collect()
+    }
+
+    fn search_entries_unique(&self, pattern: &str, n: Option<usize>) -> Vec<HistoryReplyEntry> {
+        struct LatestMatch<'a> {
+            ordinal: usize,
+            session_id: u32,
+            entry: &'a HistoryEntry,
+        }
+
+        let mut latest_matches = HashMap::new();
+        let mut ordinal = 0usize;
+        for (session_id, entry) in self.entry_refs() {
+            if !matches_history_pattern(&entry.input, pattern) {
+                continue;
+            }
+            latest_matches.insert(
+                entry.input.as_str(),
+                LatestMatch {
+                    ordinal,
+                    session_id,
+                    entry,
+                },
+            );
+            ordinal = ordinal.saturating_add(1);
+        }
+
+        let mut matches = latest_matches.into_values().collect::<Vec<_>>();
+        matches.sort_unstable_by_key(|entry| entry.ordinal);
         if let Some(limit) = n {
             keep_last_entries(&mut matches, limit);
         }
-
         matches
-    }
-
-    fn all_entries(&self) -> Vec<HistoryReplyEntry> {
-        self.sessions
-            .iter()
-            .flat_map(|session| {
-                session
-                    .entries
-                    .iter()
-                    .map(move |entry| HistoryReplyEntry::from_entry(session.id, entry))
-            })
+            .into_iter()
+            .map(|entry| HistoryReplyEntry::from_entry(entry.session_id, entry.entry))
             .collect()
     }
 }
@@ -308,28 +346,43 @@ fn history_output(outcome: &ExecutionOutcome) -> Option<String> {
 fn matches_history_pattern(input: &str, pattern: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let input = input.chars().collect::<Vec<_>>();
-    let mut states = vec![vec![false; input.len() + 1]; pattern.len() + 1];
-    states[0][0] = true;
+    let mut input_index = 0usize;
+    let mut pattern_index = 0usize;
+    let mut last_star_index = None;
+    let mut input_index_after_star = 0usize;
 
-    for pattern_index in 0..pattern.len() {
-        if pattern[pattern_index] == '*' {
-            states[pattern_index + 1][0] = states[pattern_index][0];
+    while input_index < input.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == input[input_index])
+        {
+            input_index += 1;
+            pattern_index += 1;
+            continue;
         }
+
+        if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            last_star_index = Some(pattern_index);
+            pattern_index += 1;
+            input_index_after_star = input_index;
+            continue;
+        }
+
+        let Some(star_index) = last_star_index else {
+            return false;
+        };
+        pattern_index = star_index + 1;
+        input_index_after_star += 1;
+        input_index = input_index_after_star;
     }
 
-    for pattern_index in 0..pattern.len() {
-        for input_index in 0..input.len() {
-            states[pattern_index + 1][input_index + 1] = match pattern[pattern_index] {
-                '*' => {
-                    states[pattern_index][input_index + 1] || states[pattern_index + 1][input_index]
-                }
-                '?' => states[pattern_index][input_index],
-                literal => states[pattern_index][input_index] && literal == input[input_index],
-            };
+    while pattern_index < pattern.len() {
+        if pattern[pattern_index] != '*' {
+            return false;
         }
+        pattern_index += 1;
     }
 
-    states[pattern.len()][input.len()]
+    true
 }
 
 fn keep_last_entries<T>(entries: &mut Vec<T>, limit: usize) {
@@ -346,4 +399,96 @@ fn normalize_history_index(index: i32, line_count: i32) -> i32 {
         index
     };
     adjusted.clamp(0, line_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with_inputs(sessions: &[&[&str]]) -> HistoryStore {
+        HistoryStore {
+            sessions: sessions
+                .iter()
+                .enumerate()
+                .map(|(session_index, inputs)| HistorySession {
+                    id: u32::try_from(session_index + 1).unwrap(),
+                    entries: inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(line_index, input)| HistoryEntry {
+                            line: u32::try_from(line_index + 1).unwrap(),
+                            input: (*input).to_owned(),
+                            output: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn tail_entries_returns_last_entries_in_chronological_order() {
+        let store = store_with_inputs(&[&["a = 1", "b = 2"], &["c = 3", "d = 4"]]);
+
+        let entries = store.tail_entries(3);
+
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| (entry.session, entry.line, entry.input))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 2, "b = 2".to_owned()),
+                (2, 1, "c = 3".to_owned()),
+                (2, 2, "d = 4".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_entries_unique_keeps_latest_match_for_each_input() {
+        let store = store_with_inputs(&[&["alpha", "beta"], &["alpha", "gamma", "beta"]]);
+
+        let entries = store.search_entries("*", None, true);
+
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| (entry.session, entry.line, entry.input))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, 1, "alpha".to_owned()),
+                (2, 2, "gamma".to_owned()),
+                (2, 3, "beta".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_entries_unique_applies_limit_after_latest_deduplication() {
+        let store = store_with_inputs(&[&["alpha", "beta"], &["alpha", "gamma", "beta"]]);
+
+        let entries = store.search_entries("*", Some(2), true);
+
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| (entry.session, entry.line, entry.input))
+                .collect::<Vec<_>>(),
+            vec![(2, 2, "gamma".to_owned()), (2, 3, "beta".to_owned()),]
+        );
+    }
+
+    #[test]
+    fn matches_history_pattern_supports_wildcards() {
+        assert!(matches_history_pattern("", ""));
+        assert!(matches_history_pattern("", "*"));
+        assert!(matches_history_pattern("value", "v*e"));
+        assert!(matches_history_pattern("value", "v?l*"));
+        assert!(matches_history_pattern("alpha", "a**a"));
+        assert!(matches_history_pattern("你好", "你?"));
+        assert!(!matches_history_pattern("", "?"));
+        assert!(!matches_history_pattern("value", "v?z*"));
+        assert!(!matches_history_pattern("你好", "?你"));
+    }
 }
