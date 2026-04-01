@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -18,36 +18,49 @@ use super::history::HistoryStore;
 use super::{ConnectionInfo, KernelError};
 
 fn kernel_descendant_pids(system: &System, kernel_pid: Pid) -> Vec<Pid> {
-    fn is_kernel_descendant(
-        system: &System,
-        pid: Pid,
-        kernel_pid: Pid,
-        descendants: &mut HashMap<Pid, bool>,
-    ) -> bool {
-        if let Some(&is_descendant) = descendants.get(&pid) {
-            return is_descendant;
-        }
-
-        let is_descendant = if pid == kernel_pid {
-            true
-        } else {
-            system
-                .process(pid)
-                .and_then(|process| process.parent())
-                .is_some_and(|parent| is_kernel_descendant(system, parent, kernel_pid, descendants))
-        };
-
-        descendants.insert(pid, is_descendant);
-        is_descendant
+    if system.process(kernel_pid).is_none() {
+        return Vec::new();
     }
 
-    let mut descendants = HashMap::new();
-    system
-        .processes()
-        .keys()
-        .copied()
-        .filter(|pid| is_kernel_descendant(system, *pid, kernel_pid, &mut descendants))
-        .collect()
+    let mut children_by_parent: HashMap<Pid, Vec<Pid>> = HashMap::new();
+    for (&pid, process) in system.processes() {
+        if let Some(parent) = process.parent() {
+            children_by_parent.entry(parent).or_default().push(pid);
+        }
+    }
+
+    collect_descendant_pids(&children_by_parent, kernel_pid)
+}
+
+fn collect_descendant_pids(children_by_parent: &HashMap<Pid, Vec<Pid>>, root_pid: Pid) -> Vec<Pid> {
+    let mut descendants = Vec::new();
+    let mut stack = vec![root_pid];
+    let mut visited = HashSet::new();
+
+    while let Some(pid) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+
+        descendants.push(pid);
+        if let Some(children) = children_by_parent.get(&pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+
+    descendants
+}
+
+fn aggregate_process_usage(system: &System, pids: &[Pid]) -> (f64, u64) {
+    pids.iter().filter_map(|pid| system.process(*pid)).fold(
+        (0.0, 0_u64),
+        |(cpu, memory), process| {
+            (
+                cpu + f64::from(process.cpu_usage()),
+                memory + process.memory(),
+            )
+        },
+    )
 }
 
 #[allow(dead_code)]
@@ -375,15 +388,8 @@ impl MessageLoopState {
                 .without_tasks(),
         );
 
-        let (kernel_cpu, kernel_memory) = kernel_processes
-            .into_iter()
-            .filter_map(|pid| self.usage_system.process(pid))
-            .fold((0.0, 0_u64), |(cpu, memory), process| {
-                (
-                    cpu + f64::from(process.cpu_usage()),
-                    memory + process.memory(),
-                )
-            });
+        let (kernel_cpu, kernel_memory) =
+            aggregate_process_usage(&self.usage_system, &kernel_processes);
 
         let mut content = json!({
             "hostname": System::host_name().unwrap_or_default(),
@@ -556,8 +562,11 @@ impl MessageLoopState {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerLifecycle, WorkerLifecycleState};
+    use std::collections::HashMap;
+
+    use super::{WorkerLifecycle, WorkerLifecycleState, collect_descendant_pids};
     use crate::kernel::KernelError;
+    use sysinfo::Pid;
 
     fn started_lifecycle() -> WorkerLifecycle {
         WorkerLifecycle {
@@ -614,5 +623,50 @@ mod tests {
             .on_execute_finished()
             .expect_err("completion without execute should fail");
         assert!(matches!(error, KernelError::Worker(_)));
+    }
+
+    #[test]
+    fn collect_descendant_pids_includes_root_and_nested_children() {
+        let root = Pid::from_u32(10);
+        let child = Pid::from_u32(11);
+        let grandchild = Pid::from_u32(12);
+        let sibling = Pid::from_u32(13);
+        let unrelated_root = Pid::from_u32(20);
+        let unrelated_child = Pid::from_u32(21);
+
+        let children_by_parent = HashMap::from([
+            (root, vec![child, sibling]),
+            (child, vec![grandchild]),
+            (unrelated_root, vec![unrelated_child]),
+        ]);
+
+        let mut descendants = collect_descendant_pids(&children_by_parent, root)
+            .into_iter()
+            .map(Pid::as_u32)
+            .collect::<Vec<_>>();
+        descendants.sort_unstable();
+
+        assert_eq!(descendants, vec![10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn collect_descendant_pids_ignores_cycles_after_first_visit() {
+        let root = Pid::from_u32(30);
+        let child = Pid::from_u32(31);
+        let grandchild = Pid::from_u32(32);
+
+        let children_by_parent = HashMap::from([
+            (root, vec![child]),
+            (child, vec![grandchild]),
+            (grandchild, vec![root]),
+        ]);
+
+        let mut descendants = collect_descendant_pids(&children_by_parent, root)
+            .into_iter()
+            .map(Pid::as_u32)
+            .collect::<Vec<_>>();
+        descendants.sort_unstable();
+
+        assert_eq!(descendants, vec![30, 31, 32]);
     }
 }
